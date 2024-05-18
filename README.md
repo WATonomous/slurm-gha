@@ -21,7 +21,7 @@ flowchart LR
 Custom image: https://github.com/WATonomous/actions-runner-image
 
 # TODO
-- Use docker and custom image for actions runner
+- Use docker and custom image for actions runner [done]
 - Make sure the image is cached 
 - Set up custom cpu/mem for different sized jobs
 	- What should these be based off of? https://github.com/WATonomous/infra-config/blob/b604376f4ee9fa3336b11dc084ba90b962ec7ee1/kubernetes/github-arc/get-config.py#L120-L142 
@@ -29,12 +29,11 @@ Custom image: https://github.com/WATonomous/actions-runner-image
 - Get access token
 - Use for more repos
 	- modify to get the repo name dynamically
-- Need to track if the runner for a job has been allocated
+- Need to track if the runner for a job has been allocated [done]
 - Look into security of passing tokens to scripts
 - Testing
 
-# Issue
-- Rerun jobs aren't picked up
+# Issues
 
 # Potential issue:
 - job1 requires label1, label2

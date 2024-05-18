@@ -7,6 +7,8 @@ from dotenv import load_dotenv
 # config 
 GITHUB_API_BASE_URL = 'https://api.github.com/repos/alexboden/gh-actions-test' 
 GITHUB_REPO_URL = 'https://github.com/alexboden/gh-actions-test'
+DOCKER_FILE_URL = 'https://api.github.com/repos/WATonomous/actions-runner-image/contents/Dockerfile'
+
 load_dotenv()
 GITHUB_ACCESS_TOKEN = os.getenv('GITHUB_ACCESS_TOKEN')
 
@@ -81,7 +83,8 @@ def allocate_actions_runner(job_id, token):
         return
 
     # create a github runner
-    subprocess.run(["sbatch", "allocate_ephemeral_runner.sh", GITHUB_REPO_URL, registration_token, removal_token, ','.join(labels)])
+    subprocess.run(["sbatch -", "./allocate_ephemeral_runner_from_docker.sh", GITHUB_REPO_URL, registration_token, removal_token, ','.join(labels)])
+    # subprocess.run(["sbatch", "allocate_ephemeral_runner_from_docker.sh", GITHUB_REPO_URL, registration_token, removal_token, ','.join(labels)])
     
     allocated_jobs.add(job_id)
 
@@ -96,5 +99,18 @@ def poll_github_actions_and_allocate_runners(url, token):
             print("Polling for queued workflows...")
         time.sleep(1) # issues occur if you request to frequently
 
+def pull_custom_docker_image(docker_github_file_url, token):
+    data, _ = get_gh_api(docker_github_file_url, token)
+    download_url = data['download_url']
+
+    # download the dockerfile
+    response = requests.get(download_url)
+    print(response.text)
+
+    # save the dockerfile
+    with open('GHA_Dockerfile', 'w') as f:
+        f.write(response.text)
+    
 if __name__ == "__main__":
-    poll_github_actions_and_allocate_runners(url=queued_workflows_url, token=GITHUB_ACCESS_TOKEN)
+    # poll_github_actions_and_allocate_runners(url=queued_workflows_url, token=GITHUB_ACCESS_TOKEN)
+    pull_custom_docker_image(DOCKER_FILE_URL, GITHUB_ACCESS_TOKEN)
