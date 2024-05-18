@@ -28,7 +28,7 @@ tar xzf ./actions-runner-linux-x64-2.316.1.tar.gz
 # Wait for the runner to finish
 wait $!
 # Cleanup
-./config.sh remove --token $TOKEN
+./config.sh remove --token $REMOVAL_TOKEN
 cd ../..
 echo "Removing $runner_dir"
 rm -rf "$runner_dir" 
