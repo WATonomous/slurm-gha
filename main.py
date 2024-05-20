@@ -4,10 +4,9 @@ import subprocess
 import os
 from dotenv import load_dotenv
 
-# config 
-GITHUB_API_BASE_URL = 'https://api.github.com/repos/alexboden/gh-actions-test' 
-GITHUB_REPO_URL = 'https://github.com/alexboden/gh-actions-test'
-DOCKER_FILE_URL = 'https://api.github.com/repos/WATonomous/actions-runner-image/contents/Dockerfile'
+from runner_size_config import get_runner_resources
+
+from config import GITHUB_API_BASE_URL, GITHUB_REPO_URL, DOCKER_FILE_URL, LIST_OF_RUNNER_LABELS
 
 load_dotenv()
 GITHUB_ACCESS_TOKEN = os.getenv('GITHUB_ACCESS_TOKEN')
@@ -58,9 +57,15 @@ def allocate_runners_for_jobs(workflow_data, token):
                 print(f"Job {job['id']} is queued.")
 
 def allocate_actions_runner(job_id, token):
+    if job_id in allocated_jobs:
+        print(f"Runner already allocated for job {job_id}")
+        return
+    allocated_jobs.add(job_id)
+
+    
     data, _ = get_gh_api(f'{GITHUB_API_BASE_URL}/actions/jobs/{job_id}', token)
-    labels = data["labels"]
-    print(data)
+    labels = data["labels"] # should only be one label
+    size_label = labels[0]
 
     # get the runner registration token
     headers = {
@@ -77,16 +82,23 @@ def allocate_actions_runner(job_id, token):
     removal_token = data.json()["token"]
     
     print(labels, registration_token, removal_token)
-
-    if job_id in allocated_jobs:
-        print(f"Runner already allocated for job {job_id}")
-        return
-
-    # create a github runner
-    subprocess.run(["sbatch -", "./allocate_ephemeral_runner_from_docker.sh", GITHUB_REPO_URL, registration_token, removal_token, ','.join(labels)])
-    # subprocess.run(["sbatch", "allocate_ephemeral_runner_from_docker.sh", GITHUB_REPO_URL, registration_token, removal_token, ','.join(labels)])
+ 
+    command = [
+        "sbatch",
+        "./allocate_ephemeral_runner_from_docker.sh",
+        GITHUB_REPO_URL,
+        registration_token,
+        removal_token,
+        ','.join(labels)
+    ]
     
-    allocated_jobs.add(job_id)
+    # Execute the command with the modified environment
+    result = subprocess.run(command)
+    if result.returncode != 0:
+        print(f"Failed to allocate runner for job {job_id}.")
+        allocated_jobs.remove(job_id) 
+        # retry the job allocation
+        allocate_actions_runner(job_id, token)
 
 def poll_github_actions_and_allocate_runners(url, token):
     etag = None
@@ -112,5 +124,5 @@ def pull_custom_docker_image(docker_github_file_url, token):
         f.write(response.text)
     
 if __name__ == "__main__":
-    # poll_github_actions_and_allocate_runners(url=queued_workflows_url, token=GITHUB_ACCESS_TOKEN)
-    pull_custom_docker_image(DOCKER_FILE_URL, GITHUB_ACCESS_TOKEN)
+    poll_github_actions_and_allocate_runners(url=queued_workflows_url, token=GITHUB_ACCESS_TOKEN)
+    # pull_custom_docker_image(DOCKER_FILE_URL, GITHUB_ACCESS_TOKEN)

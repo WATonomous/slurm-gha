@@ -1,4 +1,11 @@
 #!/bin/bash
+#SBATCH--job-name=slurm-gh-actions-runner
+#SBATCH--cpus-per-task=2
+#SBATCH--mem=4G
+#SBATCH--grestmpdisk:2048
+#SBATCH--time=00:30:00
+# The above sbatch configuration is generated dynamically based on the runner label by runner_size_config.py
+#!/bin/bash
 # Use: ./ephemeral_runner.sh <repo-urL> <registration-token> <removal-token> <labels>
 
 REPO_URL=$1
