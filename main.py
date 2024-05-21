@@ -62,11 +62,6 @@ def allocate_actions_runner(job_id, token):
         return
     allocated_jobs.add(job_id)
 
-    
-    data, _ = get_gh_api(f'{GITHUB_API_BASE_URL}/actions/jobs/{job_id}', token)
-    labels = data["labels"] # should only be one label
-    size_label = labels[0]
-
     # get the runner registration token
     headers = {
         'Authorization': f'token {token}',
@@ -81,11 +76,23 @@ def allocate_actions_runner(job_id, token):
     data = requests.post(f'{GITHUB_API_BASE_URL}/actions/runners/remove-token', headers=headers)
     removal_token = data.json()["token"]
     
-    print(labels, registration_token, removal_token)
- 
+    data, _ = get_gh_api(f'{GITHUB_API_BASE_URL}/actions/jobs/{job_id}', token)
+    labels = data["labels"] # should only be one label in prod
+
+    print(f"Allocating runner for: {data['workflow_name']}-{data['name']} with labels: {labels} and job_id: {job_id}")
+
+    runner_size_label = "gh-arc-runners-small" # default to small runner
+    if "gh-arc-runners-medium" in labels:
+        runner_size_label = "gh-arc-runners-medium"
+    elif "gh-arc-runners-large" in labels:
+        runner_size_label = "gh-arc-runners-large"
+    elif "gh-arc-runners-xlarge" in labels:
+        runner_size_label = "gh-arc-runners-xlarge"
+    
+    
     command = [
         "sbatch",
-        "./allocate_ephemeral_runner_from_docker.sh",
+        f"./slurm-runner-scripts/runner-{runner_size_label}.sh",
         GITHUB_REPO_URL,
         registration_token,
         removal_token,
@@ -105,7 +112,6 @@ def poll_github_actions_and_allocate_runners(url, token):
     while True:
         data, etag = get_gh_api(url, token, etag)
         if data:
-            print(data)
             print("Changes detected.")
             allocate_runners_for_jobs(data, token)
             print("Polling for queued workflows...")

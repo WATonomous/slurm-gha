@@ -1,11 +1,4 @@
 #!/bin/bash
-#SBATCH--job-name=slurm-gh-actions-runner
-#SBATCH--cpus-per-task=4
-#SBATCH--mem=8G
-#SBATCH--grestmpdisk:2048
-#SBATCH--time=00:30:00
-# The above sbatch configuration is generated dynamically based on the runner label by runner_size_config.py
-#!/bin/bash
 # Use: ./ephemeral_runner.sh <repo-urL> <registration-token> <removal-token> <labels>
 
 REPO_URL=$1
@@ -37,7 +30,6 @@ echo "Building Docker image"
 docker build -t gha-runner:latest https://raw.githubusercontent.com/WATonomous/actions-runner-image/main/Dockerfile
 
 DOCKER_CONTAINER_ID=$(docker run -d --name "ghar_$SLURM_JOB_ID" gha-runner:latest tail -f /dev/null)
-echo $DOCKER_CONTAINER_ID > docker_id.txt
 
 # Ensure the container started correctly
 if [ $? -ne 0 ]; then

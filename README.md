@@ -22,18 +22,23 @@ Custom image: https://github.com/WATonomous/actions-runner-image
 
 # TODO
 - Use docker and custom image for actions runner [done]
-- Make sure the image is cached 
-- Set up custom cpu/mem for different sized jobs
+- Need to track if the runner for a job has been allocated [done]
+- Add logic to check if script succeeded or failed [done]
+	- remove job id from allocated jobs
+- Set up custom cpu/mem for different sized jobs [done]
 	- What should these be based off of? https://github.com/WATonomous/infra-config/blob/b604376f4ee9fa3336b11dc084ba90b962ec7ee1/kubernetes/github-arc/get-config.py#L120-L142 
+- Look into removing the building step
+	- check if the image has already been built and that the source git repo hasn't changed
 - Use secrets for the token
 - Get access token
 - Use for more repos
 	- modify to get the repo name dynamically
-- Need to track if the runner for a job has been allocated [done]
 - Look into security of passing tokens to scripts
 - Testing
+- Make sure the image is cached 
 
 # Issues
+- If script needs to be restart and runners are being built, the script will allocate new runners once its back up 
 
 # Potential issue:
 - job1 requires label1, label2
@@ -43,3 +48,4 @@ Custom image: https://github.com/WATonomous/actions-runner-image
 - runner2 is allocated with label1
 - runner2 CANT RUN job1
 Won't be an issue if we use one label (small, medium, large) per job
+

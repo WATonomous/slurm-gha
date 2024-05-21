@@ -1,3 +1,5 @@
+import os
+
 from config import LIST_OF_RUNNER_LABELS, ALLOCATE_RUNNER_SCRIPT_PATH 
 
 
@@ -36,7 +38,7 @@ def get_runner_sbatch_config(runner_label):
     #SBATCH --time=00:30:00
     """
      
-    return sbatch_config.replace(" ", "").strip()
+    return sbatch_config.replace("    ", "").strip()
 
 def create_runner_sbatch_file(runner_label):
     """
@@ -46,8 +48,10 @@ def create_runner_sbatch_file(runner_label):
     # get sbatch config
     sbatch_config = get_runner_sbatch_config(runner_label)
     
+    # ensure directory exists
+    os.makedirs("slurm-runner-scripts", exist_ok=True)
     # write to file
-    with open(f"runner_scripts/runner_{runner_label}.sh", "w") as f:
+    with open(f"slurm-runner-scripts/runner-{runner_label}.sh", "w") as f:
         f.write(sbatch_config)
         f.write("\n")
         f.write("# The above sbatch configuration is generated dynamically based on the runner label by runner_size_config.py\n")
