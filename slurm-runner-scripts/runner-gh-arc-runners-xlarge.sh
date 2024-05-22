@@ -6,14 +6,13 @@
 #SBATCH --time=00:30:00
 # The above sbatch configuration is generated dynamically based on the runner label by runner_size_config.py
 #!/bin/bash
-# Use: ./ephemeral_runner.sh <repo-urL> <registration-token> <removal-token> <labels>
+# Use: ./ephemeral_runner.sh <repo-urL> <registration-token> <removal-token> <labels> 
 
 REPO_URL=$1
 REGISTRATION_TOKEN=$2
 REMOVAL_TOKEN=$3
 LABELS=$4
 
-# Setup
 runner_dir="runners/runner_$REGISTRATION_TOKEN"
 
 # start docker
@@ -31,12 +30,21 @@ do
 done
 echo "Docker is ready."
 
-# wait for docker to start
+# Building the custom actions runner image
+REPO_NAME="WATonomous/actions-runner-image" 
+LATEST_COMMIT=$(curl -s https://api.github.com/repos/$REPO_NAME/commits/main | jq -r '.sha')
+IMAGE_NAME="gha-runner:$LATEST_COMMIT"
 
-echo "Building Docker image"
-docker build -t gha-runner:latest https://raw.githubusercontent.com/WATonomous/actions-runner-image/main/Dockerfile
+# Check if Docker image already exists, only build if it doesn't
+if [[ "$(docker images -q $IMAGE_NAME 2> /dev/null)" == "" ]]; then
+  echo "Building Docker image with commit $LATEST_COMMIT"
+  docker build -t $IMAGE_NAME https://raw.githubusercontent.com/$REPO_NAME/main/Dockerfile
+else
+  echo "Docker image $IMAGE_NAME already exists. Skipping build."
+fi
 
-DOCKER_CONTAINER_ID=$(docker run -d --name "ghar_$SLURM_JOB_ID" gha-runner:latest tail -f /dev/null)
+echo "Running Docker container..."
+DOCKER_CONTAINER_ID=$(docker run -d --name "ghar_$SLURM_JOB_ID" "$IMAGE_NAME" tail -f /dev/null)
 
 # Ensure the container started correctly
 if [ $? -ne 0 ]; then
@@ -44,7 +52,7 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-# Register and run
+# Execute commands in the container to register, run one job, and then remove the runner
 echo "Registering runner..."
 docker exec $DOCKER_CONTAINER_ID /bin/bash -c "./config.sh --url \"$REPO_URL\" --token \"$REGISTRATION_TOKEN\" --labels \"$LABELS\" --name \"slurm_$SLURM_JOB_ID\" --unattended --ephemeral"
 
@@ -56,3 +64,6 @@ docker exec $DOCKER_CONTAINER_ID /bin/bash -c "./config.sh remove --token $REMOV
 
 docker stop $DOCKER_CONTAINER_ID
 docker rm $DOCKER_CONTAINER_ID
+
+echo "Docker container removed"
+echo "Script finished"
