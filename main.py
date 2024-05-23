@@ -7,7 +7,7 @@ import threading
 from dotenv import load_dotenv
 
 from runner_size_config import create_runner_sbatch_files
-from config import GITHUB_API_BASE_URL, GITHUB_REPO_URL, DOCKER_FILE_URL, LIST_OF_RUNNER_LABELS
+from config import GITHUB_API_BASE_URL, GITHUB_REPO_URL 
 from RunningJob import RunningJob
 
 load_dotenv()

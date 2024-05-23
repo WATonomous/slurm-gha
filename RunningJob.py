@@ -2,7 +2,7 @@ from typing import List
 
 class RunningJob:
     def __init__(self, job_id: int, slurm_job_id: int, workflow_name: str, job_name: str, labels: List[str]):
-		"""Class to represent a running Github Actions Job on Slurm."""
+        """Class to represent a running Github Actions Job on Slurm."""
         self.job_id = job_id
         self.slurm_job_id = slurm_job_id
         self.workflow_name = workflow_name
