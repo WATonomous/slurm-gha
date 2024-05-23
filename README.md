@@ -28,9 +28,7 @@ Custom image: https://github.com/WATonomous/actions-runner-image
 - Set up custom cpu/mem for different sized jobs [done]
 	- What should these be based off of? https://github.com/WATonomous/infra-config/blob/b604376f4ee9fa3336b11dc084ba90b962ec7ee1/kubernetes/github-arc/get-config.py#L120-L142 
 - Look into removing the building step [done]
-	- check if the image has already been built and that the source git repo hasn't changed
-	- use this https://github.com/WATonomous/actions-runner-image/pkgs/container/actions-runner-image 
-- Keep data structure of running jobs, and when the are completed report status on commandline
+- Keep data structure of running jobs, and when the are completed report status on commandline [done]
 - Add function to stop all sbatch running jobs on startup in case of restart
 - Use secrets for the token
 - Get access token
@@ -38,6 +36,8 @@ Custom image: https://github.com/WATonomous/actions-runner-image
 	- modify to get the repo name dynamically
 - Look into security of passing tokens to scripts
 - Testing
+
+# TODO After MVP
 - Make sure the image is cached 
 
 # Issues
