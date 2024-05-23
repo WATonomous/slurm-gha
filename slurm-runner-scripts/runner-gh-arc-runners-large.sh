@@ -30,21 +30,8 @@ do
 done
 echo "Docker is ready."
 
-# Building the custom actions runner image
-REPO_NAME="WATonomous/actions-runner-image" 
-LATEST_COMMIT=$(curl -s https://api.github.com/repos/$REPO_NAME/commits/main | jq -r '.sha')
-IMAGE_NAME="gha-runner:$LATEST_COMMIT"
-
-# Check if Docker image already exists, only build if it doesn't
-if [[ "$(docker images -q $IMAGE_NAME 2> /dev/null)" == "" ]]; then
-  echo "Building Docker image with commit $LATEST_COMMIT"
-  docker build -t $IMAGE_NAME https://raw.githubusercontent.com/$REPO_NAME/main/Dockerfile
-else
-  echo "Docker image $IMAGE_NAME already exists. Skipping build."
-fi
-
 echo "Running Docker container..."
-DOCKER_CONTAINER_ID=$(docker run -d --name "ghar_$SLURM_JOB_ID" "$IMAGE_NAME" tail -f /dev/null)
+DOCKER_CONTAINER_ID=$(docker run -d --name "ghar_$SLURM_JOB_ID" ghcr.io/watonomous/actions-runner-image:main tail -f /dev/null)
 
 # Ensure the container started correctly
 if [ $? -ne 0 ]; then

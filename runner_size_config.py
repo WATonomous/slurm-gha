@@ -61,5 +61,3 @@ def create_runner_sbatch_file(runner_label):
 def create_runner_sbatch_files():
     for runner_label in LIST_OF_RUNNER_LABELS:
         create_runner_sbatch_file(runner_label)
-    
-create_runner_sbatch_files()
