@@ -10,13 +10,13 @@ def get_runner_resources(runner_label):
     Based on https://github.com/WATonomous/infra-config/blob/b604376f4ee9fa3336b11dc084ba90b962ec7ee1/kubernetes/github-arc/get-config.py#L120-L142
     """
     if runner_label == "gh-arc-runners-small":
-        return {"cpu" : 1, "memory" : 2, "tmpdisk" : 2048}
+        return {"cpu" : 1, "memory" : 2, "tmpdisk" : 4096}
     elif runner_label == "gh-arc-runners-medium":
-        return {"cpu" : 2, "memory" : 4, "tmpdisk" : 2048}
+        return {"cpu" : 2, "memory" : 4, "tmpdisk" : 4096}
     elif runner_label == "gh-arc-runners-large":
-        return {"cpu" : 4, "memory" : 8, "tmpdisk" : 2048}
+        return {"cpu" : 4, "memory" : 8, "tmpdisk" : 4096}
     elif runner_label == "gh-arc-runners-xlarge":
-        return {"cpu" : 8, "memory" : 16, "tmpdisk" : 2048}
+        return {"cpu" : 8, "memory" : 16, "tmpdisk" : 16384}
     else:
         raise ValueError(f"Runner label {runner_label} not found.")
 

@@ -47,7 +47,14 @@ def allocate_runners_for_jobs(workflow_data, token):
     
     for i in range(number_of_queued_workflows):
         workflow_id = workflow_data["workflow_runs"][i]["id"]
-        job_data, _ = get_gh_api(f'{GITHUB_API_BASE_URL}/actions/runs/{workflow_id}/jobs', token)
+        if workflow_data["workflow_runs"][i]["head_branch"] != "alexboden/test-slurm-gha-runner":
+            print(f"Skipping workflow {workflow_id} because it is not on the correct branch.")
+            print(f"Branch is {workflow_data['workflow_runs'][i]['head_branch']}")
+            continue
+        else:
+            print(f"Processing workflow {workflow_id} because it is on the correct branch.")
+            print(f"Branch is {workflow_data['workflow_runs'][i]['head_branch']}")
+        job_data, _ = get_gh_api(f'{GITHUB_API_BASE_URL}/actions/runs/{workflow_id}/jobs?per_page=167', token)
         for job in job_data["jobs"]:
             if job["status"] == "queued":
                 queued_job_id = job["id"]
@@ -58,7 +65,7 @@ def allocate_actions_runner(job_id, token):
     if job_id in allocated_jobs:
         print(f"Runner already allocated for job {job_id}")
         return
-
+    print(f"Allocating runner for job {job_id}")
     allocated_jobs[job_id] = None # mark as allocated to prevent double allocation
 
     # get the runner registration token
@@ -81,14 +88,17 @@ def allocate_actions_runner(job_id, token):
     print(f"Allocating runner for: {data['workflow_name']}-{data['name']} with labels: {labels} and job_id: {job_id}")
     allocated_jobs[job_id] = RunningJob(job_id, None, data['workflow_name'], data['name'], labels)
 
-    runner_size_label = "gh-arc-runners-small" # default to small runner
-    if "gh-arc-runners-medium" in labels:
-        runner_size_label = "gh-arc-runners-medium"
-    elif "gh-arc-runners-large" in labels:
-        runner_size_label = "gh-arc-runners-large"
-    elif "gh-arc-runners-xlarge" in labels:
-        runner_size_label = "gh-arc-runners-xlarge"
+    if "alextest" not in labels[0]:
+        print("Skipping job because it is not for the correct runner.")
+        return
     
+    runner_size_label = "gh-arc-runners-small" # default to small runner
+    if "alextest-gh-arc-runners-medium" in labels:
+        runner_size_label = "gh-arc-runners-medium"
+    elif "alextest-gh-arc-runners-large" in labels:
+        runner_size_label = "gh-arc-runners-large"
+    elif "alextest-gh-arc-runners-xlarge" in labels:
+        runner_size_label = "gh-arc-runners-xlarge"
     
     command = [
         "sbatch",
@@ -114,6 +124,7 @@ def allocate_actions_runner(job_id, token):
 
 def poll_github_actions_and_allocate_runners(url, token, sleep_time=1):
     etag = None
+    # add count to reset the etag
     while True:
         data, etag = get_gh_api(url, token, etag)
         if data:
@@ -192,3 +203,5 @@ if __name__ == "__main__":
 
     github_thread.join()
     slurm_thread.join()
+
+# Weird job wasn't appearing on api
