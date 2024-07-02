@@ -17,7 +17,7 @@ GITHUB_ACCESS_TOKEN = os.getenv('GITHUB_ACCESS_TOKEN')
 queued_workflows_url = f'{GITHUB_API_BASE_URL}/actions/runs?status=queued'
 
 # global tracking for allocated runners
-allocated_jobs = {} # job_id -> RunningJob 
+allocated_jobs = {} # Maps job_id -> RunningJob 
 
 def get_gh_api(url, token, etag=None):
     headers = {
@@ -54,12 +54,14 @@ def allocate_runners_for_jobs(workflow_data, token):
         else:
             print(f"Processing workflow {workflow_id} because it is on the correct branch.")
             print(f"Branch is {workflow_data['workflow_runs'][i]['head_branch']}")
-        job_data, _ = get_gh_api(f'{GITHUB_API_BASE_URL}/actions/runs/{workflow_id}/jobs?per_page=167', token)
+        job_data, _ = get_gh_api(f'{GITHUB_API_BASE_URL}/actions/runs/{workflow_id}/jobs?per_page=300', token) #TODO get jobs per page dynamically
         for job in job_data["jobs"]:
             if job["status"] == "queued":
                 queued_job_id = job["id"]
                 allocate_actions_runner(queued_job_id, token) 
-                print(f"Job {job['id']} is queued.")
+                print(f"Job {job['name']} {job['id']} is queued.")
+            else:
+                print(f"Job {job['name']} {job['id']} is not queued.")
 
 def allocate_actions_runner(job_id, token):
     if job_id in allocated_jobs:
@@ -85,7 +87,7 @@ def allocate_actions_runner(job_id, token):
     data, _ = get_gh_api(f'{GITHUB_API_BASE_URL}/actions/jobs/{job_id}', token)
     labels = data["labels"] # should only be one label in prod
 
-    print(f"Allocating runner for: {data['workflow_name']}-{data['name']} with labels: {labels} and job_id: {job_id}")
+    # print(f"Allocating runner for: {data['workflow_name']}-{data['name']} with labels: {labels} and job_id: {job_id}")
     allocated_jobs[job_id] = RunningJob(job_id, None, data['workflow_name'], data['name'], labels)
 
     if "alextest" not in labels[0]:
@@ -112,9 +114,9 @@ def allocate_actions_runner(job_id, token):
     # Execute the command with the modified environment
     result = subprocess.run(command, capture_output=True, text=True) 
     output = result.stdout.strip()
-    slurm_job_id = int(output.split()[-1]) # Output is of the form "Submitted batch job 3828"
+    slurm_job_id = int(output.split()[-1]) # output is of the form "Submitted batch job 3828"
     allocated_jobs[job_id] = RunningJob(job_id, slurm_job_id, data['workflow_name'], data['name'], labels)
-    print(f"Allocated runner for job {job_id} with SLURM job ID {slurm_job_id}.")
+    print(f"Allocated runner for job {allocated_jobs[job_id]} with SLURM job ID {slurm_job_id}.")
 
     if result.returncode != 0:
         print(f"Failed to allocate runner for job {job_id}.")
@@ -125,6 +127,7 @@ def allocate_actions_runner(job_id, token):
 def poll_github_actions_and_allocate_runners(url, token, sleep_time=1):
     etag = None
     # add count to reset the etag
+    i = 0
     while True:
         data, etag = get_gh_api(url, token, etag)
         if data:
@@ -132,6 +135,11 @@ def poll_github_actions_and_allocate_runners(url, token, sleep_time=1):
             allocate_runners_for_jobs(data, token)
             print("Polling for queued workflows...")
         time.sleep(sleep_time) # issues occur if you request to frequently
+        
+        if i % 15 == 0 and len(allocated_jobs) > 0:
+            print(f"Current {len(allocated_jobs)} allocated jobs:")
+            print(allocated_jobs)
+        i += 1
     
 def check_slurm_status():
     if not allocated_jobs:
@@ -150,7 +158,7 @@ def check_slurm_status():
             sacct_output = sacct_result.stdout.strip()
 
             if sacct_result.returncode != 0:
-                print(f"Sacct command failed with return code {sacct_result.returncode}")
+                print(f"sacct command failed with return code {sacct_result.returncode}")
                 print(f"Error output: {sacct_result.stderr}")
                 continue
 
