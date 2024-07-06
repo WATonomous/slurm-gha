@@ -43,29 +43,11 @@ chmod -R 777 $PARENT_DIR
 
 DOCKER_CONTAINER_ID=$(docker run -d --name "ghar_$SLURM_JOB_ID" --mount type=bind,source=/tmp/run/docker.sock,target=/var/run/docker.sock --mount type=bind,source=$PARENT_DIR,target=$PARENT_DIR ghcr.io/watonomous/actions-runner-image:main tail -f /dev/null)
 
-# docker exec $DOCKER_CONTAINER_ID /bin/bash -c "
-#     GITHUB_ACTIONS_WKDIR='/tmp/runner_$SLURM_JOB_ID/_work'
-#     mkdir -p \$GITHUB_ACTIONS_WKDIR
-#     sudo chown -R runner:runner \$GITHUB_ACTIONS_WKDIR
-#     sudo chmod -R 777 \$GITHUB_ACTIONS_WKDIR
-#     ls -ld /tmp/runner_$SLURM_JOB_ID
-#     ls -ld \$GITHUB_ACTIONS_WKDIR
-#     sudo chmod 666 /var/run/docker.sock
-# "
-
-echo "Docker ps"
-docker ps
-
-echo "pwd : $(pwd)"
-
 docker exec $DOCKER_CONTAINER_ID /bin/bash -c "sudo chmod 666 /var/run/docker.sock" # Allows the runner to access the docker socket
-docker exec $DOCKER_CONTAINER_ID /bin/bash -c "echo pwd" 
-docker exec $DOCKER_CONTAINER_ID /bin/bash -c "pwd" 
-docker exec $DOCKER_CONTAINER_ID /bin/bash -c "ls" 
 docker exec $DOCKER_CONTAINER_ID /bin/bash -c "mkdir \"$PARENT_DIR\"" 
 docker exec $DOCKER_CONTAINER_ID /bin/bash -c "sudo chown -R runner:runner \"$PARENT_DIR\""
-docker exec $DOCKER_CONTAINER_ID /bin/bash -c "echo permissions for \"$PARENT_DIR\""
-docker exec $DOCKER_CONTAINER_ID /bin/bash -c "ls -ld \"$PARENT_DIR\""
+# docker exec $DOCKER_CONTAINER_ID /bin/bash -c "echo permissions for \"$PARENT_DIR\""
+# docker exec $DOCKER_CONTAINER_ID /bin/bash -c "ls -ld \"$PARENT_DIR\""
 docker exec $DOCKER_CONTAINER_ID /bin/bash -c "sudo chmod -R 755 \"$PARENT_DIR\"" 
 
 
