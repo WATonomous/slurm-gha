@@ -12,9 +12,9 @@ def get_runner_resources(runner_label):
     if runner_label == "gh-arc-runners-small":
         return {"cpu" : 1, "memory" : 2, "tmpdisk" : 4096}
     elif runner_label == "gh-arc-runners-medium":
-        return {"cpu" : 2, "memory" : 4, "tmpdisk" : 8192}
+        return {"cpu" : 2, "memory" : 4, "tmpdisk" : 12288}
     elif runner_label == "gh-arc-runners-large":
-        return {"cpu" : 4, "memory" : 8, "tmpdisk" : 12288}
+        return {"cpu" : 4, "memory" : 8, "tmpdisk" : 16384}
     elif runner_label == "gh-arc-runners-xlarge":
         return {"cpu" : 8, "memory" : 16, "tmpdisk" : 16384}
     else:
