@@ -8,7 +8,7 @@ import os
 import threading
 from dotenv import load_dotenv
 
-from runner_size_config import create_runner_sbatch_files
+from runner_size_config import create_runner_sbatch_files, get_runner_resources
 from config import GITHUB_API_BASE_URL, GITHUB_REPO_URL 
 from RunningJob import RunningJob
 
@@ -129,15 +129,15 @@ def allocate_actions_runner(job_id, token):
         runner_size_label = "gh-arc-runners-xlarge"
     
     logging.info(f"Using runner size label: {runner_size_label}")
-	runner_resources = get_runner_resources(runner_size_label)
+    runner_resources = get_runner_resources(runner_size_label)
     command = [
         "sbatch",
-        "--mem=", f"{runner_resources['memory']}G",
-        "--cpus-per-task=", f"{runner_resources['memory']}G",
-        "--mem", f"{runner_resources['memory']}G",
-		" --gres tmpdisk:", f"{runner_resources['tmpdisk']}",
-		"--time", f"{runner_resources['time']}",
-        f"./allocate-ephemeral-runner-from-docker.sh",
+        f"--job-name=slurm-gh-actions-runner-{job_id}"
+        f"--mem={runner_resources['memory']}G",
+        f"--cpus-per-task={runner_resources['cpu']}",
+        f"--gres=tmpdisk:{runner_resources['tmpdisk']}",
+        f"--time={runner_resources['time']}",
+        f"allocate-ephemeral-runner-from-docker.sh",
         GITHUB_REPO_URL,
         registration_token,
         removal_token,
@@ -146,12 +146,20 @@ def allocate_actions_runner(job_id, token):
     
     logging.info(f"Running command: {' '.join(command)}")
     # Execute the command with the modified environment
-    result = subprocess.run(command, capture_output=True, text=True) 
+    result = subprocess.run(command, capture_output=True, text=True, env=os.environ)
     output = result.stdout.strip()
-    logging.info(f"Command output: {output}")
-    slurm_job_id = int(output.split()[-1]) # output is of the form "Submitted batch job 3828"
-    allocated_jobs[job_id] = RunningJob(job_id, slurm_job_id, data['workflow_name'], data['name'], labels)
-    logging.info(f"Allocated runner for job {allocated_jobs[job_id]} with SLURM job ID {slurm_job_id}.")
+    error_output = result.stderr.strip()
+    logging.info(f"Command stdout: {output}")
+    logging.error(f"Command stderr: {error_output}")
+    try:
+        slurm_job_id = int(output.split()[-1])  # output is of the form "Submitted batch job 3828"
+        allocated_jobs[job_id] = RunningJob(job_id, slurm_job_id, data['workflow_name'], data['name'], labels)
+        logging.info(f"Allocated runner for job {allocated_jobs[job_id]} with SLURM job ID {slurm_job_id}.")
+    except (IndexError, ValueError) as e:
+        logging.error(f"Failed to parse SLURM job ID from command output: {output}. Error: {e}")
+        del allocated_jobs[job_id]
+        # retry the job allocation
+        allocate_actions_runner(job_id, token)
 
     if result.returncode != 0:
         logging.error(f"Failed to allocate runner for job {job_id}.")
