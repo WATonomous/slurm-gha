@@ -9,7 +9,7 @@ import threading
 from dotenv import load_dotenv
 
 from runner_size_config import create_runner_sbatch_files, get_runner_resources
-from config import GITHUB_API_BASE_URL, GITHUB_REPO_URL 
+from config import GITHUB_API_BASE_URL, GITHUB_REPO_URL, ALLOCATE_RUNNER_SCRIPT_PATH 
 from RunningJob import RunningJob
 
 # Configure logging
@@ -39,26 +39,67 @@ queued_workflows_url = f'{GITHUB_API_BASE_URL}/actions/runs?status=queued'
 allocated_jobs = {} # Maps job_id -> RunningJob 
 
 def get_gh_api(url, token, etag=None):
-    headers = {
-        'Authorization': f'token {token}',
-        'Accept': 'application/vnd.github.v3+json'
-    }
-    if etag:
+    headers = {'Authorization': f'token {token}', 'Accept': 'application/vnd.github.v3+json'}
+    if (etag):
         headers['If-None-Match'] = etag
 
     response = requests.get(url, headers=headers)
+    
     if response.status_code == 304:
         return None, etag 
     elif response.status_code == 200:
         new_etag = response.headers.get('ETag')
         return response.json(), new_etag 
+    elif response.status_code == 403 and 'X-RateLimit-Remaining' in response.headers and response.headers['X-RateLimit-Remaining'] == '0':
+        reset_time = int(response.headers['X-RateLimit-Reset'])
+        sleep_time = reset_time - time.time() + 1  # Adding 1 second to ensure the reset has occurred
+        logging.warning(f"Rate limit exceeded. Waiting for {sleep_time} seconds.")
+        time.sleep(sleep_time)
+        return get_gh_api(url, token, etag)  # Retry the request
     else:
         logging.error(f"Unexpected status code: {response.status_code}")
         response.raise_for_status()  # Handle HTTP errors
 
+def poll_github_actions_and_allocate_runners(url, token, sleep_time=1):
+    etag = None
+    i = 0
+    while True:
+        data, etag = get_gh_api(url, token, etag)
+        if data:
+            logging.info("Changes detected.")
+            allocate_runners_for_jobs(data, token)
+            logging.info("Polling for queued workflows...")
+        time.sleep(sleep_time) # issues occur if you request to frequently
+        
+        if i % 15 == 0 and len(allocated_jobs) > 0:
+            logging.info(f"Current {len(allocated_jobs)} allocated jobs:")
+            logging.info(allocated_jobs)
+            etag = None # reset etag to get the latest data
+        i += 1
+
+
+def get_all_jobs(workflow_id, token):
+    all_jobs = []
+    page = 1
+    per_page = 100 # Maximum number of jobs per page according to rate limits
+
+    while True:
+        url = f"{GITHUB_API_BASE_URL}/actions/runs/{workflow_id}/jobs?per_page={per_page}&page={page}"
+        job_data, _ = get_gh_api(url, token)
+        if job_data and 'jobs' in job_data:
+            all_jobs.extend(job_data['jobs'])
+            if len(job_data['jobs']) < per_page:
+                break  # No more pages
+            page += 1
+            logging.info(f"Getting jobs for workflow {workflow_id} page {page}")
+        else:
+            break  # No more data
+
+    return all_jobs
+
 def allocate_runners_for_jobs(workflow_data, token):
     if "workflow_runs" not in workflow_data:
-        logging.info("No workflows found.")
+        logging.error("No workflows found.")
         return
     
     number_of_queued_workflows = workflow_data["total_count"] 
@@ -76,10 +117,10 @@ def allocate_runners_for_jobs(workflow_data, token):
         else:
             logging.info(f"Processing workflow {workflow_id} because it is on the correct branch.")
             logging.info(f"Branch is {workflow_data['workflow_runs'][i]['head_branch']}")
-        job_data, _ = get_gh_api(f'{GITHUB_API_BASE_URL}/actions/runs/{workflow_id}/jobs?per_page=100', token) #TODO get jobs per page dynamically, EDIT apparently 100 is the max
-        logging.info(f"There are {len(job_data['jobs'])} jobs in the workflow.")
+        job_data = get_all_jobs(workflow_id, token)
+        logging.info(f"There are {len(job_data)} jobs in the workflow.")
         logging.info("job_data: ", job_data)
-        for job in job_data["jobs"]:
+        for job in job_data:
             logging.info(f"Evaluating job: {job['name']} - {job['id']}, Status: {job['status']}")
             if job["status"] == "queued":
                 queued_job_id = job["id"]
@@ -137,7 +178,7 @@ def allocate_actions_runner(job_id, token):
         f"--cpus-per-task={runner_resources['cpu']}",
         f"--gres=tmpdisk:{runner_resources['tmpdisk']}",
         f"--time={runner_resources['time']}",
-        f"allocate-ephemeral-runner-from-docker.sh",
+        ALLOCATE_RUNNER_SCRIPT_PATH, # allocate-ephemeral-runner-from-docker.sh
         GITHUB_REPO_URL,
         registration_token,
         removal_token,
@@ -146,7 +187,7 @@ def allocate_actions_runner(job_id, token):
     
     logging.info(f"Running command: {' '.join(command)}")
     # Execute the command with the modified environment
-    result = subprocess.run(command, capture_output=True, text=True, env=os.environ)
+    result = subprocess.run(command, capture_output=True, text=True)
     output = result.stdout.strip()
     error_output = result.stderr.strip()
     logging.info(f"Command stdout: {output}")
@@ -167,24 +208,6 @@ def allocate_actions_runner(job_id, token):
         # retry the job allocation
         allocate_actions_runner(job_id, token)
 
-def poll_github_actions_and_allocate_runners(url, token, sleep_time=1):
-    etag = None
-    # add count to reset the etag
-    i = 0
-    while True:
-        data, etag = get_gh_api(url, token, etag)
-        if data:
-            logging.info("Changes detected.")
-            allocate_runners_for_jobs(data, token)
-            logging.info("Polling for queued workflows...")
-        time.sleep(sleep_time) # issues occur if you request to frequently
-        
-        if i % 15 == 0 and len(allocated_jobs) > 0:
-            logging.info(f"Current {len(allocated_jobs)} allocated jobs:")
-            logging.info(allocated_jobs)
-            etag = None # reset etag to get the latest data
-        i += 1
-    
 def check_slurm_status():
     if not allocated_jobs:
         return
@@ -243,9 +266,6 @@ def poll_slurm_statuses(sleep_time=1):
         time.sleep(sleep_time)
 
 if __name__ == "__main__":
-    # create sbatch files for runners
-    create_runner_sbatch_files()
-
     # need to use threading to achieve simultaneous polling
     github_thread = threading.Thread(target=poll_github_actions_and_allocate_runners, args=(queued_workflows_url, GITHUB_ACCESS_TOKEN))
     slurm_thread = threading.Thread(target=poll_slurm_statuses)
