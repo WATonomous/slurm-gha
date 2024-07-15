@@ -29,6 +29,10 @@ Custom image: https://github.com/WATonomous/actions-runner-image
 	- What should these be based off of? https://github.com/WATonomous/infra-config/blob/b604376f4ee9fa3336b11dc084ba90b962ec7ee1/kubernetes/github-arc/get-config.py#L120-L142 
 - Look into removing the building step [done]
 - Keep data structure of running jobs, and when the are completed report status on commandline [done]
+- docker in docker 
+	- https://slurm.schedmd.com/scrun.html
+	- https://jpetazzo.github.io/2015/09/03/do-not-use-docker-in-docker-for-ci/
+	- https://docs.docker.com/engine/security/rootless/#rootless-docker-in-docker
 - Add function to stop all sbatch running jobs on startup in case of restart
 - Use secrets for the token
 - Get access token

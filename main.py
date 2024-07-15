@@ -1,14 +1,33 @@
 import requests
 import time
+import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime
 import subprocess
 import os
 import threading
 from dotenv import load_dotenv
 
-from runner_size_config import create_runner_sbatch_files
+from runner_size_config import create_runner_sbatch_files, get_runner_resources
 from config import GITHUB_API_BASE_URL, GITHUB_REPO_URL 
 from RunningJob import RunningJob
+
+# Configure logging
+log_file = 'slurm-action-runners.log'
+log_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)  # 10 MB per file, 5 backup files
+log_handler.setLevel(logging.INFO)
+log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+log_handler.setFormatter(log_formatter)
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+logger.addHandler(log_handler)
+
+# Optionally, add console handler if you want logs to appear on the console as well
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(log_formatter)
+logger.addHandler(console_handler)
 
 load_dotenv()
 GITHUB_ACCESS_TOKEN = os.getenv('GITHUB_ACCESS_TOKEN')
@@ -17,7 +36,7 @@ GITHUB_ACCESS_TOKEN = os.getenv('GITHUB_ACCESS_TOKEN')
 queued_workflows_url = f'{GITHUB_API_BASE_URL}/actions/runs?status=queued'
 
 # global tracking for allocated runners
-allocated_jobs = {} # job_id -> RunningJob 
+allocated_jobs = {} # Maps job_id -> RunningJob 
 
 def get_gh_api(url, token, etag=None):
     headers = {
@@ -34,31 +53,46 @@ def get_gh_api(url, token, etag=None):
         new_etag = response.headers.get('ETag')
         return response.json(), new_etag 
     else:
-        print(f"Unexpected status code: {response.status_code}")
+        logging.error(f"Unexpected status code: {response.status_code}")
         response.raise_for_status()  # Handle HTTP errors
 
 def allocate_runners_for_jobs(workflow_data, token):
     if "workflow_runs" not in workflow_data:
-        print("No workflows found.")
+        logging.info("No workflows found.")
         return
     
     number_of_queued_workflows = workflow_data["total_count"] 
+    logging.info(f"Total number of queued workflows: {number_of_queued_workflows}")
     number_of_queued_workflows = len(workflow_data["workflow_runs"])
+    logging.info(f"Number of workflow runs: {number_of_queued_workflows}")
     
     for i in range(number_of_queued_workflows):
         workflow_id = workflow_data["workflow_runs"][i]["id"]
-        job_data, _ = get_gh_api(f'{GITHUB_API_BASE_URL}/actions/runs/{workflow_id}/jobs', token)
+        logging.info(f"Evaluating workflow ID: {workflow_id}")
+        if workflow_data["workflow_runs"][i]["head_branch"] != "alexboden/test-slurm-gha-runner":
+            logging.info(f"Skipping workflow {workflow_id} because it is not on the correct branch.")
+            logging.info(f"Branch is {workflow_data['workflow_runs'][i]['head_branch']}")
+            continue
+        else:
+            logging.info(f"Processing workflow {workflow_id} because it is on the correct branch.")
+            logging.info(f"Branch is {workflow_data['workflow_runs'][i]['head_branch']}")
+        job_data, _ = get_gh_api(f'{GITHUB_API_BASE_URL}/actions/runs/{workflow_id}/jobs?per_page=100', token) #TODO get jobs per page dynamically, EDIT apparently 100 is the max
+        logging.info(f"There are {len(job_data['jobs'])} jobs in the workflow.")
+        logging.info("job_data: ", job_data)
         for job in job_data["jobs"]:
+            logging.info(f"Evaluating job: {job['name']} - {job['id']}, Status: {job['status']}")
             if job["status"] == "queued":
                 queued_job_id = job["id"]
                 allocate_actions_runner(queued_job_id, token) 
-                print(f"Job {job['id']} is queued.")
+                logging.info(f"Job {job['name']} {job['id']} is queued.")
+            else:
+                logging.info(f"Job {job['name']} {job['id']} is not queued.")
 
 def allocate_actions_runner(job_id, token):
     if job_id in allocated_jobs:
-        print(f"Runner already allocated for job {job_id}")
+        logging.info(f"Runner already allocated for job {job_id}")
         return
-
+    logging.info(f"Allocating runner for job {job_id}")
     allocated_jobs[job_id] = None # mark as allocated to prevent double allocation
 
     # get the runner registration token
@@ -70,57 +104,86 @@ def allocate_actions_runner(job_id, token):
     data = requests.post(f'{GITHUB_API_BASE_URL}/actions/runners/registration-token', headers=headers)
     registration_token = data.json()["token"]
 
-    time.sleep(0.5) # was returning the same token without this
+    time.sleep(1) # https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api?apiVersion=2022-11-28#pause-between-mutative-requests
 
     data = requests.post(f'{GITHUB_API_BASE_URL}/actions/runners/remove-token', headers=headers)
     removal_token = data.json()["token"]
     
     data, _ = get_gh_api(f'{GITHUB_API_BASE_URL}/actions/jobs/{job_id}', token)
     labels = data["labels"] # should only be one label in prod
+    logging.info(f"Job labels: {labels}")
 
-    print(f"Allocating runner for: {data['workflow_name']}-{data['name']} with labels: {labels} and job_id: {job_id}")
     allocated_jobs[job_id] = RunningJob(job_id, None, data['workflow_name'], data['name'], labels)
 
+    if labels[0] != "alextest-gh-arc-runners-small" and labels[0] != "alextest-gh-arc-runners-medium" and labels[0] != "alextest-gh-arc-runners-large" and labels[0] != "alextest-gh-arc-runners-xlarge":
+        logging.info(f"Skipping job because it is not for the correct runner. labels: {labels}, labels[0]: {labels[0]}")
+        del allocated_jobs[job_id]
+        return
+    
     runner_size_label = "gh-arc-runners-small" # default to small runner
-    if "gh-arc-runners-medium" in labels:
+    if "alextest-gh-arc-runners-medium" in labels:
         runner_size_label = "gh-arc-runners-medium"
-    elif "gh-arc-runners-large" in labels:
+    elif "alextest-gh-arc-runners-large" in labels:
         runner_size_label = "gh-arc-runners-large"
-    elif "gh-arc-runners-xlarge" in labels:
+    elif "alextest-gh-arc-runners-xlarge" in labels:
         runner_size_label = "gh-arc-runners-xlarge"
     
-    
+    logging.info(f"Using runner size label: {runner_size_label}")
+    runner_resources = get_runner_resources(runner_size_label)
     command = [
         "sbatch",
-        f"./slurm-runner-scripts/runner-{runner_size_label}.sh",
+        f"--job-name=slurm-gh-actions-runner-{job_id}"
+        f"--mem={runner_resources['memory']}G",
+        f"--cpus-per-task={runner_resources['cpu']}",
+        f"--gres=tmpdisk:{runner_resources['tmpdisk']}",
+        f"--time={runner_resources['time']}",
+        f"allocate-ephemeral-runner-from-docker.sh",
         GITHUB_REPO_URL,
         registration_token,
         removal_token,
         ','.join(labels)
     ]
     
+    logging.info(f"Running command: {' '.join(command)}")
     # Execute the command with the modified environment
-    result = subprocess.run(command, capture_output=True, text=True) 
+    result = subprocess.run(command, capture_output=True, text=True, env=os.environ)
     output = result.stdout.strip()
-    slurm_job_id = int(output.split()[-1]) # Output is of the form "Submitted batch job 3828"
-    allocated_jobs[job_id] = RunningJob(job_id, slurm_job_id, data['workflow_name'], data['name'], labels)
-    print(f"Allocated runner for job {job_id} with SLURM job ID {slurm_job_id}.")
+    error_output = result.stderr.strip()
+    logging.info(f"Command stdout: {output}")
+    logging.error(f"Command stderr: {error_output}")
+    try:
+        slurm_job_id = int(output.split()[-1])  # output is of the form "Submitted batch job 3828"
+        allocated_jobs[job_id] = RunningJob(job_id, slurm_job_id, data['workflow_name'], data['name'], labels)
+        logging.info(f"Allocated runner for job {allocated_jobs[job_id]} with SLURM job ID {slurm_job_id}.")
+    except (IndexError, ValueError) as e:
+        logging.error(f"Failed to parse SLURM job ID from command output: {output}. Error: {e}")
+        del allocated_jobs[job_id]
+        # retry the job allocation
+        allocate_actions_runner(job_id, token)
 
     if result.returncode != 0:
-        print(f"Failed to allocate runner for job {job_id}.")
+        logging.error(f"Failed to allocate runner for job {job_id}.")
         allocated_jobs.remove(job_id) 
         # retry the job allocation
         allocate_actions_runner(job_id, token)
 
 def poll_github_actions_and_allocate_runners(url, token, sleep_time=1):
     etag = None
+    # add count to reset the etag
+    i = 0
     while True:
         data, etag = get_gh_api(url, token, etag)
         if data:
-            print("Changes detected.")
+            logging.info("Changes detected.")
             allocate_runners_for_jobs(data, token)
-            print("Polling for queued workflows...")
+            logging.info("Polling for queued workflows...")
         time.sleep(sleep_time) # issues occur if you request to frequently
+        
+        if i % 15 == 0 and len(allocated_jobs) > 0:
+            logging.info(f"Current {len(allocated_jobs)} allocated jobs:")
+            logging.info(allocated_jobs)
+            etag = None # reset etag to get the latest data
+        i += 1
     
 def check_slurm_status():
     if not allocated_jobs:
@@ -139,8 +202,8 @@ def check_slurm_status():
             sacct_output = sacct_result.stdout.strip()
 
             if sacct_result.returncode != 0:
-                print(f"Sacct command failed with return code {sacct_result.returncode}")
-                print(f"Error output: {sacct_result.stderr}")
+                logging.error(f"sacct command failed with return code {sacct_result.returncode}")
+                logging.error(f"Error output: {sacct_result.stderr}")
                 continue
 
             for line in sacct_output.split('\n'):
@@ -165,11 +228,11 @@ def check_slurm_status():
                     duration = "[Unknown Duration]"
                     if start_time and end_time:
                         duration = end_time - start_time
-                    print(f"Slurm job {job_component} {status} in {duration}. Running Job Info: {str(runningjob)}")
+                    logging.info(f"Slurm job {job_component} {status} in {duration}. Running Job Info: {str(runningjob)}")
                     to_remove.append(job_id)
 
         except Exception as e:
-            print(f"Error querying SLURM job details for job ID {runningjob.slurm_job_id}: {e}")
+            logging.error(f"Error querying SLURM job details for job ID {runningjob.slurm_job_id}: {e}")
 
     for job_id in to_remove:
         del allocated_jobs[job_id]
