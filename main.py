@@ -71,7 +71,7 @@ def poll_github_actions_and_allocate_runners(url, token, sleep_time=1):
             logging.info("Polling for queued workflows...")
         time.sleep(sleep_time) # issues occur if you request to frequently
         
-        if i % 15 == 0 and len(allocated_jobs) > 0:
+        if i % 1 == 0 and len(allocated_jobs) > 0:
             logging.info(f"Current {len(allocated_jobs)} allocated jobs:")
             logging.info(allocated_jobs)
             etag = None # reset etag to get the latest data
@@ -81,14 +81,14 @@ def poll_github_actions_and_allocate_runners(url, token, sleep_time=1):
 def get_all_jobs(workflow_id, token):
     all_jobs = []
     page = 1
-    per_page = 100 # Maximum number of jobs per page according to rate limits
+    per_page = 50 # Maximum number of jobs per page is 100 according to rate limits
 
     while True:
         url = f"{GITHUB_API_BASE_URL}/actions/runs/{workflow_id}/jobs?per_page={per_page}&page={page}"
         job_data, _ = get_gh_api(url, token)
         if job_data and 'jobs' in job_data:
             all_jobs.extend(job_data['jobs'])
-            if len(job_data['jobs']) < per_page:
+            if len(job_data['jobs']) == 0:
                 break  # No more pages
             page += 1
             logging.info(f"Getting jobs for workflow {workflow_id} page {page}")
@@ -119,7 +119,7 @@ def allocate_runners_for_jobs(workflow_data, token):
             logging.info(f"Branch is {workflow_data['workflow_runs'][i]['head_branch']}")
         job_data = get_all_jobs(workflow_id, token)
         logging.info(f"There are {len(job_data)} jobs in the workflow.")
-        logging.info("job_data: ", job_data)
+        logging.info(f"job_data: {job_data}")
         for job in job_data:
             logging.info(f"Evaluating job: {job['name']} - {job['id']}, Status: {job['status']}")
             if job["status"] == "queued":
@@ -173,8 +173,8 @@ def allocate_actions_runner(job_id, token):
     runner_resources = get_runner_resources(runner_size_label)
     command = [
         "sbatch",
-        f"--job-name=slurm-gh-actions-runner-{job_id}"
-        f"--mem={runner_resources['memory']}G",
+        f"--job-name=slurm-gh-actions-runner-{job_id}",
+        f"--mem-per-cpu=4G",
         f"--cpus-per-task={runner_resources['cpu']}",
         f"--gres=tmpdisk:{runner_resources['tmpdisk']}",
         f"--time={runner_resources['time']}",
@@ -204,7 +204,6 @@ def allocate_actions_runner(job_id, token):
 
     if result.returncode != 0:
         logging.error(f"Failed to allocate runner for job {job_id}.")
-        allocated_jobs.remove(job_id) 
         # retry the job allocation
         allocate_actions_runner(job_id, token)
 
@@ -267,7 +266,7 @@ def poll_slurm_statuses(sleep_time=1):
 
 if __name__ == "__main__":
     # need to use threading to achieve simultaneous polling
-    github_thread = threading.Thread(target=poll_github_actions_and_allocate_runners, args=(queued_workflows_url, GITHUB_ACCESS_TOKEN))
+    github_thread = threading.Thread(target=poll_github_actions_and_allocate_runners, args=(queued_workflows_url, GITHUB_ACCESS_TOKEN, 3))
     slurm_thread = threading.Thread(target=poll_slurm_statuses)
 
     github_thread.start()

@@ -12,11 +12,11 @@ def get_runner_resources(runner_label):
     if runner_label == "gh-arc-runners-small":
         return {"cpu" : 1, "memory" : 2, "tmpdisk" : 4096, "time" : "00:15:00"}
     elif runner_label == "gh-arc-runners-medium":
-        return {"cpu" : 2, "memory" : 4, "tmpdisk" : 16384, "time" : "00:20:00"}
+        return {"cpu" : 2, "memory" : 4, "tmpdisk" : 32768, "time" : "00:20:00"}
     elif runner_label == "gh-arc-runners-large":
-        return {"cpu" : 4, "memory" : 8, "tmpdisk" : 16384, "time" : "00:25:00"}
+        return {"cpu" : 4, "memory" : 8, "tmpdisk" : 32768, "time" : "00:25:00"}
     elif runner_label == "gh-arc-runners-xlarge":
-        return {"cpu" : 8, "memory" : 16, "tmpdisk" : 16384, "time" : "00:30:00"}
+        return {"cpu" : 8, "memory" : 16, "tmpdisk" : 32768, "time" : "00:30:00"}
     else:
         raise ValueError(f"Runner label {runner_label} not found.")
 
