@@ -173,8 +173,8 @@ def allocate_actions_runner(job_id, token):
     runner_resources = get_runner_resources(runner_size_label)
     command = [
         "sbatch",
-        f"--job-name=slurm-gh-actions-runner-{job_id}"
-        f"--mem={runner_resources['memory']}G",
+        f"--job-name=slurm-gha-runner-{job_id}",
+        f"--mem-per-cpu=4G",
         f"--cpus-per-task={runner_resources['cpu']}",
         f"--gres=tmpdisk:{runner_resources['tmpdisk']}",
         f"--time={runner_resources['time']}",

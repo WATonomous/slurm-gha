@@ -22,7 +22,7 @@ fi
 echo "INFO Docker in Slurm started"
 
 # Define the parent directory for GitHub Actions in the host machine
-PARENT_DIR="/tmp/runner_$SLURM_JOB_ID"
+PARENT_DIR="/tmp/runner_$SLURMD_NODENAME_$SLURM_JOB_ID"
 GITHUB_ACTIONS_WKDIR="$PARENT_DIR/_work"
 mkdir -p $PARENT_DIR
 chown -R $(id -u):$(id -g) $PARENT_DIR
@@ -30,7 +30,7 @@ chmod -R 777 $PARENT_DIR
 
 
 # Start the actions runner container. Mount the docker socket and the parent directory (of the working directory).
-DOCKER_CONTAINER_ID=$(docker run -d --name "ghar_$SLURM_JOB_ID" --mount type=bind,source=/tmp/run/docker.sock,target=/var/run/docker.sock --mount type=bind,source=$PARENT_DIR,target=$PARENT_DIR ghcr.io/watonomous/actions-runner-image:main tail -f /dev/null)
+DOCKER_CONTAINER_ID=$(docker run -d --name "ghar_$SLURMD_NODENAME_$SLURM_JOB_ID" --mount type=bind,source=/tmp/run/docker.sock,target=/var/run/docker.sock --mount type=bind,source=$PARENT_DIR,target=$PARENT_DIR ghcr.io/watonomous/actions-runner-image:main tail -f /dev/null)
 docker exec $DOCKER_CONTAINER_ID /bin/bash -c "sudo chmod 666 /var/run/docker.sock" # Allows the runner to access the docker socket
 # Configure the permissions of the parent directory within the container
 docker exec $DOCKER_CONTAINER_ID /bin/bash -c "mkdir \"$PARENT_DIR\"" 
@@ -40,7 +40,7 @@ docker exec $DOCKER_CONTAINER_ID /bin/bash -c "sudo chmod -R 755 \"$PARENT_DIR\"
 # Execute commands in the container to register, run one job, and then remove the runner
 echo "INFO Registering runner..."
 
-docker exec $DOCKER_CONTAINER_ID /bin/bash -c "/home/runner/config.sh --work "$GITHUB_ACTIONS_WKDIR" --url \"$REPO_URL\" --token \"$REGISTRATION_TOKEN\" --labels \"$LABELS\" --name \"slurm_$SLURM_JOB_ID\" --unattended --ephemeral"
+docker exec $DOCKER_CONTAINER_ID /bin/bash -c "/home/runner/config.sh --work "$GITHUB_ACTIONS_WKDIR" --url \"$REPO_URL\" --token \"$REGISTRATION_TOKEN\" --labels \"$LABELS\" --name \"slurm_$HOSTNAME_$SLURM_JOB_ID\" --unattended --ephemeral"
 
 echo "INFO Running runner..."
 docker exec $DOCKER_CONTAINER_ID /bin/bash -c "/home/runner/run.sh"
