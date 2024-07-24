@@ -119,7 +119,7 @@ def allocate_runners_for_jobs(workflow_data, token):
             logging.info(f"Branch is {workflow_data['workflow_runs'][i]['head_branch']}")
         job_data = get_all_jobs(workflow_id, token)
         logging.info(f"There are {len(job_data)} jobs in the workflow.")
-        logging.info("job_data: ", job_data)
+        logging.info(f"job_data: {job_data}")
         for job in job_data:
             logging.info(f"Evaluating job: {job['name']} - {job['id']}, Status: {job['status']}")
             if job["status"] == "queued":
