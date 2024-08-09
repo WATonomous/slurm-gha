@@ -44,7 +44,8 @@ def get_gh_api(url, token, etag=None):
         headers['If-None-Match'] = etag
 
     response = requests.get(url, headers=headers)
-    
+    if int(response.headers['X-RateLimit-Remaining']) % 100 == 0:
+        logging.info(f"Rate Limit Remaining: {response.headers['X-RateLimit-Remaining']}") 
     if response.status_code == 304:
         return None, etag 
     elif response.status_code == 200:
@@ -119,9 +120,9 @@ def allocate_runners_for_jobs(workflow_data, token):
             logging.info(f"Branch is {workflow_data['workflow_runs'][i]['head_branch']}")
         job_data = get_all_jobs(workflow_id, token)
         logging.info(f"There are {len(job_data)} jobs in the workflow.")
-        logging.info(f"job_data: {job_data}")
+        # logging.info(f"job_data: {job_data}")
         for job in job_data:
-            logging.info(f"Evaluating job: {job['name']} - {job['id']}, Status: {job['status']}")
+            # logging.info(f"Evaluating job: {job['name']} - {job['id']}, Status: {job['status']}")
             if job["status"] == "queued":
                 queued_job_id = job["id"]
                 allocate_actions_runner(queued_job_id, token) 
@@ -173,8 +174,9 @@ def allocate_actions_runner(job_id, token):
     runner_resources = get_runner_resources(runner_size_label)
     command = [
         "sbatch",
-        f"--job-name=slurm-gha-runner-{job_id}",
-        f"--mem-per-cpu=4G",
+		# f"--nodelist=trpro-slurm1",
+        f"--job-name=slurm-{runner_size_label}-{job_id}",
+        f"--mem-per-cpu={runner_resources['mem-per-cpu']}",
         f"--cpus-per-task={runner_resources['cpu']}",
         f"--gres=tmpdisk:{runner_resources['tmpdisk']}",
         f"--time={runner_resources['time']}",
@@ -196,17 +198,17 @@ def allocate_actions_runner(job_id, token):
         slurm_job_id = int(output.split()[-1])  # output is of the form "Submitted batch job 3828"
         allocated_jobs[job_id] = RunningJob(job_id, slurm_job_id, data['workflow_name'], data['name'], labels)
         logging.info(f"Allocated runner for job {allocated_jobs[job_id]} with SLURM job ID {slurm_job_id}.")
+        if result.returncode != 0:
+            del allocated_jobs[job_id]
+            logging.error(f"Failed to allocate runner for job {job_id}.")
+            allocate_actions_runner(job_id, token)
     except (IndexError, ValueError) as e:
         logging.error(f"Failed to parse SLURM job ID from command output: {output}. Error: {e}")
         del allocated_jobs[job_id]
         # retry the job allocation
         allocate_actions_runner(job_id, token)
 
-    if result.returncode != 0:
-        logging.error(f"Failed to allocate runner for job {job_id}.")
-        allocated_jobs.remove(job_id) 
-        # retry the job allocation
-        allocate_actions_runner(job_id, token)
+
 
 def check_slurm_status():
     if not allocated_jobs:
