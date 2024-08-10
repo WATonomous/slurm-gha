@@ -16,48 +16,6 @@ def get_runner_resources(runner_label):
     elif runner_label == "gh-arc-runners-large":
         return {"cpu" : 4, "mem-per-cpu" : "2G", "tmpdisk" : 16384, "time" : "00:25:00"}
     elif runner_label == "gh-arc-runners-xlarge":
-        return {"cpu" : 8, "mem-per-cpu" : "2G", "tmpdisk" : 16384, "time" : "00:30:00"}
+        return {"cpu" : 16, "mem-per-cpu" : "2G", "tmpdisk" : 16384, "time" : "00:30:00"}
     else:
         raise ValueError(f"Runner label {runner_label} not found.")
-
-def get_runner_sbatch_config(runner_label):
-    """
-    Returns the sbatch configuration for a runner based on the runner label.
-    """
-    
-    # get resources 
-    resources = get_runner_resources(runner_label)
-    
-    # get sbatch config
-    sbatch_config = f"""
-    #!/bin/bash
-    #SBATCH --job-name=slurm-gh-actions-runner
-    #SBATCH --cpus-per-task={resources["cpu"]}
-    #SBATCH --mem={resources["memory"]}G
-    #SBATCH --gres tmpdisk:{resources["tmpdisk"]}
-    #SBATCH --time=00:30:00
-    """
-     
-    return sbatch_config.replace("    ", "").strip()
-
-def create_runner_sbatch_file(runner_label):
-    """
-    Creates a sbatch file for a runner based on the runner label.
-    """
-    
-    # get sbatch config
-    sbatch_config = get_runner_sbatch_config(runner_label)
-    
-    # ensure directory exists
-    os.makedirs("slurm-runner-scripts", exist_ok=True)
-    # write to file
-    with open(f"slurm-runner-scripts/runner-{runner_label}.sh", "w") as f:
-        f.write(sbatch_config)
-        f.write("\n")
-        f.write("# The above sbatch configuration is generated dynamically based on the runner label by runner_size_config.py\n")
-        open(ALLOCATE_RUNNER_SCRIPT_PATH, "r").seek(0)
-        f.write(open(ALLOCATE_RUNNER_SCRIPT_PATH, "r").read())
-    
-def create_runner_sbatch_files():
-    for runner_label in LIST_OF_RUNNER_LABELS:
-        create_runner_sbatch_file(runner_label)

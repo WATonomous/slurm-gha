@@ -8,7 +8,7 @@ import os
 import threading
 from dotenv import load_dotenv
 
-from runner_size_config import create_runner_sbatch_files, get_runner_resources
+from runner_size_config import get_runner_resources
 from config import GITHUB_API_BASE_URL, GITHUB_REPO_URL, ALLOCATE_RUNNER_SCRIPT_PATH 
 from RunningJob import RunningJob
 
@@ -23,22 +23,28 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 logger.addHandler(log_handler)
 
-# Optionally, add console handler if you want logs to appear on the console as well
 console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.INFO)
 console_handler.setFormatter(log_formatter)
 logger.addHandler(console_handler)
 
+# Load GitHub access token from .env file
+# Only secret required is the GitHub access token
 load_dotenv()
 GITHUB_ACCESS_TOKEN = os.getenv('GITHUB_ACCESS_TOKEN')
 
-# constants
+# Constants
 queued_workflows_url = f'{GITHUB_API_BASE_URL}/actions/runs?status=queued'
 
-# global tracking for allocated runners
+# Global tracking for allocated runners
 allocated_jobs = {} # Maps job_id -> RunningJob 
 
 def get_gh_api(url, token, etag=None):
+    """
+    Sends a GET request to the GitHub API with the given URL and access token.
+    If the rate limit is exceeded, the function will wait until the rate limit is reset before returning.
+    """
+    
     headers = {'Authorization': f'token {token}', 'Accept': 'application/vnd.github.v3+json'}
     if (etag):
         headers['If-None-Match'] = etag
@@ -61,25 +67,21 @@ def get_gh_api(url, token, etag=None):
         logging.error(f"Unexpected status code: {response.status_code}")
         response.raise_for_status()  # Handle HTTP errors
 
-def poll_github_actions_and_allocate_runners(url, token, sleep_time=1):
+def poll_github_actions_and_allocate_runners(url, token, sleep_time=5):
     etag = None
-    i = 0
     while True:
-        data, etag = get_gh_api(url, token, etag)
+        data, _ = get_gh_api(url, token, etag)
         if data:
             logging.info("Changes detected.")
             allocate_runners_for_jobs(data, token)
             logging.info("Polling for queued workflows...")
         time.sleep(sleep_time) # issues occur if you request to frequently
-        
-        if i % 15 == 0 and len(allocated_jobs) > 0:
-            logging.info(f"Current {len(allocated_jobs)} allocated jobs:")
-            logging.info(allocated_jobs)
-            etag = None # reset etag to get the latest data
-        i += 1
 
 
 def get_all_jobs(workflow_id, token):
+	"""
+ 	Get all CI jobs for a given workflow ID by iterating through the paginated API response.
+  	"""
     all_jobs = []
     page = 1
     per_page = 100 # Maximum number of jobs per page according to rate limits
@@ -111,26 +113,28 @@ def allocate_runners_for_jobs(workflow_data, token):
     for i in range(number_of_queued_workflows):
         workflow_id = workflow_data["workflow_runs"][i]["id"]
         logging.info(f"Evaluating workflow ID: {workflow_id}")
-        if workflow_data["workflow_runs"][i]["head_branch"] != "alexboden/test-slurm-gha-runner":
-            logging.info(f"Skipping workflow {workflow_id} because it is not on the correct branch.")
-            logging.info(f"Branch is {workflow_data['workflow_runs'][i]['head_branch']}")
+		# If statement to check if the workflow is on the testing branch, remove this for production
+		branch = workflow_data["workflow_runs"][i]["head_branch"]
+        if branch != "alexboden/test-slurm-gha-runner":
+            logging.info(f"Skipping workflow {workflow_id} because it is not on the correct branch, branch: {branch}.")
             continue
         else:
-            logging.info(f"Processing workflow {workflow_id} because it is on the correct branch.")
-            logging.info(f"Branch is {workflow_data['workflow_runs'][i]['head_branch']}")
+            logging.info(f"Processing workflow {workflow_id} because it is on the correct branch, branch: {branch}.")
         job_data = get_all_jobs(workflow_id, token)
         logging.info(f"There are {len(job_data)} jobs in the workflow.")
-        # logging.info(f"job_data: {job_data}")
         for job in job_data:
-            # logging.info(f"Evaluating job: {job['name']} - {job['id']}, Status: {job['status']}")
             if job["status"] == "queued":
                 queued_job_id = job["id"]
                 allocate_actions_runner(queued_job_id, token) 
                 logging.info(f"Job {job['name']} {job['id']} is queued.")
-            else:
-                logging.info(f"Job {job['name']} {job['id']} is not queued.")
+            # else:
+            #     logging.info(f"Job {job['name']} {job['id']} is not queued.")
 
 def allocate_actions_runner(job_id, token):
+	"""
+	Allocates a runner for the given job ID by sending a POST request to the GitHub API to get a registration token.
+	Proceeds to submit a SLURM job to allocate the runner with the corresponding resources.
+ 	"""
     if job_id in allocated_jobs:
         logging.info(f"Runner already allocated for job {job_id}")
         return
@@ -172,9 +176,11 @@ def allocate_actions_runner(job_id, token):
     
     logging.info(f"Using runner size label: {runner_size_label}")
     runner_resources = get_runner_resources(runner_size_label)
+
+	# sbatch resource allocation command
     command = [
         "sbatch",
-		# f"--nodelist=trpro-slurm1",
+        # f"--nodelist=trpro-slurm1",
         f"--job-name=slurm-{runner_size_label}-{job_id}",
         f"--mem-per-cpu={runner_resources['mem-per-cpu']}",
         f"--cpus-per-task={runner_resources['cpu']}",
@@ -188,7 +194,7 @@ def allocate_actions_runner(job_id, token):
     ]
     
     logging.info(f"Running command: {' '.join(command)}")
-    # Execute the command with the modified environment
+
     result = subprocess.run(command, capture_output=True, text=True)
     output = result.stdout.strip()
     error_output = result.stderr.strip()
@@ -211,6 +217,9 @@ def allocate_actions_runner(job_id, token):
 
 
 def check_slurm_status():
+    """
+    Checks the status of SLURM jobs and updates the allocated_jobs dictionary.
+    """
     if not allocated_jobs:
         return
 
@@ -241,7 +250,6 @@ def check_slurm_status():
                 start_time_str = parts[2]
                 end_time_str = parts[3]
 
-                # Focus only on the main job ID and ignore '.batch' or '.extern' components
                 if '.batch' in job_component or '.extern' in job_component:
                     continue
 
@@ -262,7 +270,10 @@ def check_slurm_status():
     for job_id in to_remove:
         del allocated_jobs[job_id]
 
-def poll_slurm_statuses(sleep_time=1):
+def poll_slurm_statuses(sleep_time=5):
+	"""
+ 	Wrapper function to poll check_slurm_status.
+  	"""
     while True:
         check_slurm_status()
         time.sleep(sleep_time)
