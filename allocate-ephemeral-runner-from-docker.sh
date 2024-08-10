@@ -2,22 +2,22 @@
 # Use: ./ephemeral_runner.sh <repo-urL> <registration-token> <removal-token> <labels> 
 # Tailored for a use in Slurm environment, running Docker in Docker to allow CI to run docker commands 
 
+# Check if all required arguments are provided
+if [ $# -lt 4 ]; then
+    log "ERROR: Missing required arguments"
+    log "Usage: $0 <repo-url> <registration-token> <removal-token> <labels>"
+    exit 1
+fi
+
 REPO_URL=$1
 REGISTRATION_TOKEN=$2
 REMOVAL_TOKEN=$3
 LABELS=$4
 
-# start docker
 echo "INFO Starting Docker on Slurm"
 slurm-start-dockerd.sh
 
 export DOCKER_HOST=unix:///tmp/run/docker.sock
-
-# Ensure the container started correctly
-if [ $? -ne 0 ]; then
-    echo "Failed to start Docker container."
-    exit 1
-fi
 
 echo "INFO Docker in Slurm started"
 
@@ -32,8 +32,10 @@ chmod -R 777 $PARENT_DIR
 
 # Start the actions runner container. Mount the docker socket and the parent directory (of the working directory).
 DOCKER_CONTAINER_ID=$(docker run -d --name "ghar_${SLURMD_NODENAME}-${SLURM_JOB_ID}" --mount type=bind,source=/tmp/run/docker.sock,target=/var/run/docker.sock --mount type=bind,source=$PARENT_DIR,target=$PARENT_DIR ghcr.io/watonomous/actions-runner-image:main tail -f /dev/null)
+
 docker exec $DOCKER_CONTAINER_ID /bin/bash -c "sudo chmod 666 /var/run/docker.sock" # Allows the runner to access the docker socket
-# Configure the permissions of the parent directory within the container
+
+# Configure the the parent directory within the container
 docker exec $DOCKER_CONTAINER_ID /bin/bash -c "mkdir \"$PARENT_DIR\"" 
 docker exec $DOCKER_CONTAINER_ID /bin/bash -c "sudo chown -R runner:runner \"$PARENT_DIR\""
 docker exec $DOCKER_CONTAINER_ID /bin/bash -c "sudo chmod -R 755 \"$PARENT_DIR\"" 
@@ -46,14 +48,13 @@ docker exec $DOCKER_CONTAINER_ID /bin/bash -c "/home/runner/config.sh --work "$G
 echo "INFO Running runner..."
 docker exec $DOCKER_CONTAINER_ID /bin/bash -c "/home/runner/run.sh"
 
-docker exec $DOCKER_CONTAINER_ID /bin/bash -c "ls" 
-
 echo "INFO Removing runner..."
 docker exec $DOCKER_CONTAINER_ID /bin/bash -c "/home/runner/config.sh remove --token $REMOVAL_TOKEN"
 
+# Clean up
 docker stop $DOCKER_CONTAINER_ID
 docker rm $DOCKER_CONTAINER_ID
 
 echo "INFO Docker container removed"
-echo "INFO allocate-ephemeral-runner-from-docker.sh finished, now exiting."
-exit
+echo "INFO allocate-ephemeral-runner-from-docker.sh finished, exiting..."
+exit 0
