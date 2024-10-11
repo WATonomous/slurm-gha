@@ -24,7 +24,7 @@ export DOCKER_HOST=unix:///tmp/run/docker.sock
 
 # Define the parent directory for GitHub Actions in the host machine
 PARENT_DIR="/tmp/runner-${SLURMD_NODENAME}-${SLURM_JOB_ID}"
-PROVISIONER_DIR="/mnt/wato-drive/alexboden/provisioner-cache/$RUN_ID"
+PROVISIONER_DIR="/mnt/wato-drive2/alexboden/provisioner-cache/$RUN_ID"
 log "INFO Parent directory for GitHub Actions: $PARENT_DIR"
 
 start_time=$(date +%s)
@@ -39,6 +39,10 @@ log "INFO Created and set permissions for parent directory (Duration: $(($end_ti
 log "INFO Starting Docker on Slurm"
 start_time=$(date +%s)
 slurm-start-dockerd.sh
+if [ $? -ne 0 ]; then
+    log "ERROR Docker failed to start (non-zero exit code)"
+    exit 1
+fi
 end_time=$(date +%s)
 log "INFO Docker in Slurm started (Duration: $(($end_time - $start_time)) seconds)"
 
@@ -52,11 +56,8 @@ DOCKER_IMAGE="/cvmfs/unpacked.cern.ch/ghcr.io/watonomous/actions-runner-image:ma
 
 log "INFO Starting Apptainer container and configuring runner"
 
-apptainer exec --writable-tmpfs --fakeroot --bind /tmp/run/docker.sock:/tmp/run/docker.sock --bind /tmp:/tmp /cvmfs/unpacked.cern.ch/ghcr.io/watonomous/actions-runner-image:main /bin/bash -c "export RUNNER_ALLOW_RUNASROOT=1 && export PYTHONPATH=/home/runner/.local/lib/python3.10/site-packages && /home/runner/config.sh --work \"${GITHUB_ACTIONS_WKDIR}\" --url \"${REPO_URL}\" --token \"${REGISTRATION_TOKEN}\" --labels \"${LABELS}\" --name \"slurm-${SLURMD_NODENAME}-${SLURM_JOB_ID}\" --unattended --ephemeral && /home/runner/run.sh && /home/runner/config.sh remove --token \"${REMOVAL_TOKEN}\""
+apptainer exec --writable-tmpfs --containall --fakeroot --bind /tmp/run/docker.sock:/tmp/run/docker.sock --bind /home/alexboden:/home/alexboden --bind /tmp:/tmp /cvmfs/unpacked.cern.ch/ghcr.io/watonomous/actions-runner-image:main /bin/bash -c "export DOCKER_HOST=unix:///tmp/run/docker.sock && export RUNNER_ALLOW_RUNASROOT=1 && export PYTHONPATH=/home/runner/.local/lib/python3.10/site-packages && /home/runner/config.sh --work \"${GITHUB_ACTIONS_WKDIR}\" --url \"${REPO_URL}\" --token \"${REGISTRATION_TOKEN}\" --labels \"${LABELS}\" --name \"slurm-${SLURMD_NODENAME}-${SLURM_JOB_ID}\" --unattended --ephemeral && /home/runner/run.sh && /home/runner/config.sh remove --token \"${REMOVAL_TOKEN}\""
 
-# mount tmp to get rid of https://github.com/WATonomous/infra-config/actions/runs/10822451152/job/30026308856#step:4:88
-
-log "exiting apptainer"
 log "INFO Runner removed (Duration: $(($end_time - $start_time)) seconds)"
 
 log "INFO allocate-ephemeral-runner-from-apptainer.sh finished, exiting..."
