@@ -72,16 +72,15 @@ def poll_github_actions_and_allocate_runners(url, token, sleep_time=5):
     while True:
         data, _ = get_gh_api(url, token, etag)
         if data:
-            logging.info("Changes detected.")
             allocate_runners_for_jobs(data, token)
             logging.info("Polling for queued workflows...")
         time.sleep(sleep_time) # issues occur if you request to frequently
 
 
 def get_all_jobs(workflow_id, token):
-	"""
- 	Get all CI jobs for a given workflow ID by iterating through the paginated API response.
-  	"""
+    """
+     Get all CI jobs for a given workflow ID by iterating through the paginated API response.
+      """
     all_jobs = []
     page = 1
     per_page = 100 # Maximum number of jobs per page according to rate limits
@@ -106,35 +105,35 @@ def allocate_runners_for_jobs(workflow_data, token):
         return
     
     number_of_queued_workflows = workflow_data["total_count"] 
-    logging.info(f"Total number of queued workflows: {number_of_queued_workflows}")
+    # logging.info(f"Total number of queued workflows: {number_of_queued_workflows}")
     number_of_queued_workflows = len(workflow_data["workflow_runs"])
-    logging.info(f"Number of workflow runs: {number_of_queued_workflows}")
+    # logging.info(f"Number of workflow runs: {number_of_queued_workflows}")
     
     for i in range(number_of_queued_workflows):
         workflow_id = workflow_data["workflow_runs"][i]["id"]
-        logging.info(f"Evaluating workflow ID: {workflow_id}")
-		# If statement to check if the workflow is on the testing branch, remove this for production
-		branch = workflow_data["workflow_runs"][i]["head_branch"]
-        if branch != "alexboden/test-slurm-gha-runner":
-            logging.info(f"Skipping workflow {workflow_id} because it is not on the correct branch, branch: {branch}.")
+        # logging.info(f"Evaluating workflow ID: {workflow_id}")
+        # If statement to check if the workflow is on the testing branch, remove this for production
+        branch = workflow_data["workflow_runs"][i]["head_branch"]
+        if branch != "alexboden/test-slurm-gha-runner" and branch != "alexboden/test-ci-apptainer":
+            # logging.info(f"Skipping workflow {workflow_id} because it is not on the correct branch, branch: {branch}.")
             continue
-        else:
-            logging.info(f"Processing workflow {workflow_id} because it is on the correct branch, branch: {branch}.")
+        # else:
+            # logging.info(f"Processing workflow {workflow_id} because it is on the correct branch, branch: {branch}.")
         job_data = get_all_jobs(workflow_id, token)
-        logging.info(f"There are {len(job_data)} jobs in the workflow.")
+        # logging.info(f"There are {len(job_data)} jobs in the workflow.")
         for job in job_data:
             if job["status"] == "queued":
                 queued_job_id = job["id"]
                 allocate_actions_runner(queued_job_id, token) 
-                logging.info(f"Job {job['name']} {job['id']} is queued.")
+                # logging.info(f"Job {job['name']} {job['id']} is queued.")
             # else:
             #     logging.info(f"Job {job['name']} {job['id']} is not queued.")
 
 def allocate_actions_runner(job_id, token):
-	"""
-	Allocates a runner for the given job ID by sending a POST request to the GitHub API to get a registration token.
-	Proceeds to submit a SLURM job to allocate the runner with the corresponding resources.
- 	"""
+    """
+    Allocates a runner for the given job ID by sending a POST request to the GitHub API to get a registration token.
+    Proceeds to submit a SLURM job to allocate the runner with the corresponding resources.
+     """
     if job_id in allocated_jobs:
         logging.info(f"Runner already allocated for job {job_id}")
         return
@@ -158,29 +157,31 @@ def allocate_actions_runner(job_id, token):
     data, _ = get_gh_api(f'{GITHUB_API_BASE_URL}/actions/jobs/{job_id}', token)
     labels = data["labels"] # should only be one label in prod
     logging.info(f"Job labels: {labels}")
-
+    
+    run_id = data['run_id']
+    
     allocated_jobs[job_id] = RunningJob(job_id, None, data['workflow_name'], data['name'], labels)
 
-    if labels[0] != "alextest-gh-arc-runners-small" and labels[0] != "alextest-gh-arc-runners-medium" and labels[0] != "alextest-gh-arc-runners-large" and labels[0] != "alextest-gh-arc-runners-xlarge":
+    if labels[0] != "alexboden-gh-arc-runners-small" and labels[0] != "alexboden-gh-arc-runners-medium" and labels[0] != "alexboden-gh-arc-runners-large" and labels[0] != "alexboden-gh-arc-runners-xlarge":
         logging.info(f"Skipping job because it is not for the correct runner. labels: {labels}, labels[0]: {labels[0]}")
         del allocated_jobs[job_id]
         return
     
     runner_size_label = "gh-arc-runners-small" # default to small runner
-    if "alextest-gh-arc-runners-medium" in labels:
+    if "alexboden-gh-arc-runners-medium" in labels:
         runner_size_label = "gh-arc-runners-medium"
-    elif "alextest-gh-arc-runners-large" in labels:
+    elif "alexboden-gh-arc-runners-large" in labels:
         runner_size_label = "gh-arc-runners-large"
-    elif "alextest-gh-arc-runners-xlarge" in labels:
+    elif "alexboden-gh-arc-runners-xlarge" in labels:
         runner_size_label = "gh-arc-runners-xlarge"
     
     logging.info(f"Using runner size label: {runner_size_label}")
     runner_resources = get_runner_resources(runner_size_label)
 
-	# sbatch resource allocation command
+    # sbatch resource allocation command
     command = [
         "sbatch",
-        # f"--nodelist=trpro-slurm1",
+        # f"--nodelist=thor-slurm1",
         f"--job-name=slurm-{runner_size_label}-{job_id}",
         f"--mem-per-cpu={runner_resources['mem-per-cpu']}",
         f"--cpus-per-task={runner_resources['cpu']}",
@@ -190,7 +191,8 @@ def allocate_actions_runner(job_id, token):
         GITHUB_REPO_URL,
         registration_token,
         removal_token,
-        ','.join(labels)
+        ','.join(labels),
+        str(run_id)
     ]
     
     logging.info(f"Running command: {' '.join(command)}")
@@ -254,11 +256,17 @@ def check_slurm_status():
                     continue
 
                 # Convert time strings to datetime objects
-                start_time = datetime.strptime(start_time_str, '%Y-%m-%dT%H:%M:%S') if start_time_str != 'Unknown' else None
-                end_time = datetime.strptime(end_time_str, '%Y-%m-%dT%H:%M:%S') if end_time_str != 'Unknown' else None
-
-                if status in ['COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT']: # otherwise job is not finished running
-                    duration = "[Unknown Duration]"
+               
+                if status.startswith('COMPLETED') or status.startswith('FAILED') or status.startswith('CANCELLED') or status.startswith('TIMEOUT'):
+                    try:
+                        start_time = datetime.strptime(start_time_str, '%Y-%m-%dT%H:%M:%S')
+                        end_time = datetime.strptime(end_time_str, '%Y-%m-%dT%H:%M:%S')
+                    except Exception as e:
+                        logging.error(f"Error parsing start/end time for job {job_component}: {e}")
+                        start_time = None
+                        end_time = None
+                        duration = "[Unknown Duration]"
+                    
                     if start_time and end_time:
                         duration = end_time - start_time
                     logging.info(f"Slurm job {job_component} {status} in {duration}. Running Job Info: {str(runningjob)}")
@@ -271,16 +279,16 @@ def check_slurm_status():
         del allocated_jobs[job_id]
 
 def poll_slurm_statuses(sleep_time=5):
-	"""
- 	Wrapper function to poll check_slurm_status.
-  	"""
+    """
+    Wrapper function to poll check_slurm_status.
+    """
     while True:
         check_slurm_status()
         time.sleep(sleep_time)
 
 if __name__ == "__main__":
     # need to use threading to achieve simultaneous polling
-    github_thread = threading.Thread(target=poll_github_actions_and_allocate_runners, args=(queued_workflows_url, GITHUB_ACCESS_TOKEN))
+    github_thread = threading.Thread(target=poll_github_actions_and_allocate_runners, args=(queued_workflows_url, GITHUB_ACCESS_TOKEN, 2))
     slurm_thread = threading.Thread(target=poll_slurm_statuses)
 
     github_thread.start()
