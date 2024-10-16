@@ -1,0 +1,91 @@
+name: Build and publish Images/Packages
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*.*.*"
+  pull_request:
+    branches:
+      - main
+
+concurrency: build_and_publish_concurrency_group-${{ github.event.pull_request.number || github.ref_name }}
+
+env:
+  IMAGE_NAME: ${{ github.repository }}
+  IMAGE_REGISTRY: ghcr.io
+  REGISTRY_USER: ${{ github.actor }}
+  REGISTRY_PASSWORD: ${{ github.token }}
+
+jobs:
+  create-and-publish-packages:
+    runs-on: ubuntu-latest
+    permissions:
+      # Required to push to the container registry
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@40891eba8c2bcd1309b07ba8b11232f313e86779
+        with:
+          registry: ${{ env.IMAGE_REGISTRY }}
+          username: ${{ env.REGISTRY_USER }}
+          password: ${{ env.REGISTRY_PASSWORD }}
+
+      # MARK: publisher image
+      - name: Extract metadata (tags, labels) for publisher
+        id: publisher-meta
+        uses: docker/metadata-action@c4ee3adeed93b1fa6a762f209fb01608c1a22f1e
+        with:
+          images: ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: |
+            suffix=-publisher
+          tags: |
+            type=schedule
+            type=ref,event=branch
+            type=ref,event=tag
+            type=ref,event=pr
+            type=sha,format=long
+
+      - name: Build and push publisher image
+        uses: docker/build-push-action@91df6b874e498451163feb47610c87c4a218c1ee
+        with:
+          context: .
+          target: publisher
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            DOCKER_METADATA_OUTPUT_JSON
+          tags: ${{ steps.publisher-meta.outputs.tags }}
+          labels: ${{ steps.publisher-meta.outputs.labels }}
+
+      # MARK: server image
+      - name: Extract metadata (tags, labels) for server
+        id: server-meta
+        uses: docker/metadata-action@c4ee3adeed93b1fa6a762f209fb01608c1a22f1e
+        with:
+          images: ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: |
+            suffix=-server
+          tags: |
+            type=schedule
+            type=ref,event=branch
+            type=ref,event=tag
+            type=ref,event=pr
+            type=sha,format=long
+
+      - name: Build and push server image
+        uses: docker/build-push-action@91df6b874e498451163feb47610c87c4a218c1ee
+        with:
+          context: .
+          target: server
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            DOCKER_METADATA_OUTPUT_JSON
+          tags: ${{ steps.server-meta.outputs.tags }}
+          labels: ${{ steps.server-meta.outputs.labels }}
