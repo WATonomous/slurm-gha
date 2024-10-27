@@ -15,6 +15,7 @@ COPY requirements.txt /app/
 RUN pip3 install -r requirements.txt
 
 # Run the Python script
+# Note the env variable GITHUB_ACCESS_TOKEN will need to be set in order to authenticate with the GitHub API
 CMD ["python3", "main.py"]
 
 USER gha-runner

@@ -1,6 +1,6 @@
 # run-gha-on-slurm
 
-This is still a work in progress. The goal is to run GitHub Actions on the Slurm cluster.
+The purpose of this project is to run GitHub Actions on prem via our Slurm cluster.
 
 # Overview
 1. The Allocator polls the GitHub API for queued jobs
@@ -41,9 +41,13 @@ Unfortunately, caching the image is not an elegant solution because this would r
 This led us to investegate a [Docker pull through cache](https://docs.docker.com/docker-hub/mirror/).
 
 
-### Docker References
+### References
 1. [Docker Rootless](https://docs.docker.com/engine/security/rootless/)
 2. [Custom Actions Runner Image](https://github.com/WATonomous/actions-runner-image)
+3. [Apptainer](https://apptainer.org/docs/user/main/index.html)
+4. [Stargz Snapshotter](https://github.com/containerd/stargz-snapshotter)
+5. [CVMFS](https://cvmfs.readthedocs.io/en/stable/)
+6. [CVMFS Stratum 0](https://github.com/WATonomous/cvmfs-ephemeral/)
 
 
 # Issues
