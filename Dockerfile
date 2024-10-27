@@ -16,3 +16,5 @@ RUN pip3 install -r requirements.txt
 
 # Run the Python script
 CMD ["python3", "main.py"]
+
+USER gha-runner
