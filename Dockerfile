@@ -18,4 +18,4 @@ RUN pip3 install -r requirements.txt
 # Note the env variable GITHUB_ACCESS_TOKEN will need to be set in order to authenticate with the GitHub API
 CMD ["python3", "main.py"]
 
-USER alexboden
+# USER alexboden
