@@ -31,7 +31,7 @@ logger.addHandler(console_handler)
 # Load GitHub access token from .env file
 # Only secret required is the GitHub access token
 load_dotenv()
-GITHUB_ACCESS_TOKEN = os.getenv('GITHUB_ACCESS_TOKEN').trim()
+GITHUB_ACCESS_TOKEN = os.getenv('GITHUB_ACCESS_TOKEN').strip()
 
 # Constants
 queued_workflows_url = f'{GITHUB_API_BASE_URL}/actions/runs?status=queued'
