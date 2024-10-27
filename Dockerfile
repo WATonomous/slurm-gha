@@ -1,4 +1,8 @@
-FROM python:3.9-slim
+# Use the Slurm base image
+FROM ghcr.io/watonomous/slurm-dist:sha-d71cada1ede70e133c6765e0239840ec97aadd40-slurmdbd
+
+# Install Python and any dependencies
+RUN apt-get update && apt-get install -y python3 python3-pip && rm -rf /var/lib/apt/lists/*
 
 # Set the working directory in the container
 WORKDIR /app
@@ -6,9 +10,9 @@ WORKDIR /app
 # Copy the Python script and any necessary files
 COPY main.py config.py runner_size_config.py RunningJob.py allocate-ephemeral-runner-from-apptainer.sh /app/
 
-# Install any required Python packages
+# Install Python requirements
 COPY requirements.txt /app/
-RUN pip install -r requirements.txt
+RUN pip3 install -r requirements.txt
 
 # Run the Python script
-CMD ["python", "main.py"]
+CMD ["python3", "main.py"]
