@@ -185,7 +185,7 @@ def allocate_actions_runner(job_id, token):
         f"--job-name=slurm-{runner_size_label}-{job_id}",
         f"--mem-per-cpu={runner_resources['mem-per-cpu']}",
         f"--cpus-per-task={runner_resources['cpu']}",
-        f"--gres=tmpdisk:{runner_resources['tmpdisk']}",
+        f"--gres tmpdisk:{runner_resources['tmpdisk']}",
         f"--time={runner_resources['time']}",
         ALLOCATE_RUNNER_SCRIPT_PATH, # allocate-ephemeral-runner-from-docker.sh
         GITHUB_REPO_URL,
