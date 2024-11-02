@@ -13,7 +13,7 @@ from config import GITHUB_API_BASE_URL, GITHUB_REPO_URL, ALLOCATE_RUNNER_SCRIPT_
 from RunningJob import RunningJob
 
 # Configure logging
-log_file = 'slurm-action-runners.log'
+log_file = '/tmp/slurm-action-runners.log'
 log_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)  # 10 MB per file, 5 backup files
 log_handler.setLevel(logging.INFO)
 log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
