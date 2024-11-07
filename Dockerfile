@@ -20,4 +20,4 @@ RUN pip3 install -r requirements.txt
 ENTRYPOINT ["python3", "/app/main.py"]
 
 # Custom user for running the CI
-USER watcloud-slurm-ci 
+# USER watcloud-slurm-ci 
