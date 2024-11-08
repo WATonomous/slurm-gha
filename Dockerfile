@@ -1,5 +1,5 @@
 # Use the Slurm base image
-FROM ghcr.io/watonomous/slurm-dist:sha-d71cada1ede70e133c6765e0239840ec97aadd40-slurmctld
+FROM ghcr.io/watonomous/slurm-dist:main-daemon-base@sha256:bf7503c3bc94074038a896ee42356228d14e5747fab6d00f0d7c1f54416bd2b
 
 # Install Python and any dependencies
 RUN apt-get update && apt-get install -y python3 python3-pip && rm -rf /var/lib/apt/lists/*
