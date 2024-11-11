@@ -35,7 +35,7 @@ log "INFO Created and set permissions for parent directory (Duration: $(($end_ti
 
 log "INFO Starting Docker on Slurm"
 start_time=$(date +%s)
-slurm-start-dockerd.sh
+/opt/slurm/bin/slurm-start-dockerd.sh
 export DOCKER_HOST=unix:///tmp/run/docker.sock 
 if [ $? -ne 0 ]; then
     log "ERROR Docker failed to start (non-zero exit code)"
