@@ -20,4 +20,4 @@ CMD ["python3", "main.py"]
 # ENTRYPOINT ["python3", "/app/main.py"]
 
 # Custom user for running the CI
-USER watcloud-slurm-ci 
+# USER watcloud-slurm-ci 
