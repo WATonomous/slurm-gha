@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y python3 python3-pip
 WORKDIR /watcloud-slurm-ci/
 
 # Copy the Python script and any necessary files
-COPY main.py config.py runner_size_config.py RunningJob.py allocate-ephemeral-runner-from-apptainer.sh /app/
+COPY main.py config.py runner_size_config.py RunningJob.py allocate-ephemeral-runner-from-apptainer.sh /watcloud-slurm-ci/
 
 # Install Python requirements
 COPY requirements.txt /watcloud-slurm-ci/
