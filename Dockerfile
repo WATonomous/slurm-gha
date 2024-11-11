@@ -13,11 +13,11 @@ COPY main.py config.py runner_size_config.py RunningJob.py allocate-ephemeral-ru
 # Install Python requirements
 COPY requirements.txt /home/watcloud-slurm-ci/
 RUN pip3 install -r requirements.txt
-RUN chmod +x /start.sh
+RUN chmod +x start.sh
 
 # Run the Python script
 # Note the env variable GITHUB_ACCESS_TOKEN will need to be set in order to authenticate with the GitHub API
-CMD ["python3", "/home/watcloud-slurm-ci/start.sh"]
+ENTRYPOINT ["/home/watcloud-slurm-ci/start.sh"]
 # ENTRYPOINT ["python3", "/app/main.py"]
 
 # Custom user for running the CI
