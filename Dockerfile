@@ -5,13 +5,13 @@ FROM ghcr.io/watonomous/slurm-dist:v0.0.12-daemon-base
 RUN apt-get update && apt-get install -y python3 python3-pip 
 
 # Set the working directory in the container
-WORKDIR /app
+WORKDIR /watcloud-slurm-ci/
 
 # Copy the Python script and any necessary files
 COPY main.py config.py runner_size_config.py RunningJob.py allocate-ephemeral-runner-from-apptainer.sh /app/
 
 # Install Python requirements
-COPY requirements.txt /app/
+COPY requirements.txt /watcloud-slurm-ci/
 RUN pip3 install -r requirements.txt
 
 # Run the Python script
