@@ -16,8 +16,8 @@ RUN pip3 install -r requirements.txt
 
 # Run the Python script
 # Note the env variable GITHUB_ACCESS_TOKEN will need to be set in order to authenticate with the GitHub API
-# CMD ["python3", "main.py"]
+CMD ["python3", "main.py"]
 # ENTRYPOINT ["python3", "/app/main.py"]
 
 # Custom user for running the CI
-# USER watcloud-slurm-ci 
+USER watcloud-slurm-ci 
