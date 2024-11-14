@@ -15,4 +15,4 @@ done
 echo "Munge socket is ready. Starting Python script."
 
 # Start the Python script as the watcloud-slurm-ci user
-su -s /bin/bash -c "python3 /home/watcloud-slurm-ci/main.py" watcloud-slurm-ci
+su -s /bin/bash -c "python3 /home/watcloud-slurm-ci/debug.py" watcloud-slurm-ci
