@@ -41,7 +41,7 @@ def run_sbatch_incrementally():
     base_command = [
         "/opt/slurm/bin/sbatch",
         "--job-name=test-no-gres",
-        "allocate-ephemeral-runner-from-apptainer.sh"
+        "echo.sh"
     ]
     
     # Define additional options to add incrementally
@@ -49,7 +49,7 @@ def run_sbatch_incrementally():
         "--mem-per-cpu=2G",
         "--cpus-per-task=1",
         "--time=00:01:00",
-        "--gres=tmpdisk:4096"
+        "--gres tmpdisk:4096"
     ]
 
     # Run the base command first
