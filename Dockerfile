@@ -19,9 +19,6 @@ RUN chmod +x *.sh
 RUN useradd -u 1814 -m -d /home/watcloud-slurm-ci watcloud-slurm-ci
 RUN chown -R watcloud-slurm-ci:watcloud-slurm-ci /home/watcloud-slurm-ci/
 
-# Slurm binaries are in /opt/slurm/bin
-ENV PATH="/opt/slurm/bin:${PATH}"
-
 # Run the Python script
 # Note the env variable GITHUB_ACCESS_TOKEN will need to be set
 ENTRYPOINT ["/home/watcloud-slurm-ci/start.sh"]
