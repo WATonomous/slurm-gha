@@ -32,6 +32,7 @@ logger.addHandler(console_handler)
 # Only secret required is the GitHub access token
 load_dotenv()
 GITHUB_ACCESS_TOKEN = os.getenv('GITHUB_ACCESS_TOKEN').strip()
+os.environ["PATH"] = "/opt/slurm/bin:" + os.environ["PATH"]
 
 # Constants
 queued_workflows_url = f'{GITHUB_API_BASE_URL}/actions/runs?status=queued'
