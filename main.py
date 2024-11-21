@@ -83,6 +83,7 @@ def poll_github_actions_and_allocate_runners(url, token, sleep_time=5):
         data, _ = get_gh_api(url, token, etag)
         if data:
             allocate_runners_for_jobs(data, token)
+            global POLLED_WITHOUT_ALLOCATING
             if not POLLED_WITHOUT_ALLOCATING:
                 logger.info("Polling for queued workflows...")
                 POLLED_WITHOUT_ALLOCATING = True
@@ -141,6 +142,7 @@ def allocate_actions_runner(job_id, token):
         logger.info(f"Runner already allocated for job {job_id}")
         return
     logger.info(f"Allocating runner for job {job_id}")
+    global POLLED_WITHOUT_ALLOCATING
     POLLED_WITHOUT_ALLOCATING = False
     allocated_jobs[job_id] = None # mark as allocated to prevent double allocation
 
