@@ -1,8 +1,5 @@
 import os
 
-from config import LIST_OF_RUNNER_LABELS, ALLOCATE_RUNNER_SCRIPT_PATH 
-
-
 def get_runner_resources(runner_label):
     """
     Returns the resources required for a runner based on the runner label.
