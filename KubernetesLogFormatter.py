@@ -1,5 +1,6 @@
 import json
 import os
+import logging
 
 POD_NAME = os.getenv('POD_NAME', 'unknown-pod')
 NAMESPACE = os.getenv('NAMESPACE', 'default')
