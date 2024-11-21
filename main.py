@@ -1,10 +1,10 @@
 import requests
 import time
 import logging
-from logging.handlers import RotatingFileHandler
 from datetime import datetime
 import subprocess
 import os
+import sys
 import threading
 from dotenv import load_dotenv
 
@@ -14,21 +14,22 @@ from RunningJob import RunningJob
 from KubernetesLogFormatter import KubernetesLogFormatter
 
 # Configure logging
-log_formatter = KubernetesFormatter()
+logger = logging.getLogger()
+log_formatter = KubernetesLogFormatter()
 
 # StreamHandler for stdout (INFO and below)
-stdout_handler = logger.StreamHandler(sys.stdout)
-stdout_handler.setLevel(logger.INFO) 
+stdout_handler = logging.StreamHandler(sys.stdout)
+stdout_handler.setLevel(logging.INFO) 
 stdout_handler.setFormatter(log_formatter)
 
 # StreamHandler for stderr (WARNING and above)
-stderr_handler = logger.StreamHandler(sys.stderr)
-stderr_handler.setLevel(logger.WARNING)
+stderr_handler = logging.StreamHandler(sys.stderr)
+stderr_handler.setLevel(logging.WARNING)
 stderr_handler.setFormatter(log_formatter)
 
 # Initialize logger
-logger = logger.getLogger()
-logger.setLevel(logger.DEBUG)
+logger = logging.getLogger()
+logger.setLevel(logging.DEBUG)
 
 # Add handlers to logger
 logger.addHandler(stdout_handler)
