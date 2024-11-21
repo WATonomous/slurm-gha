@@ -2,9 +2,6 @@ import json
 import os
 import logging
 
-POD_NAME = os.getenv('HOSTNAME', 'unknown-pod')
-NAMESPACE = get_kubernetes_namespace()
-
 def get_kubernetes_namespace():
     namespace_file = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
     try:
@@ -22,7 +19,7 @@ class KubernetesLogFormatter(logging.Formatter):
             "timestamp": self.formatTime(record, self.datefmt),
             "level": record.levelname,
             "message": record.getMessage(),
-            "pod_name": POD_NAME,
-            "namespace": NAMESPACE,
+            "pod_name": os.getenv('HOSTNAME', 'unknown-pod'),
+            "namespace":  get_kubernetes_namespace(),
         }
         return json.dumps(log_record)

@@ -122,7 +122,7 @@ def allocate_runners_for_jobs(workflow_data, token):
     
     for i in range(number_of_queued_workflows):
         workflow_id = workflow_data["workflow_runs"][i]["id"]
-        logger.info(f"Evaluating workflow ID: {workflow_id}")
+        # logger.info(f"Evaluating workflow ID: {workflow_id}")
         branch = workflow_data["workflow_runs"][i]["head_branch"]
         if branch != "alexboden/test-slurm-gha-runner" and branch != "alexboden/test-ci-apptainer":
             continue
