@@ -54,21 +54,7 @@ export ACTIONS_RUNNER_IMAGE="/cvmfs/unpacked.cern.ch/ghcr.io/watonomous/actions-
 
 log "INFO Starting Apptainer container and configuring runner"
 
-# --compat is 
-
-    # --containall
-
-    # --no-init
-
-    # --no-umask
-
-    # --writable-tmpfs
-
-    # --no-eval
-
 apptainer exec --writable-tmpfs --containall --fakeroot --bind /tmp/run/docker.sock:/tmp/run/docker.sock --bind /cvmfs/cvmfs-ephemeral.cluster.watonomous.ca:/cvmfs/cvmfs-ephemeral.cluster.watonomous.ca --bind /home/alexboden:/home/alexboden --bind /tmp:/tmp /cvmfs/unpacked.cern.ch/ghcr.io/watonomous/actions-runner-image:main /bin/bash -c "export DOCKER_HOST=unix:///tmp/run/docker.sock && export RUNNER_ALLOW_RUNASROOT=1 && export PYTHONPATH=/home/runner/.local/lib/python3.10/site-packages && /home/runner/config.sh --work \"${GITHUB_ACTIONS_WKDIR}\" --url \"${REPO_URL}\" --token \"${REGISTRATION_TOKEN}\" --labels \"${LABELS}\" --name \"slurm-${SLURMD_NODENAME}-${SLURM_JOB_ID}\" --unattended --ephemeral && /home/runner/run.sh && /home/runner/config.sh remove --token \"${REMOVAL_TOKEN}\""
-
-# apptainer exec --compat --fakeroot --bind /tmp/run/docker.sock:/tmp/run/docker.sock --bind /cvmfs/cvmfs-ephemeral.cluster.watonomous.ca:/cvmfs/cvmfs-ephemeral.cluster.watonomous.ca --bind /home/alexboden:/home/alexboden --bind /tmp:/tmp --bind /cvmfs/soft.computecanada.ca/:/cvmfs/soft.computecanada.ca/ /cvmfs/unpacked.cern.ch/ghcr.io/watonomous/actions-runner-image:main /bin/bash -c "source /cvmfs/soft.computecanada.ca/config/profile/bash.sh && export DOCKER_HOST=unix:///tmp/run/docker.sock && export RUNNER_ALLOW_RUNASROOT=1 && export PYTHONPATH=/home/runner/.local/lib/python3.10/site-packages && /home/runner/config.sh --work \"${GITHUB_ACTIONS_WKDIR}\" --url \"${REPO_URL}\" --token \"${REGISTRATION_TOKEN}\" --labels \"${LABELS}\" --name \"slurm-${SLURMD_NODENAME}-${SLURM_JOB_ID}\" --unattended --ephemeral && /home/runner/run.sh && /home/runner/config.sh remove --token \"${REMOVAL_TOKEN}\""
 
 log "INFO Runner removed (Duration: $(($end_time - $start_time)) seconds)"
 

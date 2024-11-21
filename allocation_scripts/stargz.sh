@@ -16,9 +16,9 @@ record_timing() {
 }
 
 # Check if all required arguments are provided
-if [ $# -lt 4 ]; then
+if [ $# -lt 5 ]; then
     log "ERROR: Missing required arguments"
-    log "Usage: $0 <repo-url> <registration-token> <removal-token> <label>"
+    log "Usage: $0 <repo-url> <registration-token> <removal-token> <label> <run_id>"
     exit 1
 fi
 
@@ -71,19 +71,21 @@ record_timing "Start stargz" $duration
 export DOCKER_HOST=unix:///tmp/run/docker.sock
 
 # Define the parent directory for GitHub Actions in the host machine
-PARENT_DIR="/tmp/runner-${SLURMD_NODENAME}-${SLURM_JOB_ID}"
-PROVISIONER_DIR="/mnt/wato-drive/alexboden/provisioner-cache/"
+PARENT_DIR="/dev/shm/docker/runner-${SLURMD_NODENAME}-${SLURM_JOB_ID}"
+PROVISIONER_DIR="/mnt/wato-drive2/alexboden/provisioner-cache/$RUN_ID"
 log "INFO Parent directory for GitHub Actions: $PARENT_DIR"
 
 start_time=$(date +%s)
 GITHUB_ACTIONS_WKDIR="$PARENT_DIR/_work"
 mkdir -p $PARENT_DIR
+ls -l /mnt/wato-drive2/alexboden/provisioner-cache
+mkdir -p $PROVISIONER_DIR
 chown -R $(id -u):$(id -g) $PARENT_DIR
 chmod -R 777 $PARENT_DIR
 end_time=$(date +%s)
 duration=$((end_time - start_time))
-log "INFO Created and set permissions for parent directory (Duration: $duration seconds)"
-record_timing "Create Parent Directory" $duration
+log "INFO Created and set permissions for parent and provisioner directories (Duration: $duration seconds)"
+record_timing "Create Directories" $duration
 
 # Start the actions runner container
 log "INFO Starting actions runner container"
@@ -98,12 +100,13 @@ record_timing "Start Container" $duration
 log "INFO Configuring container"
 start_time=$(date +%s)
 ./bin/nerdctl exec $DOCKER_CONTAINER_ID /bin/bash -c "sudo chmod 666 /var/run/docker.sock" # Allows the runner to access the docker socket
-./bin/nerdctl exec $DOCKER_CONTAINER_ID /bin/bash -c "mkdir \"$PARENT_DIR\"" 
+./bin/nerdctl exec $DOCKER_CONTAINER_ID /bin/bash -c "mkdir -p \"$PARENT_DIR\"" 
 ./bin/nerdctl exec $DOCKER_CONTAINER_ID /bin/bash -c "sudo chown -R runner:runner \"$PARENT_DIR\""
-docker exec $DOCKER_CONTAINER_ID /bin/bash -c "sudo chmod -R 755 \"$PARENT_DIR\"" 
+./bin/nerdctl exec $DOCKER_CONTAINER_ID /bin/bash -c "sudo chmod -R 755 \"$PARENT_DIR\"" 
 
-./bin/nerdctl exec $DOCKER_CONTAINER_ID /bin/bash -c "sudo chown -R runner:runner \"$PROVISIONER_DIR\""
-docker exec $DOCKER_CONTAINER_ID /bin/bash -c "sudo chmod -R 755 \"$PROVISIONER_DIR\"" 
+# ./bin/nerdctl exec $DOCKER_CONTAINER_ID /bin/bash -c "mkdir -p \"$PROVISIONER_DIR\""
+# ./bin/nerdctl exec $DOCKER_CONTAINER_ID /bin/bash -c "sudo chown -R root:root \"$PROVISIONER_DIR\""
+./bin/nerdctl exec $DOCKER_CONTAINER_ID /bin/bash -c "sudo chmod -R 777 \"$PROVISIONER_DIR\"" 
 
 end_time=$(date +%s)
 duration=$((end_time - start_time))
@@ -138,8 +141,8 @@ record_timing "Remove Runner" $duration
 # Clean up
 log "INFO Stopping and removing Docker container"
 start_time=$(date +%s)
-docker stop $DOCKER_CONTAINER_ID
-docker rm $DOCKER_CONTAINER_ID
+./bin/nerdctl stop $DOCKER_CONTAINER_ID
+./bin/nerdctl rm $DOCKER_CONTAINER_ID
 end_time=$(date +%s)
 duration=$((end_time - start_time))
 log "INFO Docker container removed (Duration: $duration seconds)"
@@ -155,9 +158,9 @@ kill $SNAPSHOTTER_PID
 
 wait $CONTAINERD_PID
 wait $SNAPSHOTTER_PID
-end_time=$(date +%s)
 
 rootlesskit rm -rf /tmp/{run,config,containerd*,nerdctl}
+end_time=$(date +%s)
 duration=$((end_time - start_time))
 log "INFO Containerd and Stargz cleaned up (Duration: $duration seconds)"
 
