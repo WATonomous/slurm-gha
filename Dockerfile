@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y python3 python3-pip
 WORKDIR /home/watcloud-slurm-ci/
 
 # Copy the Python script and any necessary files
-COPY main.py config.py runner_size_config.py RunningJob.py allocate-ephemeral-runner-from-apptainer.sh start.sh /home/watcloud-slurm-ci/
+COPY main.py config.py runner_size_config.py RunningJob.py KubernetesLogFormatter.py allocation_scripts/apptainer.sh start.sh /home/watcloud-slurm-ci/
 
 # Install Python requirements
 COPY requirements.txt /home/watcloud-slurm-ci/
@@ -19,6 +19,6 @@ RUN chmod +x *.sh
 RUN useradd -u 1814 -m -d /home/watcloud-slurm-ci watcloud-slurm-ci
 RUN chown -R watcloud-slurm-ci:watcloud-slurm-ci /home/watcloud-slurm-ci/
 
-# Run the Python script
+# Run the Python script and start Slurm munge daemon via supervisord
 # Note the env variable GITHUB_ACCESS_TOKEN will need to be set
 ENTRYPOINT ["/home/watcloud-slurm-ci/start.sh"]
