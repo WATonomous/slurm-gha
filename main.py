@@ -163,18 +163,13 @@ def allocate_actions_runner(job_id, token):
     
     allocated_jobs[job_id] = RunningJob(job_id, None, data['workflow_name'], data['name'], labels)
 
-    if labels[0] != "alexboden-gh-arc-runners-small" and labels[0] != "alexboden-gh-arc-runners-medium" and labels[0] != "alexboden-gh-arc-runners-large" and labels[0] != "alexboden-gh-arc-runners-xlarge":
-        logging.info(f"Skipping job because it is not for the correct runner. labels: {labels}, labels[0]: {labels[0]}")
-        del allocated_jobs[job_id]
-        return
-    
-    runner_size_label = "gh-arc-runners-small" # default to small runner
-    if "alexboden-gh-arc-runners-medium" in labels:
-        runner_size_label = "gh-arc-runners-medium"
-    elif "alexboden-gh-arc-runners-large" in labels:
-        runner_size_label = "gh-arc-runners-large"
-    elif "alexboden-gh-arc-runners-xlarge" in labels:
-        runner_size_label = "gh-arc-runners-xlarge"
+	# Jobs should only specify one label
+	if "slurm-runner" in labels[0]:
+		runner_size_label = labels[0]
+	else:
+		logging.error(f"Invalid label {labels[0]} for job {job_id}.")
+		del allocated_jobs[job_id]
+		return
     
     logging.info(f"Using runner size label: {runner_size_label}")
     runner_resources = get_runner_resources(runner_size_label)
