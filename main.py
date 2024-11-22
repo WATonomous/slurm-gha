@@ -87,7 +87,7 @@ def poll_github_actions_and_allocate_runners(url, token, sleep_time=5):
             if not POLLED_WITHOUT_ALLOCATING:
                 logger.info("Polling for queued workflows...")
                 POLLED_WITHOUT_ALLOCATING = True
-        time.sleep(sleep_time) # issues occur if you request to frequently
+        time.sleep(sleep_time)
 
 
 def get_all_jobs(workflow_id, token):
