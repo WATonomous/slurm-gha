@@ -168,10 +168,10 @@ def allocate_actions_runner(job_id, token):
     
     allocated_jobs[job_id] = RunningJob(job_id, None, data['workflow_name'], data['name'], labels)
 
-	if "slurm-runner" not in labels[0]:
-		logger.info(f"Skipping job because it is not for the correct runner. labels: {labels}, labels[0]: {labels[0]}")
-		del allocated_jobs[job_id]
-		return
+    if "slurm-runner" not in labels[0]:
+        logger.info(f"Skipping job because it is not for the correct runner. labels: {labels}, labels[0]: {labels[0]}")
+        del allocated_jobs[job_id]
+        return
     
     runner_size_label = labels[0]
     
