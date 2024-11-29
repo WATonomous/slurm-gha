@@ -60,8 +60,10 @@ def get_gh_api(url, token, etag=None):
         headers['If-None-Match'] = etag
 
     response = requests.get(url, headers=headers)
-    if int(response.headers['X-RateLimit-Remaining']) % 100 == 0:
-        logger.info(f"Rate Limit Remaining: {response.headers['X-RateLimit-Remaining']}") 
+    if 'X-RateLimit-Remaining' in response.headers:
+        if int(response.headers['X-RateLimit-Remaining']) % 100 == 0:
+            logger.info(f"Rate Limit Remaining: {response.headers['X-RateLimit-Remaining']}") 
+    
     if response.status_code == 304:
         return None, etag 
     elif response.status_code == 200:
