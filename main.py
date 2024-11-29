@@ -183,7 +183,7 @@ def allocate_actions_runner(job_id, token):
         data = response.json()
         registration_token = data["token"]
 
-    	time.sleep(1) # https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api?apiVersion=2022-11-28#pause-between-mutative-requests
+        time.sleep(1) # https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api?apiVersion=2022-11-28#pause-between-mutative-requests
         response = requests.post(f'{GITHUB_API_BASE_URL}/actions/runners/remove-token', headers=headers)
         response.raise_for_status()
         data = response.json()
