@@ -88,7 +88,7 @@ def poll_github_actions_and_allocate_runners(url, token, sleep_time=5):
     etag = None
     while True:
         try:
-            data, etag = get_gh_api(url, token, etag)
+            data, etag = get_gh_api(url, token, None)
             if data:
                 allocate_runners_for_jobs(data, token)
                 global POLLED_WITHOUT_ALLOCATING
