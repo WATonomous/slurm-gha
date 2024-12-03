@@ -280,7 +280,8 @@ def check_slurm_status():
 
             if sacct_result.returncode != 0:
                 logger.error(f"sacct command failed with return code {sacct_result.returncode}")
-                logger.error(f"Error output: {sacct_result.stderr}")
+                if sacct_result.stderr:
+                    logger.error(f"Error output: {sacct_result.stderr}")
                 continue
 
             for line in sacct_output.split('\n'):
