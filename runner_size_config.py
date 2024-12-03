@@ -9,9 +9,9 @@ def get_runner_resources(runner_label):
     if runner_label == "slurm-runner-small":
         return {"cpu" : 1, "mem-per-cpu" : "2G", "tmpdisk" : 4096, "time" : "00:15:00"}
     elif runner_label == "slurm-runner-medium":
-        return {"cpu" : 2, "mem-per-cpu" : "2G", "tmpdisk" : 16384, "time" : "00:20:00"}
+        return {"cpu" : 2, "mem-per-cpu" : "3G", "tmpdisk" : 16384, "time" : "00:20:00"}
     elif runner_label == "slurm-runner-large":
-        return {"cpu" : 4, "mem-per-cpu" : "3G", "tmpdisk" : 16384, "time" : "00:25:00"}
+        return {"cpu" : 4, "mem-per-cpu" : "2G", "tmpdisk" : 16384, "time" : "00:25:00"}
     elif runner_label == "slurm-runner-xlarge":
         return {"cpu" : 16, "mem-per-cpu" : "2G", "tmpdisk" : 16384, "time" : "00:30:00"}
     else:
