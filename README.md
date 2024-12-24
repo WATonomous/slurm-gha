@@ -20,18 +20,20 @@ flowchart LR
 
 ## Enabling Docker Within CI Jobs
 
-Our CI job runner is a container, [actions-runner-image](https://github.com/WATonomous/actions-runner-image), and we are running Docker containers in our jobs, we need to run Docker within Docker.
+We run our CI jobs with a container, [actions-runner-image](https://github.com/WATonomous/actions-runner-image). Within these jobs we also run containers, thus we needed to run Docker within Docker.
 
 
 ```mermaid
-graph TD
+graph RL
     A[Docker Rootless Daemon] -->|Creates| B[Docker Rootless Socket]
     C[Actions Runner Image] -->|Mounts| B
     C -->|Creates| E[CI Helper Containers]
     E -->|Mounts| B
 ```
 
-Since CI Docker commands will use the same filesystem, as they have the same Docker socket, we must configure the working directory of your runners accordingly. Normally it would be a security risk to mount the Docker socket into a container, but since we are using [Docker Rootless](https://docs.docker.com/engine/security/rootless/), we are able to mitigate this risk.
+Normally it would be a security risk to mount the Docker socket into a container, but since we are using [Docker Rootless](https://docs.docker.com/engine/security/rootless/), we are able to mitigate this risk.
+
+> **Note:** The CI's Docker commands will use the same filesystem, as they have the same Docker socket, you must configure the working directory of your runners accordingly. In our case this meant place the working directory in the ephemeral storage, via the `/tmp`, folder within a Slurm job.
 
 ## Speeding up the start time for our Actions Runner Image
 
@@ -46,7 +48,7 @@ This led us to investigate several options:
 
 We decided to go with Apptainer as it was the most straightforward solution. Apptainer is a tool that allows you to create a snapshot of a container image and store it in a tarball. This tarball can be loaded into the containerd runtime and used as a cache. This allows us to pull the image once (per machine) and use it for all subsequent jobs. 
 
-## CVMFS for caching our Provisioner image
+## CVMFS ephermal for caching our Provisioner image
 
 For many of our jobs we use a container we call the provisioner. This container is a tool that is used to provision a service. This container is large, over 1.5GB, and needs to be rebuilt with every CI run. This new container is then used to run the subsequent dependent jobs. 
 
@@ -56,10 +58,27 @@ Previously after the provisioner was built, we would cache in S3, via [rgw](http
 ```mermaid
 flowchart TD
     SLURM[SLURM Job Node] -->|1 hop| Kubernetes[Kubernetes Node]
-    Kubernetes -->|1 hop 0 if cached| RGW[RGW Container Local]
+    Kubernetes -->|0 or 1 depending on cache| RGW[RGW Container]
 ```
 
+### New Idea
+We decided to leverage a (CVMFS ephemeral server)[https://github.com/WATonomous/cvmfs-ephemeral/] to be used for hosting ephemeral files such as our provisioner image. In this setup, the provisioner image is cached in a CVMFS repository hosted on a high-performance node in the kubernetes cluster. By avoiding the Kubernetes RGW cache, which is deployed on a separate less performant node, we can reduce the time it takes to pull the provisioner image.
+
+
+```mermaid
+flowchart TD
+    SLURM[SLURM Job Node] -->|1 hop| CVMFS[CVMFS Ephemeral Server]
+```
+
+
 ## Deployment to Kubernetes
+
+We deployed this on our self hosted Kubernetes, via the docker image in this repo. To communicate with the GitHub API, an access token is needed. For our use case a [personal access token](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#about-personal-access-tokens) which provides 5000 requests per hour was sufficient. This was deployed as a Kubernetes environment variable. 
+
+To enable communication with the Slurm controller we set up a [munge key](https://dun.github.io/munge/). The Python script is then able to allocate an actions runner by triggering a bash script run with `sbatch`.
+
+## Tracking Metrics
+
 
 ## Next Steps
 
