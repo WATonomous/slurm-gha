@@ -142,8 +142,7 @@ def allocate_runners_for_jobs(workflow_data, token):
     for i in range(number_of_queued_workflows):
         workflow_id = workflow_data["workflow_runs"][i]["id"]
         branch = workflow_data["workflow_runs"][i]["head_branch"]
-        if branch != "alexboden/test-slurm-gha-runner" and branch != "alexboden/test-ci-apptainer":
-            continue
+        logger.info(f"Checking branch {branch}")
         try:
             job_data = get_all_jobs(workflow_id, token)
             if not job_data:
