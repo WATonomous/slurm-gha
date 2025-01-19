@@ -9,7 +9,8 @@ class RunningJob:
         workflow_name: str, 
         job_name: str, 
         labels: List[str],
-        start_time: Optional[datetime] = None
+        start_time: Optional[datetime] = None,
+        machine_name: Optional[str] = None,
     ):
         """
         Class to represent a running GitHub Actions Job on Slurm.
@@ -27,11 +28,12 @@ class RunningJob:
         self.job_name = job_name
         self.labels = labels
         self.start_time = start_time
+        self.machine_name = machine_name
 
     def __str__(self) -> str:
         return (f"RunningJob(job_id={self.job_id}, slurm_job_id={self.slurm_job_id}, "
                 f"workflow_name={self.workflow_name}, job_name={self.job_name}, "
-                f"labels={self.labels}, start_time={self.start_time})")
+                f"labels={self.labels}, start_time={self.start_time}), machine_name={self.machine_name}")
 
     def __repr__(self) -> str:
         return self.__str__()
