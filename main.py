@@ -249,7 +249,7 @@ def allocate_actions_runner(job_id, token):
             job_name=data['name'],
             labels=labels,
             start_time=datetime.now(),
-            machine_name=None  # We will fill it once we parse sacct
+            machine_name=None 
         )
 
         # We do NOT increment CURRENT_ALLOCATED_JOBS here because we do not yet know the node (machine).
