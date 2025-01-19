@@ -77,8 +77,44 @@ We deployed this on our self hosted Kubernetes, via the docker image in this rep
 
 To enable communication with the Slurm controller we set up a [munge key](https://dun.github.io/munge/). The Python script is then able to allocate an actions runner by triggering a bash script run with `sbatch`.
 
-## Tracking Metrics
 
+# Speed comparison
+
+## Before:
+### User ingestion:
+https://github.com/WATonomous/infra-config/actions/runs/12427574689
+https://github.com/WATonomous/infra-config/actions/runs/12427547885
+https://github.com/WATonomous/infra-config/actions/runs/12424954086
+https://github.com/WATonomous/infra-config/actions/runs/12424337584
+https://github.com/WATonomous/infra-config/actions/runs/12422341445
+https://github.com/WATonomous/infra-config/actions/runs/12420112260
+
+# Master - scheduled:
+https://github.com/WATonomous/infra-config/actions/runs/12553360748
+https://github.com/WATonomous/infra-config/actions/runs/12530736888
+https://github.com/WATonomous/infra-config/actions/runs/12521935862
+https://github.com/WATonomous/infra-config/actions/runs/12509665511
+https://github.com/WATonomous/infra-config/actions/runs/12487314642
+https://github.com/WATonomous/infra-config/actions/runs/12449453195
+https://github.com/WATonomous/infra-config/actions/runs/12440178947
+https://github.com/WATonomous/infra-config/actions/runs/12422821414
+
+## After:
+### User ingestion:
+https://github.com/WATonomous/infra-config/actions/runs/12854845210
+https://github.com/WATonomous/infra-config/actions/runs/12851571085
+https://github.com/WATonomous/infra-config/actions/runs/12850108807
+https://github.com/WATonomous/infra-config/actions/runs/12696207371
+https://github.com/WATonomous/infra-config/actions/runs/12682617238
+
+# Master - scheduled: 
+https://github.com/WATonomous/infra-config/actions/runs/12848528449
+https://github.com/WATonomous/infra-config/actions/runs/12838792205
+https://github.com/WATonomous/infra-config/actions/runs/12819860145
+https://github.com/WATonomous/infra-config/actions/runs/12799262666
+https://github.com/WATonomous/infra-config/actions/runs/12778673306
+https://github.com/WATonomous/infra-config/actions/runs/12738272633
+https://github.com/WATonomous/infra-config/actions/runs/12738272633
 
 ## Next Steps
 
