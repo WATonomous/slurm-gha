@@ -368,7 +368,7 @@ def check_slurm_status():
 
                     if start_time and end_time:
                         duration = end_time - start_time
-                    logger.info(f"Slurm job {job_component} {status} in {duration}. Running Job Info: {str(runningjob)}")
+                    logger.info(f"Slurm job {job_component} {status} in {duration}. Running Job Info: {str(running_job)}")
                     to_remove.append(job_id)
 
         except Exception as e:
