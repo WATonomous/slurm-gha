@@ -249,6 +249,11 @@ def allocate_actions_runner(job_id, token, repo_api_base_url, repo_url, repo_nam
 
         runner_size_label = labels[0]
 
+        if "slurm-runner" not in runner_size_label:
+            logger.info(f"Skipping job because it is not labeled for slurm-runner.")
+            del allocated_jobs[(repo_name, job_id)]
+            return False
+
         logger.info(f"Using runner size label: {runner_size_label}")
         runner_resources = get_runner_resources(runner_size_label)
 
