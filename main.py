@@ -255,8 +255,6 @@ def allocate_actions_runner(job_id, token):
         logger.error(f"Exception occurred in allocate_actions_runner for job_id {job_id}: {e}")
         if job_id in allocated_jobs:
             del allocated_jobs[job_id]
-        # Decide whether to retry or not
-
 
 def check_slurm_status():
     """
