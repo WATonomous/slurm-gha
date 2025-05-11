@@ -206,7 +206,7 @@ def allocate_actions_runner(job_id, token, repo_api_base_url, repo_url, repo_nam
         reg_data = reg_resp.json()
         registration_token = reg_data["token"]
 
-        # recommended small delay
+        # recommended small delay https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api?apiVersion=2022-11-28#pause-between-mutative-requests
         time.sleep(1)
 
         # Get removal token
@@ -260,7 +260,7 @@ def allocate_actions_runner(job_id, token, repo_api_base_url, repo_url, repo_nam
             f"--cpus-per-task={runner_resources['cpu']}",
             f"--gres=tmpdisk:{runner_resources['tmpdisk']}",
             f"--time={runner_resources['time']}",
-            ALLOCATE_RUNNER_SCRIPT_PATH,
+            ALLOCATE_RUNNER_SCRIPT_PATH,  # allocate-ephemeral-runner-from-docker.sh
             repo_url,
             registration_token,
             removal_token,
