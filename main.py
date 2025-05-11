@@ -146,18 +146,17 @@ def allocate_runners_for_jobs(workflow_data, token, repo_api_base_url, repo_url,
     For each queued job in a workflow, allocate the ephemeral SLURM runner if appropriate.
     Returns the count of new allocations made.
     """
+    new_allocations = 0
+
     if "workflow_runs" not in workflow_data:
         logger.error("No workflow_runs in data.")
-        return 0
+        return new_allocations
 
-    new_allocations = 0
     number_of_queued_workflows = len(workflow_data["workflow_runs"])
 
     for i in range(number_of_queued_workflows):
         workflow_id = workflow_data["workflow_runs"][i]["id"]
         branch = workflow_data["workflow_runs"][i]["head_branch"]
-        # if branch != "alexboden/test-slurm-gha-runner" and branch != "alexboden/test-ci-apptainer":
-            # continue
         job_data = get_all_jobs(workflow_id, token, repo_api_base_url)
         if not job_data: 
             continue
@@ -242,10 +241,10 @@ def allocate_actions_runner(job_id, token, repo_api_base_url, repo_url, repo_nam
         )
 
         # For example, you might only allocate if "slurm-runner" in labels
-        # if "slurm-runner" not in labels:
-        #     logger.info("Skipping job because it is not labeled for slurm-runner.")
-        #     del allocated_jobs[(repo_name, job_id)]
-        #     return False
+        if "slurm-runner" not in labels:
+            logger.info("Skipping job because it is not labeled for slurm-runner.")
+            del allocated_jobs[(repo_name, job_id)]
+            return False
 
         runner_size_label = labels[0]
 
@@ -260,7 +259,7 @@ def allocate_actions_runner(job_id, token, repo_api_base_url, repo_url, repo_nam
         # sbatch resource allocation command
         command = [
             "sbatch",
-			      f"--output=/var/log/slurm-ci/slurm-ci-%j.out",
+	    f"--output=/var/log/slurm-ci/slurm-ci-%j.out",
             f"--job-name=slurm-{runner_size_label}-{job_id}",
             f"--mem-per-cpu={runner_resources['mem-per-cpu']}",
             f"--cpus-per-task={runner_resources['cpu']}",
@@ -328,6 +327,7 @@ def allocate_actions_runner(job_id, token, repo_api_base_url, repo_url, repo_nam
         logger.error(f"Exception occurred in allocate_actions_runner for job_id {job_id}: {e}")
         if job_id in allocated_jobs:
             del allocated_jobs[job_id]
+
 def check_slurm_status():
     """
     Checks the status of SLURM jobs and removes completed or failed entries from allocated_jobs.
