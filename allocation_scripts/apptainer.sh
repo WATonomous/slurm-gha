@@ -21,12 +21,9 @@ LABELS=$4
 RUN_ID=$5
 
 PARENT_DIR="/tmp/runner-${SLURMD_NODENAME}-${SLURM_JOB_ID}"
-# PROVISIONER_DIR="/mnt/wato-drive/alexboden/provisioner-cache/$RUN_ID"
 log "INFO Parent directory for GitHub Actions: $PARENT_DIR"
 
 start_time=$(date +%s)
-# mkdir -p $PROVISIONER_DIR
-# chmod -R 777 $PROVISIONER_DIR
 GITHUB_ACTIONS_WKDIR="$PARENT_DIR/_work"
 mkdir -p $PARENT_DIR $GITHUB_ACTIONS_WKDIR
 chmod -R 777 $PARENT_DIR
