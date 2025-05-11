@@ -178,7 +178,7 @@ def allocate_runners_for_jobs(workflow_data, token, repo_api_base_url, repo_url,
 
 def allocate_actions_runner(job_id, token, repo_api_base_url, repo_url, repo_name):
     """
-    Allocates a runner for the given job ID.
+    Allocates a runner for the given job ID. Returns True if successful, False otherwise.
     """
     global allocated_jobs, POLLED_WITHOUT_ALLOCATING
 
@@ -233,18 +233,13 @@ def allocate_actions_runner(job_id, token, repo_api_base_url, repo_url, repo_nam
 
         run_id = job_data['run_id']
         allocated_jobs[(repo_name, job_id)] = RunningJob(
+            repo=repo_name,
             job_id=job_id,
             slurm_job_id=None,
             workflow_name=job_data['workflow_name'],
             job_name=job_data['name'],
             labels=labels
         )
-
-        # For example, you might only allocate if "slurm-runner" in labels
-        if "slurm-runner" not in labels:
-            logger.info("Skipping job because it is not labeled for slurm-runner.")
-            del allocated_jobs[(repo_name, job_id)]
-            return False
 
         runner_size_label = labels[0]
 
@@ -259,7 +254,7 @@ def allocate_actions_runner(job_id, token, repo_api_base_url, repo_url, repo_nam
         # sbatch resource allocation command
         command = [
             "sbatch",
-	    f"--output=/var/log/slurm-ci/slurm-ci-%j.out",
+            f"--output=/var/log/slurm-ci/slurm-ci-%j.out",
             f"--job-name=slurm-{runner_size_label}-{job_id}",
             f"--mem-per-cpu={runner_resources['mem-per-cpu']}",
             f"--cpus-per-task={runner_resources['cpu']}",
@@ -287,6 +282,7 @@ def allocate_actions_runner(job_id, token, repo_api_base_url, repo_url, repo_nam
                 slurm_job_id = int(output.split()[-1])
                 # Store the SLURM job ID in allocated_jobs
                 allocated_jobs[(repo_name, job_id)] = RunningJob(
+                    repo=repo_name,
                     job_id=job_id,
                     slurm_job_id=slurm_job_id,
                     workflow_name=job_data['workflow_name'],
@@ -309,24 +305,6 @@ def allocate_actions_runner(job_id, token, repo_api_base_url, repo_url, repo_nam
         if (repo_name, job_id) in allocated_jobs:
             del allocated_jobs[(repo_name, job_id)]
         return False
-        logger.error(f"Command stderr: {error_output}")
-        try:
-            slurm_job_id = int(output.split()[-1])  # output is of the form "Submitted batch job 3828"
-            allocated_jobs[job_id] = RunningJob(job_id, slurm_job_id, data['workflow_name'], data['name'], labels)
-            logger.info(f"Allocated runner for job {allocated_jobs[job_id]} with SLURM job ID {slurm_job_id}.")
-            if result.returncode != 0:
-                del allocated_jobs[job_id]
-                logger.error(f"Failed to allocate runner for job {job_id}.")
-                allocate_actions_runner(job_id, token)
-        except (IndexError, ValueError) as e:
-            logger.error(f"Failed to parse SLURM job ID from command output: {output}. Error: {e}")
-            del allocated_jobs[job_id]
-            # retry the job allocation
-            allocate_actions_runner(job_id, token)
-    except Exception as e:
-        logger.error(f"Exception occurred in allocate_actions_runner for job_id {job_id}: {e}")
-        if job_id in allocated_jobs:
-            del allocated_jobs[job_id]
 
 def check_slurm_status():
     """
