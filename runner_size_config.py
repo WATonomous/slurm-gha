@@ -24,11 +24,11 @@ def get_runner_resources(runner_label):
         cpu, mem_per_cpu, time, tmpdisk = 2, 2, "30:00", 16384
         for part in resources:
             if part.endswith("mempercpu"):
-                mem_per_cpu = int(part[:-8])
+                mem_per_cpu = int(part[:-9])
             elif part.endswith("cpu"):
                 cpu = int(part[:-3])
             elif part.endswith("time"):
-                time = int(part[:-4])
+                time = part[:-4]
             elif part.endswith("tmpdisk"):
                 tmpdisk = int(part[:-7])
             else:
