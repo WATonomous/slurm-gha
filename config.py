@@ -9,10 +9,9 @@ REPOS_TO_MONITOR = [
         'api_base_url': 'https://api.github.com/repos/WATonomous/infra-config',
         'repo_url': 'https://github.com/WATonomous/infra-config'
     },
-	{
-		'name': 'WATonomous/wato_asd_training',
-		'api_base_url': 'https://api.github.com/repos/WATonomous/wato_asd_training',
-		'repo_url': 'https://github.com/WATonomous/wato_asd_training'
-	}
-    
+    {
+        'name': 'WATonomous/troubleshoot-heterogenous-distributed-operations',
+        'api_base_url': 'https://api.github.com/repos/WATonomous/troubleshoot-heterogenous-distributed-operations',
+        'repo_url': 'https://github.com/WATonomous/troubleshoot-heterogenous-distributed-operations'
+    }
 ]
