@@ -51,7 +51,7 @@ export ACTIONS_RUNNER_IMAGE="/cvmfs/unpacked.cern.ch/ghcr.io/watonomous/actions-
 
 log "INFO Starting Apptainer container and configuring runner"
 
-apptainer exec --writable-tmpfs --containall --fakeroot --bind /dev/fuse --bind /tmp/run/docker.sock:/tmp/run/docker.sock --bind /cvmfs:/cvmfs  --bind /mnt/wato-drive:/mnt/wato-drive --bind /tmp:/tmp "$ACTIONS_RUNNER_IMAGE" /bin/bash -c "export DOCKER_HOST=unix:///tmp/run/docker.sock && export RUNNER_ALLOW_RUNASROOT=1 && export PYTHONPATH=/home/runner/.local/lib/python3.10/site-packages && /home/runner/config.sh --work \"${GITHUB_ACTIONS_WKDIR}\" --url \"${REPO_URL}\" --token \"${REGISTRATION_TOKEN}\" --labels \"${LABELS}\" --name \"slurm-${SLURMD_NODENAME}-${SLURM_JOB_ID}\" --unattended --ephemeral && /home/runner/run.sh && /home/runner/config.sh remove --token \"${REMOVAL_TOKEN}\""
+apptainer exec --writable-tmpfs --containall --fakeroot --bind /dev/fuse --bind /tmp/run/docker.sock:/tmp/run/docker.sock --bind /cvmfs:/cvmfs --bind /tmp:/tmp "$ACTIONS_RUNNER_IMAGE" /bin/bash -c "export DOCKER_HOST=unix:///tmp/run/docker.sock && export RUNNER_ALLOW_RUNASROOT=1 && export PYTHONPATH=/home/runner/.local/lib/python3.10/site-packages && /home/runner/config.sh --work \"${GITHUB_ACTIONS_WKDIR}\" --url \"${REPO_URL}\" --token \"${REGISTRATION_TOKEN}\" --labels \"${LABELS}\" --name \"slurm-${SLURMD_NODENAME}-${SLURM_JOB_ID}\" --unattended --ephemeral && /home/runner/run.sh && /home/runner/config.sh remove --token \"${REMOVAL_TOKEN}\""
 
 log "INFO Runner removed (Duration: $(($end_time - $start_time)) seconds)"
 
