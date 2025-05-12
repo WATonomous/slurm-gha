@@ -1,4 +1,5 @@
 import os
+import re
 
 def get_runner_resources(runner_label):
     """
