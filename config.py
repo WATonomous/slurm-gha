@@ -9,9 +9,4 @@ REPOS_TO_MONITOR = [
         'api_base_url': 'https://api.github.com/repos/WATonomous/infra-config',
         'repo_url': 'https://github.com/WATonomous/infra-config'
     },
-    {
-        'name': 'WATonomous/troubleshoot-heterogenous-distributed-operations',
-        'api_base_url': 'https://api.github.com/repos/WATonomous/troubleshoot-heterogenous-distributed-operations',
-        'repo_url': 'https://github.com/WATonomous/troubleshoot-heterogenous-distributed-operations'
-    }
 ]
