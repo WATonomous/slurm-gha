@@ -15,11 +15,10 @@ def get_kubernetes_namespace():
 
 class KubernetesLogFormatter(logging.Formatter):
     def format(self, record):
-        log_record = {
-            "timestamp": self.formatTime(record, self.datefmt),
-            "level": record.levelname,
-            "message": record.getMessage(),
-            "pod_name": os.getenv('HOSTNAME', 'unknown-pod'),
-            "namespace":  get_kubernetes_namespace(),
-        }
-        return json.dumps(log_record)
+        timestamp = self.formatTime(record, self.datefmt or "%Y-%m-%d %H:%M:%S")
+        level = record.levelname
+        message = record.getMessage()
+        pod_name = os.getenv('HOSTNAME', 'unknown-pod')
+        namespace = get_kubernetes_namespace()
+
+        return f"[{timestamp}] [{level}] [{namespace}/{pod_name}] {message}"
