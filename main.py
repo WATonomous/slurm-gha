@@ -94,26 +94,29 @@ def poll_github_actions_and_allocate_runners(token, sleep_time=5):
     global POLLED_WITHOUT_ALLOCATING
 
     while True:
-        something_allocated = False
+        try:
+            something_allocated = False
 
-        for repo in REPOS_TO_MONITOR:
-            queued_url = f"{repo['api_base_url']}/actions/runs?status=queued"
-            data, _ = get_gh_api(queued_url, token)
+            for repo in REPOS_TO_MONITOR:
+                queued_url = f"{repo['api_base_url']}/actions/runs?status=queued"
+                data, _ = get_gh_api(queued_url, token)
 
-            if data:
-                new_allocations = allocate_runners_for_jobs(
-                    workflow_data=data,
-                    token=token,
-                    repo_api_base_url=repo['api_base_url'],
-                    repo_url=repo['repo_url'],
-                    repo_name=repo['name']
-                )
-                if new_allocations > 0:
-                    something_allocated = True
+                if data:
+                    new_allocations = allocate_runners_for_jobs(
+                        workflow_data=data,
+                        token=token,
+                        repo_api_base_url=repo['api_base_url'],
+                        repo_url=repo['repo_url'],
+                        repo_name=repo['name']
+                    )
+                    if new_allocations > 0:
+                        something_allocated = True
 
-        if not something_allocated and not POLLED_WITHOUT_ALLOCATING:
-            logger.info("Polling for queued workflows...")
-            POLLED_WITHOUT_ALLOCATING = True
+            if not something_allocated and not POLLED_WITHOUT_ALLOCATING:
+                logger.info("Polling for queued workflows...")
+                POLLED_WITHOUT_ALLOCATING = True
+        except Exception as e:
+            logger.error(f"Exception in poll_github_actions_and_allocate_runners: {e}")
 
         time.sleep(sleep_time)
 
@@ -384,7 +387,10 @@ def poll_slurm_statuses(sleep_time=5):
     Wrapper function to poll check_slurm_status.
     """
     while True:
-        check_slurm_status()
+        try:
+            check_slurm_status()
+        except Exception as e:
+            logger.error(f"Exception in poll_slurm_statuses: {e}")
         time.sleep(sleep_time)
 
 if __name__ == "__main__":
