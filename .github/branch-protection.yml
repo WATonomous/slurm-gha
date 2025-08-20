@@ -1,0 +1,7 @@
+required_status_checks:
+  strict: true
+
+  contexts:
+    - "Lint and Format Check"
+
+  require_branches_up_to_date: true
