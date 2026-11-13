@@ -58,7 +58,8 @@ class GitHubClient:
     def __init__(self, token: str) -> None:
         self.rate_limit_window: RateLimitWindow | None = None
         self.no_requests_before = 0.0  # epoch seconds, from GitHub's last stop signal
-        self._last_unsignalled_stop_s = 0.0  # what the doubling grows from
+        # The last stop GitHub gave no wait for; the doubling grows from it
+        self._last_backoff_s = 0.0
         self._stop_seen_this_cycle = False
         # Read responses GitHub counted against the limit this cycle; a 304 is not counted
         self._charged_this_cycle = 0
@@ -79,7 +80,7 @@ class GitHubClient:
         """Begin a polling cycle: forget pages not requested in the last one, restart the request count,
         and let the stop backoff start over once a whole cycle passed without a stop."""
         if not self._stop_seen_this_cycle:
-            self._last_unsignalled_stop_s = 0.0
+            self._last_backoff_s = 0.0
         self._stop_seen_this_cycle = False
         self._charged_this_cycle = 0
         self._pages_last_cycle = self._pages_this_cycle
@@ -194,16 +195,13 @@ class GitHubClient:
         outcome = classify_response(response.status_code)
         if outcome == "stop":
             message = _github_error_message(response)
-            stop_s = stop_duration_s(
-                response.headers, now, self._last_unsignalled_stop_s
-            )
-            if signalled_wait_s(response.headers, now) is None:
-                self._last_unsignalled_stop_s = stop_s
+            stop_s = stop_duration_s(response.headers, now, self._last_backoff_s)
+            if wait_github_asks_for_s(response.headers, now) is None:
+                self._last_backoff_s = stop_s
             self._stop_seen_this_cycle = True
             self.no_requests_before = now + stop_s
-            reason = stop_reason(response.status_code, response.headers, message)
             raise GitHubUnavailable(
-                f"{method} {url}: HTTP {response.status_code}, {reason} ({message});"
+                f"{method} {url}: HTTP {response.status_code} ({message});"
                 f" no requests for {stop_s:.0f} s"
             )
         if outcome == "not_found":
@@ -232,34 +230,18 @@ def classify_response(status_code: int) -> str:
     return "failed"
 
 
-def stop_reason(
-    status_code: int, headers: Mapping[str, str], github_message: str
-) -> str:
-    """Pure: "rate limited" when the answer says so, else what a person has to fix."""
-    if (
-        status_code == 429
-        or headers.get("x-ratelimit-remaining") == "0"
-        or "retry-after" in headers
-        or "rate limit" in github_message.lower()
-    ):
-        return "rate limited"
-    if status_code == 401:
-        return "credentials rejected, needs a human"
-    return "forbidden, needs a human"
-
-
 def stop_duration_s(
-    headers: Mapping[str, str], now: float, previous_unsignalled_stop_s: float
+    headers: Mapping[str, str], now: float, previous_backoff_s: float
 ) -> float:
-    """Pure: as long as GitHub's headers ask; without such a signal 60 s, doubling from previous_unsignalled_stop_s."""
-    signalled_s = signalled_wait_s(headers, now)
-    if signalled_s is not None:
-        return signalled_s
-    doubled = max(2 * previous_unsignalled_stop_s, FIRST_WAIT_WITHOUT_RETRY_AFTER_S)
+    """Pure: as long as GitHub's headers ask; without such a signal 60 s, doubling from previous_backoff_s."""
+    asked_s = wait_github_asks_for_s(headers, now)
+    if asked_s is not None:
+        return asked_s
+    doubled = max(2 * previous_backoff_s, FIRST_WAIT_WITHOUT_RETRY_AFTER_S)
     return min(doubled, LONGEST_WAIT_WITHOUT_RETRY_AFTER_S)
 
 
-def signalled_wait_s(headers: Mapping[str, str], now: float) -> float | None:
+def wait_github_asks_for_s(headers: Mapping[str, str], now: float) -> float | None:
     """Pure: the wait GitHub's headers ask for, until x-ratelimit-reset if remaining is 0 and
     at least retry-after; None if they ask for none."""
     waits = []

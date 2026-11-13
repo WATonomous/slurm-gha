@@ -23,9 +23,8 @@ from github_client import (
     RateLimitWindow,
     classify_response,
     next_cycle_delay_s,
-    signalled_wait_s,
     stop_duration_s,
-    stop_reason,
+    wait_github_asks_for_s,
     update_rate_limit_window,
 )
 
@@ -64,26 +63,6 @@ class ClassifyResponseTest(unittest.TestCase):
         for status, outcome in expected.items():
             with self.subTest(status=status):
                 self.assertEqual(classify_response(status), outcome)
-
-
-class StopReasonTest(unittest.TestCase):
-    def test_rate_limited_only_on_evidence_of_a_rate_limit(self):
-        rows = [
-            (403, rate_limit_headers(0, NOW + 60), "", "rate limited"),
-            (403, {"retry-after": "30"}, "", "rate limited"),
-            (403, {}, SECONDARY_LIMIT["message"], "rate limited"),
-            (429, {}, "", "rate limited"),
-            (
-                403,
-                {},
-                "Must have admin rights to Repository.",
-                "forbidden, needs a human",
-            ),
-            (401, {}, "Bad credentials", "credentials rejected, needs a human"),
-        ]
-        for status, headers, message, reason in rows:
-            with self.subTest(status=status, headers=headers, message=message):
-                self.assertEqual(stop_reason(status, headers, message), reason)
 
 
 class StopDurationTest(unittest.TestCase):
@@ -126,7 +105,7 @@ class StopDurationTest(unittest.TestCase):
                 )
 
 
-class SignalledWaitTest(unittest.TestCase):
+class WaitGitHubAsksForTest(unittest.TestCase):
     def test_only_a_reset_with_nothing_left_or_a_retry_after_is_a_signal(self):
         rows = [
             ({}, None),
@@ -136,7 +115,7 @@ class SignalledWaitTest(unittest.TestCase):
         ]
         for headers, wait_s in rows:
             with self.subTest(headers=headers):
-                self.assertEqual(signalled_wait_s(headers, NOW), wait_s)
+                self.assertEqual(wait_github_asks_for_s(headers, NOW), wait_s)
 
 
 class UpdateRateLimitWindowTest(unittest.TestCase):
@@ -490,7 +469,7 @@ class GitHubClientTest(unittest.TestCase):
         )
         with self.assertRaises(GitHubUnavailable) as raised:
             self.github.get_all_pages(self.url("/runs"), "workflow_runs")
-        self.assertIn("rate limited", str(raised.exception))
+        self.assertIn("API rate limit exceeded", str(raised.exception))
         with self.assertRaises(GitHubUnavailable):
             self.github.get_all_pages(self.url("/runs"), "workflow_runs")
         self.assertEqual(len(self.fake.received), 1)
@@ -506,7 +485,7 @@ class GitHubClientTest(unittest.TestCase):
         self.fake.script("/runs", Reply(403, {"Retry-After": "120"}, SECONDARY_LIMIT))
         with self.assertRaises(GitHubUnavailable) as raised:
             self.github.get_json(self.url("/runs"))
-        self.assertIn("rate limited", str(raised.exception))
+        self.assertIn("secondary rate limit", str(raised.exception))
         self.assertEqual(self.github.no_requests_before, NOW + 120)
         with self.assertRaises(GitHubUnavailable):
             self.github.get_json(self.url("/runs"))
@@ -518,14 +497,14 @@ class GitHubClientTest(unittest.TestCase):
         )
         with self.assertRaises(GitHubUnavailable) as raised:
             self.github.get_json(self.url("/runs"))
-        self.assertIn("rate limited", str(raised.exception))
+        self.assertIn("HTTP 429 (Too many requests)", str(raised.exception))
         self.assertEqual(self.github.no_requests_before, NOW + 30)
 
-    def test_a_401_stops_requests_and_asks_for_a_human(self):
+    def test_a_401_stops_requests_and_says_why(self):
         self.fake.script("/runs", Reply(401, body={"message": "Bad credentials"}))
         with self.assertRaises(GitHubUnavailable) as raised:
             self.github.get_json(self.url("/runs"))
-        self.assertIn("credentials rejected, needs a human", str(raised.exception))
+        self.assertIn("HTTP 401 (Bad credentials)", str(raised.exception))
         self.assertIn("/runs", str(raised.exception))
         self.assertEqual(
             self.github.no_requests_before, NOW + FIRST_WAIT_WITHOUT_RETRY_AFTER_S
@@ -563,7 +542,7 @@ class GitHubClientTest(unittest.TestCase):
             self.github.post_json(self.url("/token"))
         self.assertEqual(self.github.no_requests_before - self.clock.now, 60)
 
-    def test_a_long_primary_stop_does_not_inflate_the_next_unsignalled_one(self):
+    def test_a_long_primary_stop_does_not_inflate_the_next_backoff(self):
         self.fake.script(
             "/runs",
             Reply(
@@ -734,7 +713,7 @@ class GitHubClientTest(unittest.TestCase):
                 with self.assertRaises(GitHubUnavailable) as raised:
                     self.github.get_json(self.url(path))
                 messages.append(str(raised.exception))
-        self.assertIn("forbidden, needs a human", messages[0])
+        self.assertIn("Must have admin rights to Repository.", messages[0])
         self.assertTrue(
             any("Rate Limit Remaining: 100" in line for line in logs.output)
         )
