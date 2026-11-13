@@ -3,5 +3,6 @@ required_status_checks:
 
   contexts:
     - "Lint and Format Check"
+    - "Unit Tests"
 
   require_branches_up_to_date: true
