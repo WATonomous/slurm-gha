@@ -7,35 +7,14 @@ from the job's own status, in the jobs of every watched run, every cycle.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from datetime import datetime
 
 from config import NEWEST_RUNS_PAGE_SIZE, RERUN_WINDOW_S
 from github_client import PAGE_SIZE, GitHubClient, GitHubNotFound, GitHubUnavailable
+from plan import Demand, WaitingJob
 from runner_size_config import size_label_of_job
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class WaitingJob:
-    """A job GitHub reported queued this cycle, for a size label we serve."""
-
-    job_id: int
-    run_id: int
-    size_label: str
-    created_at: float  # epoch seconds, from GitHub; the job has waited since then
-    workflow_name: str
-    job_name: str
-
-
-@dataclass(frozen=True)
-class Demand:
-    """A lower bound: a run whose read failed this cycle is missing, never stale."""
-
-    waiting_jobs: list[WaitingJob]
-    # runner_name of every job read this cycle, any status
-    runner_names_on_jobs: set[str]
 
 
 def watch_new_runs(

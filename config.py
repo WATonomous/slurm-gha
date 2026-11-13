@@ -34,6 +34,25 @@ IDLE_ALLOWANCE_S = 10 * 60
 SCRIPT_START_MARGIN_S = 2 * 60
 # The compute partition's MaxTime; a runner asking for more would stay pending forever
 SLURM_PARTITION_MAX_TIME_MINUTES = 24 * 60
+# B: how long a started runner may take to come online before the daemon stops counting on it. 99% of
+# recorded boots took under 63 s and 31 of 4,704 over 2 min; it trades a duplicate runner against a job
+# waiting on a boot that may never finish. Must stay below W, or such a boot would go unnoticed
+BOOT_ALLOWANCE_S = 2 * 60
+# Failures in a row a proven size label tolerates before it gets one runner at a time: one slow or broken
+# node should not hold back a whole wave
+TOLERATED_FAILURES_IN_A_ROW = 1
+# The first wait for an unproven label's one runner, once a proven label has failed past its tolerance;
+# it doubles per further failure
+FIRST_PROBE_WAIT_S = 60
+# Cap on that wait: a size label that cannot launch at all costs about 6 allocations an hour
+MAX_PROBE_WAIT_S = 10 * 60
+# A pending runner's JIT registration can only vanish through GitHub removing a runner that has not
+# connected for more than a day (GitHub docs, removing runners); missing for less, the list has not caught up
+UNUSED_REGISTRATION_LIFETIME_S = 24 * 60 * 60
+# T: how long a busy runner that no job names covers a waiting job of its size. Longer than the longest
+# measured gap between GitHub's offer and the job naming its runner (26 s), shorter than GitHub's re-queue of
+# an offer that is not acquired (about 75 s)
+BUSY_COVER_S = 60
 
 REPOS_TO_MONITOR = [
     {
