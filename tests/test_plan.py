@@ -107,10 +107,7 @@ def registrations(*registrations_list):
 
 
 def waiting(count, size_label=MEDIUM, waited_s=10):
-    return [
-        WaitingJob(index, 1, size_label, NOW - waited_s, "Provision", f"job-{index}")
-        for index in range(count)
-    ]
+    return [WaitingJob(index, size_label, NOW - waited_s) for index in range(count)]
 
 
 def demand(waiting_jobs=(), runner_names_on_jobs=()):

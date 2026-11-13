@@ -152,7 +152,7 @@ def demand_from_jobs(jobs_by_run: dict[int, list[dict]]) -> Demand:
     """Pure: jobs whose status is "queued" with a size label we serve, and every job's runner_name."""
     waiting_jobs = []
     runner_names_on_jobs = set()
-    for run_id, jobs in sorted(jobs_by_run.items()):
+    for _, jobs in sorted(jobs_by_run.items()):
         for job in jobs:
             if job.get("runner_name"):
                 runner_names_on_jobs.add(job["runner_name"])
@@ -161,11 +161,8 @@ def demand_from_jobs(jobs_by_run: dict[int, list[dict]]) -> Demand:
                 waiting_jobs.append(
                     WaitingJob(
                         job_id=job["id"],
-                        run_id=run_id,
                         size_label=size_label,
                         created_at=epoch_seconds(job["created_at"]),
-                        workflow_name=job["workflow_name"],
-                        job_name=job["name"],
                     )
                 )
     return Demand(waiting_jobs, runner_names_on_jobs)

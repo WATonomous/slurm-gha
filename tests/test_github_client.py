@@ -281,14 +281,18 @@ class FakeGitHub:
         handler.wfile.write(body)
 
 
-def answer_like_a_token_post(remaining, resets_at):
-    """Replies as GitHub answers a runner-token POST: it says "core", but counts on a separate counter of its own."""
+def answer_like_a_jit_config_post(remaining, resets_at):
+    """Replies as GitHub answers generate-jitconfig: it says "core", but counts on a separate counter of its own."""
 
     def reply(request_headers):
         nonlocal remaining
         remaining -= 1
         headers = rate_limit_headers(remaining, resets_at)
-        return Reply(201, headers, {"token": "registration-token-value"})
+        return Reply(
+            201,
+            headers,
+            {"runner": {"id": 9}, "encoded_jit_config": "jit-config-value"},
+        )
 
     return reply
 
@@ -525,18 +529,18 @@ class GitHubClientTest(unittest.TestCase):
         with self.assertRaises(GitHubUnavailable):
             self.github.get_json(self.url("/runs"))
         with self.assertRaises(GitHubUnavailable):
-            self.github.post_json(self.url("/token"))
-        self.assertEqual(self.fake.requests_to("/token"), [])
+            self.github.post_json(self.url("/generate-jitconfig"))
+        self.assertEqual(self.fake.requests_to("/generate-jitconfig"), [])
 
     def test_repeated_secondary_limits_double_across_cycles_despite_successes(self):
         self.fake.script("/runs", Reply(200, body={}))
-        self.fake.script("/token", Reply(403, body=SECONDARY_LIMIT))
+        self.fake.script("/generate-jitconfig", Reply(403, body=SECONDARY_LIMIT))
         stops = []
         for _ in range(3):
             self.github.start_cycle()
             self.github.get_json(self.url("/runs"))
             with self.assertRaises(GitHubUnavailable):
-                self.github.post_json(self.url("/token"))
+                self.github.post_json(self.url("/generate-jitconfig"))
             stops.append(self.github.no_requests_before - self.clock.now)
             self.wait_out_the_stop()
         self.assertEqual(stops, [60, 120, 240])
@@ -546,7 +550,7 @@ class GitHubClientTest(unittest.TestCase):
         self.github.get_json(self.url("/runs"))
         self.github.start_cycle()
         with self.assertRaises(GitHubUnavailable):
-            self.github.post_json(self.url("/token"))
+            self.github.post_json(self.url("/generate-jitconfig"))
         self.assertEqual(self.github.no_requests_before - self.clock.now, 60)
 
     def test_a_long_primary_stop_does_not_inflate_the_next_backoff(self):
@@ -572,18 +576,18 @@ class GitHubClientTest(unittest.TestCase):
         )
 
     def test_a_cycle_whose_requests_were_refused_keeps_the_backoff(self):
-        self.fake.script("/token", Reply(403, body=SECONDARY_LIMIT))
+        self.fake.script("/generate-jitconfig", Reply(403, body=SECONDARY_LIMIT))
         with self.assertRaises(GitHubUnavailable):
-            self.github.post_json(self.url("/token"))
+            self.github.post_json(self.url("/generate-jitconfig"))
         self.github.start_cycle()
         with self.assertRaises(GitHubUnavailable):  # refused: the stop is still active
-            self.github.post_json(self.url("/token"))
+            self.github.post_json(self.url("/generate-jitconfig"))
         self.github.start_cycle()
         self.wait_out_the_stop()
         with self.assertRaises(GitHubUnavailable):
-            self.github.post_json(self.url("/token"))
+            self.github.post_json(self.url("/generate-jitconfig"))
         self.assertEqual(self.github.no_requests_before - self.clock.now, 120)
-        self.assertEqual(len(self.fake.requests_to("/token")), 2)
+        self.assertEqual(len(self.fake.requests_to("/generate-jitconfig")), 2)
 
     def test_a_404_raises_not_found_and_stops_nothing(self):
         self.fake.script(
@@ -667,18 +671,22 @@ class GitHubClientTest(unittest.TestCase):
         self.assertEqual(len(self.fake.requests_to("/runners/1")), 1)
 
     def test_writes_are_spaced_one_second_apart(self):
-        self.fake.script("/token", answer_like_a_token_post(4000, NOW + 600))
-        token = self.github.post_json(self.url("/token"))
-        self.assertEqual(token, {"token": "registration-token-value"})
-        self.github.post_json(self.url("/token"))
+        self.fake.script(
+            "/generate-jitconfig", answer_like_a_jit_config_post(4000, NOW + 600)
+        )
+        answer = self.github.post_json(self.url("/generate-jitconfig"))
+        self.assertEqual(answer["encoded_jit_config"], "jit-config-value")
+        self.github.post_json(self.url("/generate-jitconfig"))
         self.assertEqual(self.clock.slept, [MIN_SECONDS_BETWEEN_WRITES])
 
-    def test_a_wave_of_token_posts_neither_paces_nor_changes_the_window(self):
+    def test_a_wave_of_jit_config_posts_neither_paces_nor_changes_the_window(self):
         self.fake.script("/runs", Reply(200, rate_limit_headers(4000, NOW + 3000), {}))
-        self.fake.script("/token", answer_like_a_token_post(400, NOW + 3000))
+        self.fake.script(
+            "/generate-jitconfig", answer_like_a_jit_config_post(400, NOW + 3000)
+        )
         self.github.get_json(self.url("/runs"))
         for _ in range(47):
-            self.github.post_json(self.url("/token"))
+            self.github.post_json(self.url("/generate-jitconfig"))
         self.assertEqual(
             self.github.rate_limit_window, RateLimitWindow(NOW + 3000, 4000)
         )
@@ -692,26 +700,26 @@ class GitHubClientTest(unittest.TestCase):
             self.clock.now += 0.3  # time passes on the client's clock while it waits
             return Reply(201, body={"token": "x"})
 
-        self.fake.script("/token", answer_after_300_ms)
-        self.github.post_json(self.url("/token"))
-        self.github.post_json(self.url("/token"))
+        self.fake.script("/generate-jitconfig", answer_after_300_ms)
+        self.github.post_json(self.url("/generate-jitconfig"))
+        self.github.post_json(self.url("/generate-jitconfig"))
         self.assertEqual(len(self.clock.slept), 1)
         self.assertAlmostEqual(self.clock.slept[0], MIN_SECONDS_BETWEEN_WRITES - 0.3)
 
     def test_a_refused_write_neither_sleeps_nor_counts_as_a_write(self):
-        self.fake.script("/token", Reply(201, body={"token": "x"}))
+        self.fake.script("/generate-jitconfig", Reply(201, body={"token": "x"}))
         self.fake.script("/runs", Reply(403, {"Retry-After": "60"}, SECONDARY_LIMIT))
-        self.github.post_json(self.url("/token"))
+        self.github.post_json(self.url("/generate-jitconfig"))
         with self.assertRaises(GitHubUnavailable):
             self.github.get_json(self.url("/runs"))
         for refused_at in (NOW + 0.5, NOW + 59.5):
             self.clock.now = refused_at
             with self.assertRaises(GitHubUnavailable):
-                self.github.post_json(self.url("/token"))
+                self.github.post_json(self.url("/generate-jitconfig"))
         self.clock.now = NOW + 60
-        self.github.post_json(self.url("/token"))
+        self.github.post_json(self.url("/generate-jitconfig"))
         self.assertEqual(self.clock.slept, [])
-        self.assertEqual(len(self.fake.requests_to("/token")), 2)
+        self.assertEqual(len(self.fake.requests_to("/generate-jitconfig")), 2)
 
     def test_pacing_uses_this_cycles_charged_requests(self):
         self.fake.script("/a", Reply(200, rate_limit_headers(100, NOW + 2400), {}))
@@ -724,8 +732,10 @@ class GitHubClientTest(unittest.TestCase):
         )
 
     def test_no_token_value_reaches_a_log_record_or_an_exception(self):
-        secrets = ("test-token", "registration-token-value")
-        self.fake.script("/token", answer_like_a_token_post(4000, NOW + 600))
+        secrets = ("test-token", "jit-config-value")
+        self.fake.script(
+            "/generate-jitconfig", answer_like_a_jit_config_post(4000, NOW + 600)
+        )
         # remaining 100 makes the client log a line, so the log is not trivially clean
         self.fake.script(
             "/forbidden",
@@ -740,7 +750,7 @@ class GitHubClientTest(unittest.TestCase):
         )
         messages = []
         with self.assertLogs(level="DEBUG") as logs:
-            self.github.post_json(self.url("/token"))
+            self.github.post_json(self.url("/generate-jitconfig"))
             for path in ("/forbidden", "/unauthorized"):
                 self.wait_out_the_stop()
                 with self.assertRaises(GitHubUnavailable) as raised:

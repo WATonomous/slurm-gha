@@ -69,11 +69,8 @@ class WaitingJob:
     """A job GitHub reported queued this cycle, for a size label we serve."""
 
     job_id: int
-    run_id: int
     size_label: str
     created_at: float  # epoch seconds, from GitHub; the job has waited since then
-    workflow_name: str
-    job_name: str
 
 
 @dataclass(frozen=True)

@@ -1,11 +1,11 @@
-GITHUB_API_BASE_URL = "https://api.github.com/repos/WATonomous/infra-config"
-GITHUB_REPO_URL = "https://github.com/WATonomous/infra-config"
-ALLOCATE_RUNNER_SCRIPT_PATH = "apptainer.sh"  # relative path from '/allocation_script'
+from dataclasses import dataclass
+
+# sbatch reads it from the daemon's working directory, where the Dockerfile copies it
+ALLOCATE_RUNNER_SCRIPT_PATH = "apptainer.sh"
 
 # Timeout configurations
 NETWORK_TIMEOUT = 30  # seconds per HTTP request; GitHub gives up at 10 s on its side
-SLURM_COMMAND_TIMEOUT = 60  # seconds for SLURM commands (sbatch, sacct, etc.)
-THREAD_SLEEP_TIMEOUT = 5  # seconds between polling cycles for threads
+SLURM_COMMAND_TIMEOUT = 60  # seconds for Slurm commands (squeue, sbatch, scancel)
 
 # GitHub API
 # Pinned so response shapes cannot change under a running daemon
@@ -22,6 +22,9 @@ LONGEST_WAIT_WITHOUT_RETRY_AFTER_S = 15 * 60
 NEWEST_RUNS_PAGE_SIZE = 30
 # One run-history page (2-6 s, one counted request) a minute; trades how long a missed run stays unseen against cost
 HISTORY_PAGE_INTERVAL_S = 60
+# While a repository's cycles are stopped, how often the log repeats how long and why; the cause can change
+# within GitHub (a rate limit turning into bad credentials) without the cycles recovering
+OUTAGE_REMINDER_INTERVAL_S = 10 * 60
 # How far back the history is read: GitHub allows a re-run up to 30 days after a run
 RERUN_WINDOW_S = 30 * 24 * 60 * 60
 
@@ -58,10 +61,23 @@ UNUSED_REGISTRATION_LIFETIME_S = 24 * 60 * 60
 # an offer that is not acquired (about 75 s)
 BUSY_COVER_S = 60
 
+
+@dataclass(frozen=True)
+class Repository:
+    """A repository whose waiting jobs get runners on Slurm."""
+
+    name: str  # owner/name, for log lines
+    api_base_url: str
+    # What makes a Slurm job or a runner registration this repository's, on both sides. Nothing else is read
+    # as ours (the old daemon's runners are slurm-<node>-<id>), and no repository's prefix may start
+    # another's; the daemon refuses to start otherwise
+    runner_name_prefix: str
+
+
 REPOS_TO_MONITOR = [
-    {
-        "name": "WATonomous/infra-config",
-        "api_base_url": "https://api.github.com/repos/WATonomous/infra-config",
-        "repo_url": "https://github.com/WATonomous/infra-config",
-    },
+    Repository(
+        name="WATonomous/infra-config",
+        api_base_url="https://api.github.com/repos/WATonomous/infra-config",
+        runner_name_prefix="gha-infra-config-",
+    ),
 ]

@@ -156,11 +156,8 @@ class RecordedAnswersTest(unittest.TestCase):
             [
                 WaitingJob(
                     job_id=131560293044,
-                    run_id=43326533215,
                     size_label="slurm-runner-small",
                     created_at=epoch_seconds("2026-11-12T23:10:19Z"),
-                    workflow_name="Check pull request task list completion",
-                    job_name="task-list-checker",
                 )
             ],
         )
@@ -220,7 +217,7 @@ class PureFunctionsTest(unittest.TestCase):
         ).waiting_jobs
         self.assertEqual(
             waiting,
-            [WaitingJob(7, 9, "slurm-runner-medium", NOW - 90, "Provision", "job-7")],
+            [WaitingJob(7, "slurm-runner-medium", NOW - 90)],
         )
 
     def test_runner_names_skip_jobs_without_a_runner(self):

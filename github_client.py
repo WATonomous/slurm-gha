@@ -193,7 +193,7 @@ class GitHubClient:
             raise GitHubUnavailable(f"{method} {url}: {error}") from error
 
         now = time.time()
-        # Only reads pace: token POSTs answer as "core" but are counted on a separate counter
+        # Only reads pace: writes report "core" but count separately (measured: token and JIT-config POSTs)
         if method == "GET":
             self.rate_limit_window = update_rate_limit_window(
                 self.rate_limit_window, response.headers, now
