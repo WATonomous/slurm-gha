@@ -18,6 +18,8 @@ MIN_SECONDS_BETWEEN_WRITES = 1
 FIRST_WAIT_WITHOUT_RETRY_AFTER_S = 60
 # Caps the doubling; bounds how late the end of a long GitHub fault is noticed
 LONGEST_WAIT_WITHOUT_RETRY_AFTER_S = 15 * 60
+# Newest runs read each cycle; a push creates 3, so this outlasts many pushes between two cycles
+NEWEST_RUNS_PAGE_SIZE = 30
 
 REPOS_TO_MONITOR = [
     {
