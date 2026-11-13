@@ -387,17 +387,18 @@ def plan_submissions(
     demand: Demand,
     breakers: dict[str, LabelBreaker],
     runners_taking_a_job: dict[str, int],
+    runners_submitted_this_cycle: dict[str, int],
     now: float,
 ) -> dict[str, int]:
     """Runners to submit per size label with a waiting job: waiting jobs, less those runners_taking_a_job
-    cover, minus runners that can still take one, through the label's breaker. A runner that is evidence
-    this cycle cannot: it took a job, or it failed to launch, which includes one GitHub left idle while an
-    uncovered job of its size waited."""
+    cover, minus runners that can still take one (counting runners_submitted_this_cycle), through the
+    label's breaker. A runner that is evidence this cycle cannot: it took a job, or it failed to launch,
+    which includes one GitHub left idle while an uncovered job of its size waited."""
     waiting_jobs_by_label = jobs_left_waiting_by_label(demand, runners_taking_a_job)
     uncovered = uncovered_jobs_waiting_past_b_by_label(
         demand, runners_taking_a_job, now
     )
-    runners_that_can_take_a_job_by_label = {}
+    runners_that_can_take_a_job_by_label = dict(runners_submitted_this_cycle)
     for allocation in allocations:
         registration = registrations_by_name.get(allocation.runner_name)
         phase = phase_of_allocation(allocation, registration, now)

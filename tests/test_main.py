@@ -321,6 +321,45 @@ class DeleteEndedRunnersTest(CycleAgainstFakes):
         self.assertEqual(self.deletes(), [path, path])
 
 
+class SubmitAsRunsAreReadTest(CycleAgainstFakes):
+    """Runners go out after each run's jobs are read, newest run first, without counting a job twice."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake.script(
+            NEWEST_RUNS,
+            Reply(200, body=runs_answer(run(2, "in_progress"), run(1, "in_progress"))),
+        )
+        self.fake.script(run_path(2), Reply(200, body=run(2, "in_progress")))
+
+    def jobs_of(self, run_id, *jobs):
+        self.fake.script(jobs_path(run_id), Reply(200, body=jobs_answer(*jobs)))
+
+    def test_the_newest_runs_jobs_get_runners_before_the_next_run_is_read(self):
+        self.jobs_of(2, *(job(20 + i, "queued", [MEDIUM]) for i in range(3)))
+        self.jobs_of(1, *(job(10 + i, "queued", [MEDIUM]) for i in range(2)))
+        self.cycle(memory_with({MEDIUM: LabelBreaker(NOW - 3600, ())}))
+        paths = [path for _, path, _ in self.fake.received]
+        first_jit_config = paths.index(GENERATE_JIT_CONFIG)
+        self.assertLess(paths.index(RUNNERS), paths.index(jobs_path(2)))
+        self.assertLess(paths.index(jobs_path(2)), first_jit_config)
+        self.assertLess(first_jit_config, paths.index(jobs_path(1)))
+        self.assertEqual(self.submitted_size_labels(), [MEDIUM] * 5)
+
+    def test_launch_evidence_is_weighed_even_with_no_run_to_read(self):
+        self.fake.script(NEWEST_RUNS, Reply(200, body=runs_answer()))
+        failed = self.slurm.add_job(f"{PREFIX}a", "FAILED", started_at=NOW - 20)
+        self.slurm.jobs[failed]["ended_at"] = NOW - 10
+        memory = self.cycle(memory_with({MEDIUM: LabelBreaker(NOW - 3600, ())}))
+        self.assertEqual(len(memory.breakers[MEDIUM].failures_since_success), 1)
+
+    def test_an_unproven_label_still_gets_one_runner_in_the_whole_cycle(self):
+        self.jobs_of(2, job(20, "queued", [MEDIUM]))
+        self.jobs_of(1, job(10, "queued", [MEDIUM]))
+        self.cycle(empty_memory())
+        self.assertEqual(self.submitted_size_labels(), [MEDIUM])
+
+
 class BusyRunnerCoversItsJobTest(CycleAgainstFakes):
     """A runner GitHub has offered a job covers it until the job names it, for at most T."""
 

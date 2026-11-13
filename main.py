@@ -11,6 +11,7 @@ import logging
 import os
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass, replace
 
 from dotenv import load_dotenv
@@ -173,8 +174,8 @@ def run_cycle(
     github: GitHubClient, repo: Repository, memory: RepositoryMemory, now: float
 ) -> RepositoryMemory:
     """One repository's cycle: read supply, cancel what cannot start and delete ended runners'
-    registrations, read demand, weigh launch evidence, submit. Only the two supply reads raise, and they
-    come before anything is changed."""
+    registrations, then read demand run by run, weighing launch evidence and submitting after each. Only
+    the two supply reads raise, and they come before anything is changed."""
     # Supply
     allocations = read_our_allocations(repo.runner_name_prefix)
     registrations_by_name = read_our_registrations(
@@ -196,8 +197,7 @@ def run_cycle(
             answered = sightings.deletes_answered | {registration.runner_name}
             sightings = replace(sightings, deletes_answered=answered)
 
-    # Demand: the queued jobs of every watched run, whatever the run's own status says (#39). A run that
-    # cannot be read is left out, so demand is a lower bound, which is all that adding runners needs.
+    # Demand: the queued jobs of every watched run, whatever the run's own status says (#39)
     watched_run_ids = watch_new_runs(github, repo.api_base_url, memory.watched_run_ids)
     next_history_page = memory.next_history_page
     next_history_page_at = memory.next_history_page_at
@@ -206,41 +206,59 @@ def run_cycle(
             github, repo.api_base_url, watched_run_ids, next_history_page, now
         )
         next_history_page_at = now + HISTORY_PAGE_INTERVAL_S
-    jobs_by_run = read_latest_jobs(github, repo.api_base_url, watched_run_ids)
-    watched_run_ids = stop_watching_finished_runs(
-        github, repo.api_base_url, watched_run_ids, jobs_by_run
-    )
-    demand = demand_from_jobs(jobs_by_run)
 
-    # Busy runners whose jobs may still say queued: those jobs count neither as waiting nor as evidence
-    runners_taking_a_job = runners_taking_a_job_by_label(
-        allocations, registrations_by_name, sightings, demand, now
-    )
-
-    # Launch evidence: which runners took a job and which failed to launch (#37, resubmit storms)
+    # Newest run first, submitting after each: demand read so far is a lower bound, so a new wave need not
+    # wait for older runs to be read. Runners are counted, never matched to jobs (#38).
+    # Launch evidence from supply alone first, so a cycle with no run to read still weighs failures (#37).
     breakers = update_breakers(
         memory.breakers,
         allocations,
         registrations_by_name,
-        demand,
-        runners_taking_a_job,
-        now,
+        NO_DEMAND,
+        runners_taking_a_job={},
+        now=now,
     )
+    jobs_by_run = {}
+    runners_submitted_this_cycle = Counter()
+    for run_id in sorted(watched_run_ids, reverse=True):
+        jobs_by_run |= read_latest_jobs(github, repo.api_base_url, {run_id})
+        demand = demand_from_jobs(jobs_by_run)
+        # Busy runners whose jobs may still say queued: those jobs count neither as waiting nor as evidence
+        runners_taking_a_job = runners_taking_a_job_by_label(
+            allocations, registrations_by_name, sightings, demand, now
+        )
+        breakers = update_breakers(
+            breakers,
+            allocations,
+            registrations_by_name,
+            demand,
+            runners_taking_a_job,
+            now,
+        )
+        runners_to_submit = plan_submissions(
+            allocations,
+            registrations_by_name,
+            demand,
+            breakers,
+            runners_taking_a_job,
+            runners_submitted_this_cycle,
+            now,
+        )
+        runners_submitted_this_cycle.update(
+            submit_runners(github, repo, submission_order(runners_to_submit))
+        )
     for line in breaker_log_lines(memory.breakers, breakers):
         logger.info(f"{repo.name}: {line}")
 
-    # Close the gap per size label: runners are counted, never matched to jobs (#38)
-    runners_to_submit = plan_submissions(
+    sightings = update_sightings(
+        sightings,
         allocations,
         registrations_by_name,
-        demand,
-        breakers,
-        runners_taking_a_job,
+        demand_from_jobs(jobs_by_run),
         now,
     )
-    submit_runners(github, repo, submission_order(runners_to_submit))
-    sightings = update_sightings(
-        sightings, allocations, registrations_by_name, demand, now
+    watched_run_ids = stop_watching_finished_runs(
+        github, repo.api_base_url, watched_run_ids, jobs_by_run
     )
     return RepositoryMemory(
         watched_run_ids, next_history_page, next_history_page_at, breakers, sightings
@@ -249,9 +267,11 @@ def run_cycle(
 
 def submit_runners(
     github: GitHubClient, repo: Repository, size_labels_in_order: list[str]
-) -> None:
-    """submit_runner for each entry. A failure is logged and the next entry tried; the next cycle counts
-    the gap again. While GitHub asks the client to stop, the rest fail at once without a request."""
+) -> list[str]:
+    """submit_runner for each entry; the size labels of those submitted. A failure is logged and the next
+    entry tried; the next cycle counts the gap again. While GitHub asks the client to stop, the rest fail
+    at once without a request."""
+    submitted = []
     for size_label in size_labels_in_order:
         try:
             submit_runner(
@@ -261,6 +281,9 @@ def submit_runners(
             logger.warning(
                 f"{repo.name}: could not submit a runner for {size_label}: {error}"
             )
+            continue
+        submitted.append(size_label)
+    return submitted
 
 
 def unsafe_settings(

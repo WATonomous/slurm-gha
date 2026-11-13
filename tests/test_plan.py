@@ -488,7 +488,7 @@ class PlanSubmissionsTest(unittest.TestCase):
         proven = {MEDIUM: LabelBreaker(NOW - 60, ()), SMALL: LabelBreaker(NOW - 60, ())}
         jobs = demand(waiting(10) + waiting(1, SMALL), [named_on_a_job.runner_name])
         self.assertEqual(
-            plan_submissions(allocations, by_name, jobs, proven, {}, NOW),
+            plan_submissions(allocations, by_name, jobs, proven, {}, {}, NOW),
             {MEDIUM: 10 - 3, SMALL: 0},
         )
 
@@ -497,7 +497,7 @@ class PlanSubmissionsTest(unittest.TestCase):
         proven = {MEDIUM: LabelBreaker(NOW - 60, ())}
         jobs = demand(waiting(3))
         self.assertEqual(
-            plan_submissions([just_submitted], {}, jobs, proven, {}, NOW),
+            plan_submissions([just_submitted], {}, jobs, proven, {}, {}, NOW),
             {MEDIUM: 2},
         )
 
@@ -507,26 +507,39 @@ class PlanSubmissionsTest(unittest.TestCase):
         proven = {MEDIUM: LabelBreaker(NOW - 3600, ())}
         waited_over_b = demand(waiting(1, waited_s=B + 1))
         self.assertEqual(
-            plan_submissions([passed_over], by_name, waited_over_b, proven, {}, NOW),
+            plan_submissions(
+                [passed_over], by_name, waited_over_b, proven, {}, {}, NOW
+            ),
             {MEDIUM: 1},
         )
         just_waiting = demand(waiting(1, waited_s=B))
         self.assertEqual(
-            plan_submissions([passed_over], by_name, just_waiting, proven, {}, NOW),
+            plan_submissions([passed_over], by_name, just_waiting, proven, {}, {}, NOW),
             {MEDIUM: 0},
         )
 
     def test_an_unproven_label_gets_one_runner_when_none_can_take_a_job(self):
         jobs = demand(waiting(10))
-        self.assertEqual(plan_submissions([], {}, jobs, {}, {}, NOW), {MEDIUM: 1})
+        self.assertEqual(plan_submissions([], {}, jobs, {}, {}, {}, NOW), {MEDIUM: 1})
         probe = allocation(1, "PENDING")
         by_name = registrations(registration(probe, False))
         self.assertEqual(
-            plan_submissions([probe], by_name, jobs, {}, {}, NOW), {MEDIUM: 0}
+            plan_submissions([probe], by_name, jobs, {}, {}, {}, NOW), {MEDIUM: 0}
+        )
+
+    def test_runners_submitted_earlier_this_cycle_count_as_able_to_take_a_job(self):
+        jobs = demand(waiting(10))
+        proven = {MEDIUM: LabelBreaker(NOW - 60, ())}
+        self.assertEqual(
+            plan_submissions([], {}, jobs, proven, {}, {MEDIUM: 4}, NOW), {MEDIUM: 6}
+        )
+        # An unproven label's one runner went out earlier this cycle: no second one
+        self.assertEqual(
+            plan_submissions([], {}, jobs, {}, {}, {MEDIUM: 1}, NOW), {MEDIUM: 0}
         )
 
     def test_no_waiting_jobs_no_runners(self):
-        self.assertEqual(plan_submissions([], {}, demand(), {}, {}, NOW), {})
+        self.assertEqual(plan_submissions([], {}, demand(), {}, {}, {}, NOW), {})
 
 
 class BusyRunnerCoversItsJobTest(unittest.TestCase):
@@ -543,7 +556,9 @@ class BusyRunnerCoversItsJobTest(unittest.TestCase):
         taking = runners_taking_a_job_by_label(
             allocations, by_name, sightings, jobs, now
         )
-        return plan_submissions(allocations, by_name, jobs, self.proven, taking, now)
+        return plan_submissions(
+            allocations, by_name, jobs, self.proven, taking, {}, now
+        )
 
     def test_inside_the_gap_nothing_extra_is_submitted(self):
         of, reg = self.taking()
@@ -719,8 +734,8 @@ class RegistrationsToDeleteTest(unittest.TestCase):
                 self.assertIs(phase_of_allocation(of, None, NOW), Phase.ENDED)
                 jobs = demand(waiting(1))
                 self.assertEqual(
-                    plan_submissions([of], listed, jobs, {}, {}, NOW),
-                    plan_submissions([of], deleted, jobs, {}, {}, NOW),
+                    plan_submissions([of], listed, jobs, {}, {}, {}, NOW),
+                    plan_submissions([of], deleted, jobs, {}, {}, {}, NOW),
                 )
 
 
@@ -785,7 +800,7 @@ class BreakerLifeTest(unittest.TestCase):
         self.breakers = update_breakers(
             self.breakers, allocations, by_name, jobs, {}, now
         )
-        return plan_submissions(allocations, by_name, jobs, self.breakers, {}, now)[
+        return plan_submissions(allocations, by_name, jobs, self.breakers, {}, {}, now)[
             MEDIUM
         ]
 
