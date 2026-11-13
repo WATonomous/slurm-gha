@@ -25,6 +25,16 @@ HISTORY_PAGE_INTERVAL_S = 60
 # How far back the history is read: GitHub allows a re-run up to 30 days after a run
 RERUN_WINDOW_S = 30 * 24 * 60 * 60
 
+# Runners
+# W: how long a started runner may wait for a job before its batch script stops it. The slowest recorded
+# pickup took 548 s; any value is safe, it trades idle CPUs against tolerance for slow boots
+IDLE_ALLOWANCE_S = 10 * 60
+# D: from Slurm starting the job to its batch script starting the idle-deadline clock (BatchStartTimeout
+# is 10 s), plus from a job being picked up to its job-started hook running
+SCRIPT_START_MARGIN_S = 2 * 60
+# The compute partition's MaxTime; a runner asking for more would stay pending forever
+SLURM_PARTITION_MAX_TIME_MINUTES = 24 * 60
+
 REPOS_TO_MONITOR = [
     {
         "name": "WATonomous/infra-config",

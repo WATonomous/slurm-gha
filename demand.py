@@ -12,6 +12,7 @@ from datetime import datetime
 
 from config import NEWEST_RUNS_PAGE_SIZE, RERUN_WINDOW_S
 from github_client import PAGE_SIZE, GitHubClient, GitHubNotFound, GitHubUnavailable
+from runner_size_config import size_label_of_job
 
 logger = logging.getLogger(__name__)
 
@@ -23,8 +24,7 @@ class WaitingJob:
     job_id: int
     run_id: int
     size_label: str
-    # All of the job's labels; its runner registers with exactly these
-    labels: tuple[str, ...]
+    created_at: float  # epoch seconds, from GitHub; the job has waited since then
     workflow_name: str
     job_name: str
 
@@ -100,10 +100,7 @@ def next_history_page(
     to be re-run. Never judged by length: GitHub may return a short page with more after it."""
     if not runs_on_page or not has_next_page:
         return 1
-    oldest_created_at = datetime.fromisoformat(
-        runs_on_page[-1]["created_at"].replace("Z", "+00:00")
-    )
-    if oldest_created_at.timestamp() < now - RERUN_WINDOW_S:
+    if epoch_seconds(runs_on_page[-1]["created_at"]) < now - RERUN_WINDOW_S:
         return 1
     return page + 1
 
@@ -187,7 +184,7 @@ def demand_from_jobs(jobs_by_run: dict[int, list[dict]]) -> Demand:
                         job_id=job["id"],
                         run_id=run_id,
                         size_label=size_label,
-                        labels=tuple(job["labels"]),
+                        created_at=epoch_seconds(job["created_at"]),
                         workflow_name=job["workflow_name"],
                         job_name=job["name"],
                     )
@@ -195,11 +192,9 @@ def demand_from_jobs(jobs_by_run: dict[int, list[dict]]) -> Demand:
     return Demand(waiting_jobs, runner_names_on_jobs)
 
 
-def size_label_of_job(job_labels: list[str]) -> str | None:
-    """Pure: the first label if it names a slurm-runner size, as the daemon has always read it; None otherwise."""
-    if job_labels and "slurm-runner" in job_labels[0]:
-        return job_labels[0]
-    return None
+def epoch_seconds(github_time: str) -> float:
+    """Pure: a GitHub timestamp such as "2026-11-13T00:37:59Z" in seconds since the epoch."""
+    return datetime.fromisoformat(github_time.replace("Z", "+00:00")).timestamp()
 
 
 def workflow_runs_in(body: dict, url: str) -> list[dict]:

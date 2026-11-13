@@ -196,7 +196,7 @@ def allocate_actions_runner(
     if time.time() < no_new_runner_before.get((repo_name, job_id), 0):
         return False
 
-    labels = list(job.labels)
+    labels = [job.size_label]
     runner_size_label = job.size_label
 
     logger.info(f"Allocating runner for job {job_id} in repo {repo_name}")
@@ -230,10 +230,10 @@ def allocate_actions_runner(
             "sbatch",
             "--output=/var/log/slurm-ci/slurm-ci-%j.out",
             f"--job-name=slurm-{runner_size_label}-{job_id}",
-            f"--mem-per-cpu={runner_resources['mem-per-cpu']}",
-            f"--cpus-per-task={runner_resources['cpu']}",
-            f"--gres=tmpdisk:{runner_resources['tmpdisk']}",
-            f"--time={runner_resources['time']}",
+            f"--mem-per-cpu={runner_resources.mem_per_cpu}",
+            f"--cpus-per-task={runner_resources.cpus}",
+            f"--gres=tmpdisk:{runner_resources.tmpdisk_mib}",
+            f"--time={runner_resources.job_budget_minutes}",
             # Else JobRequeue=1 turns a failed launch into a held job that never ends
             "--no-requeue",
             ALLOCATE_RUNNER_SCRIPT_PATH,  # allocate-ephemeral-runner-from-docker.sh
