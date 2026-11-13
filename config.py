@@ -26,6 +26,10 @@ HISTORY_PAGE_INTERVAL_S = 60
 RERUN_WINDOW_S = 30 * 24 * 60 * 60
 
 # Runners
+# The repository's Default runner group; generate-jitconfig requires one
+RUNNER_GROUP_ID = 1
+# Where each runner's batch script writes, on the node that ran it
+SLURM_OUTPUT_PATH = "/var/log/slurm-ci/slurm-ci-%j.out"
 # W: how long a started runner may wait for a job before its batch script stops it. The slowest recorded
 # pickup took 548 s; any value is safe, it trades idle CPUs against tolerance for slow boots
 IDLE_ALLOWANCE_S = 10 * 60

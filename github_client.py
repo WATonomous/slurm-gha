@@ -109,16 +109,16 @@ class GitHubClient:
         return items
 
     def post_json(self, url: str, body: dict | None = None) -> dict:
-        """One write, started MIN_SECONDS_BETWEEN_WRITES after the last one started (the client's only sleep);
-        never retried, body never logged."""
-        self._raise_if_stopped("POST", url)
-        wait_s = (
-            self._last_write_started_at + MIN_SECONDS_BETWEEN_WRITES - time.monotonic()
-        )
-        if wait_s > 0:
-            time.sleep(wait_s)
+        """One write, spaced from the last (_wait_to_write); never retried, body never logged."""
+        self._wait_to_write("POST", url)
         response = self._send("POST", url, json_body=body)
         return _json_object_from(response.content, f"POST {url}")
+
+    def delete(self, url: str) -> int:
+        """One write, spaced from the last (_wait_to_write); never retried. The status for 204, 404 (already
+        gone) and 422 (GitHub refuses); GitHubUnavailable for any other answer."""
+        self._wait_to_write("DELETE", url)
+        return self._send("DELETE", url, answered_statuses=(404, 422)).status_code
 
     def seconds_until_next_cycle(self, now: float) -> float:
         """next_cycle_delay_s with this cycle's charged requests, this client's window and its stop signal."""
@@ -162,14 +162,26 @@ class GitHubClient:
                 f"{method} {url}: not sent, GitHub asked for {wait_s:.0f} s more without requests"
             )
 
+    def _wait_to_write(self, method: str, url: str) -> None:
+        """Refused while a stop lasts; else sleeps until MIN_SECONDS_BETWEEN_WRITES after the last write
+        started (the client's only sleep)."""
+        self._raise_if_stopped(method, url)
+        wait_s = (
+            self._last_write_started_at + MIN_SECONDS_BETWEEN_WRITES - time.monotonic()
+        )
+        if wait_s > 0:
+            time.sleep(wait_s)
+
     def _send(
         self,
         method: str,
         url: str,
         headers: dict | None = None,
         json_body: dict | None = None,
+        answered_statuses: tuple[int, ...] = (),
     ) -> requests.Response:
-        """The one place a request leaves: refused while a stop lasts; returns a 2xx or 304 response, raises on the rest."""
+        """The one place a request leaves: refused while a stop lasts; returns a 2xx or 304 response, or one
+        with a status in answered_statuses, and raises on the rest."""
         self._raise_if_stopped(method, url)
         if method != "GET":
             self._last_write_started_at = time.monotonic()
@@ -192,6 +204,8 @@ class GitHubClient:
                 if remaining.isdigit() and int(remaining) % 100 == 0:
                     logger.info(f"Rate Limit Remaining: {remaining}")
 
+        if response.status_code in answered_statuses:
+            return response
         outcome = classify_response(response.status_code)
         if outcome == "stop":
             message = _github_error_message(response)

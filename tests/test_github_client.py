@@ -215,6 +215,7 @@ class FakeGitHub:
     def __init__(self):
         self.scripts = {}
         self.received = []  # (method, path, headers)
+        self.received_bodies = []  # (method, path, body as sent)
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -222,6 +223,9 @@ class FakeGitHub:
                 fake.answer(self)
 
             def do_POST(self):
+                fake.answer(self)
+
+            def do_DELETE(self):
                 fake.answer(self)
 
             def log_message(self, *args):
@@ -253,8 +257,11 @@ class FakeGitHub:
         return [request for request in self.received if request[1] == path]
 
     def answer(self, handler):
-        handler.rfile.read(int(handler.headers.get("Content-Length") or 0))
+        request_body = handler.rfile.read(
+            int(handler.headers.get("Content-Length") or 0)
+        )
         self.received.append((handler.command, handler.path, dict(handler.headers)))
+        self.received_bodies.append((handler.command, handler.path, request_body))
         replies = self.scripts.get(handler.path) or [
             Reply(404, body={"message": "Not Found"})
         ]
@@ -632,6 +639,32 @@ class GitHubClientTest(unittest.TestCase):
             port = unused.getsockname()[1]
         with self.assertRaises(GitHubUnavailable):
             self.github.get_json(f"http://127.0.0.1:{port}/runs")
+
+    def test_a_delete_returns_the_status_github_answered_or_raises(self):
+        for status in (204, 404, 422):
+            with self.subTest(status=status):
+                self.fake.script(f"/runners/{status}", Reply(status, body=None))
+                self.assertEqual(
+                    self.github.delete(self.url(f"/runners/{status}")), status
+                )
+        self.fake.script("/runners/500", Reply(500, body={"message": "Server Error"}))
+        with self.assertRaises(GitHubUnavailable):
+            self.github.delete(self.url("/runners/500"))
+        self.assertEqual(self.github.no_requests_before, 0)
+
+    def test_a_delete_is_a_write_spaced_from_the_last_and_obeys_stops(self):
+        self.fake.script("/write", Reply(201, body={}))
+        self.fake.script("/runners/1", Reply(204, body=None))
+        self.github.post_json(self.url("/write"))
+        self.github.delete(self.url("/runners/1"))
+        self.assertEqual(self.clock.slept, [MIN_SECONDS_BETWEEN_WRITES])
+        self.fake.script("/runners/2", Reply(403, body=SECONDARY_LIMIT))
+        with self.assertRaises(GitHubUnavailable):
+            self.github.delete(self.url("/runners/2"))
+        self.assertEqual(self.github.no_requests_before - self.clock.now, 60)
+        with self.assertRaises(GitHubUnavailable):
+            self.github.delete(self.url("/runners/1"))
+        self.assertEqual(len(self.fake.requests_to("/runners/1")), 1)
 
     def test_writes_are_spaced_one_second_apart(self):
         self.fake.script("/token", answer_like_a_token_post(4000, NOW + 600))
