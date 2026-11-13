@@ -28,7 +28,7 @@ fi
 
 # Install ruff for linting
 echo "📦 Installing ruff..."
-uv pip install ruff
+uv pip install ruff==0.17.5
 
 # Activate virtual environment and run ruff
 echo "🔍 Running ruff check..."
