@@ -51,6 +51,10 @@ allocated_jobs = {}
 # A small flag used for logging "Polling for queued workflows..." only when we don't allocate anything.
 POLLED_WITHOUT_ALLOCATING = False
 
+# sacct states from which a job can still run; every other state is final.
+# https://slurm.schedmd.com/archive/slurm-24.05.1/sacct.html#SECTION_JOB-STATE-CODES
+UNFINISHED_SLURM_STATES = ("PENDING", "RUNNING", "REQUEUED", "RESIZING", "SUSPENDED")
+
 
 def get_gh_api(url, token, etag=None):
     """
@@ -315,6 +319,8 @@ def allocate_actions_runner(job_id, token, repo_api_base_url, repo_url, repo_nam
             f"--cpus-per-task={runner_resources['cpu']}",
             f"--gres=tmpdisk:{runner_resources['tmpdisk']}",
             f"--time={runner_resources['time']}",
+            # Else JobRequeue=1 turns a failed launch into a held job that never ends
+            "--no-requeue",
             ALLOCATE_RUNNER_SCRIPT_PATH,  # allocate-ephemeral-runner-from-docker.sh
             repo_url,
             registration_token,
@@ -443,12 +449,7 @@ def check_slurm_status():
 
                 # Convert time strings to datetime objects
 
-                if (
-                    status.startswith("COMPLETED")
-                    or status.startswith("FAILED")
-                    or status.startswith("CANCELLED")
-                    or status.startswith("TIMEOUT")
-                ):
+                if not status.startswith(UNFINISHED_SLURM_STATES):
                     try:
                         start_time = datetime.strptime(
                             start_time_str, "%Y-%m-%dT%H:%M:%S"
