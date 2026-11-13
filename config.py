@@ -20,6 +20,10 @@ FIRST_WAIT_WITHOUT_RETRY_AFTER_S = 60
 LONGEST_WAIT_WITHOUT_RETRY_AFTER_S = 15 * 60
 # Newest runs read each cycle; a push creates 3, so this outlasts many pushes between two cycles
 NEWEST_RUNS_PAGE_SIZE = 30
+# One run-history page (2-6 s, one counted request) a minute; trades how long a missed run stays unseen against cost
+HISTORY_PAGE_INTERVAL_S = 60
+# How far back the history is read: GitHub allows a re-run up to 30 days after a run
+RERUN_WINDOW_S = 30 * 24 * 60 * 60
 
 REPOS_TO_MONITOR = [
     {

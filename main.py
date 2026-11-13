@@ -15,11 +15,13 @@ from demand import (
     read_latest_jobs,
     stop_watching_finished_runs,
     watch_new_runs,
+    watch_runs_from_history_page,
 )
 from github_client import GitHubClient, GitHubUnavailable
 from KubernetesLogFormatter import KubernetesLogFormatter
 from runner_size_config import get_runner_resources
-from config import MIN_SECONDS_BETWEEN_CYCLES, NETWORK_TIMEOUT, SLURM_COMMAND_TIMEOUT
+from config import HISTORY_PAGE_INTERVAL_S, MIN_SECONDS_BETWEEN_CYCLES
+from config import NETWORK_TIMEOUT, SLURM_COMMAND_TIMEOUT
 from config import THREAD_SLEEP_TIMEOUT
 from RunningJob import RunningJob
 
@@ -98,17 +100,32 @@ def poll_github_actions_and_allocate_runners(github: GitHubClient) -> None:
     )
     # Demand's only state across cycles; after a restart GitHub's run lists refill it
     watched_run_ids_by_repo = {repo["name"]: set() for repo in REPOS_TO_MONITOR}
+    history_page_by_repo = {repo["name"]: 1 for repo in REPOS_TO_MONITOR}
+    next_history_page_at = 0.0  # time.monotonic(); 0 reads page 1 in the first cycle
 
     while True:
         github.start_cycle()
         try:
             something_allocated = False
+            read_history_page = time.monotonic() >= next_history_page_at
+            if read_history_page:
+                next_history_page_at = time.monotonic() + HISTORY_PAGE_INTERVAL_S
 
             for repo in REPOS_TO_MONITOR:
                 repo_api_base_url = repo["api_base_url"]
                 watched_run_ids = watch_new_runs(
                     github, repo_api_base_url, watched_run_ids_by_repo[repo["name"]]
                 )
+                if read_history_page:
+                    watched_run_ids, history_page_by_repo[repo["name"]] = (
+                        watch_runs_from_history_page(
+                            github,
+                            repo_api_base_url,
+                            watched_run_ids,
+                            history_page_by_repo[repo["name"]],
+                            time.time(),
+                        )
+                    )
                 watched_run_ids_by_repo[repo["name"]] = watched_run_ids
 
                 jobs_by_run = {}

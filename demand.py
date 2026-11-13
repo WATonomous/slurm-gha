@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 
-from config import NEWEST_RUNS_PAGE_SIZE
-from github_client import GitHubClient, GitHubNotFound, GitHubUnavailable
+from config import NEWEST_RUNS_PAGE_SIZE, RERUN_WINDOW_S
+from github_client import PAGE_SIZE, GitHubClient, GitHubNotFound, GitHubUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,46 @@ def watch_new_runs(
     for run_id in sorted(new_run_ids):
         logger.info(f"Watching run {run_id}")
     return watched_run_ids | new_run_ids
+
+
+def watch_runs_from_history_page(
+    github: GitHubClient,
+    repo_api_base_url: str,
+    watched_run_ids: set[int],
+    page: int,
+    now: float,
+) -> tuple[set[int], int]:
+    """watched_run_ids plus the not-completed runs on one page of all runs, newest first, and the page to
+    read next; finds a re-run or, after a restart, a run that neither the newest page nor the status
+    lists show. A failed read adds nothing and keeps the page."""
+    page_url = f"{repo_api_base_url}/actions/runs?per_page={PAGE_SIZE}&page={page}&exclude_pull_requests=true"
+    try:
+        body, next_page_url = github.get_page(page_url)
+        runs = workflow_runs_in(body, page_url)
+    except GitHubUnavailable as e:
+        logger.warning(f"Could not read page {page} of the run history: {e}")
+        return watched_run_ids, page
+
+    new_run_ids = run_ids_to_watch(runs, []) - watched_run_ids
+    for run_id in sorted(new_run_ids):
+        logger.info(f"Watching run {run_id}, found on page {page} of the run history")
+    next_page = next_history_page(page, runs, next_page_url is not None, now)
+    return watched_run_ids | new_run_ids, next_page
+
+
+def next_history_page(
+    page: int, runs_on_page: list[dict], has_next_page: bool, now: float
+) -> int:
+    """Pure: the next page, or 1 again once this page is empty, has no next page, or reaches runs too old
+    to be re-run. Never judged by length: GitHub may return a short page with more after it."""
+    if not runs_on_page or not has_next_page:
+        return 1
+    oldest_created_at = datetime.fromisoformat(
+        runs_on_page[-1]["created_at"].replace("Z", "+00:00")
+    )
+    if oldest_created_at.timestamp() < now - RERUN_WINDOW_S:
+        return 1
+    return page + 1
 
 
 def read_latest_jobs(

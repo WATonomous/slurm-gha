@@ -2,19 +2,22 @@
 
 import json
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from demand import (
     Demand,
     WaitingJob,
     demand_from_jobs,
+    next_history_page,
     read_latest_jobs,
     run_ids_to_watch,
     size_label_of_job,
     stop_watching_finished_runs,
     watch_new_runs,
+    watch_runs_from_history_page,
 )
-from config import NEWEST_RUNS_PAGE_SIZE
+from config import NEWEST_RUNS_PAGE_SIZE, RERUN_WINDOW_S
 from github_client import GitHubClient
 from test_github_client import FakeGitHub, Reply, answer_304_to
 
@@ -22,6 +25,7 @@ from test_github_client import FakeGitHub, Reply, answer_304_to
 # each GitHub answer about that run, cut to a few fields
 RECORDED = sorted((Path(__file__).parent / "recorded").glob("*.json"))
 REPO = "/repos/WATonomous/infra-config"
+NOW = 1_800_000_000.0
 NEWEST_RUNS = (
     f"{REPO}/actions/runs?per_page={NEWEST_RUNS_PAGE_SIZE}&exclude_pull_requests=true"
 )
@@ -75,6 +79,25 @@ def job(
 
 def run(run_id, status, run_attempt=1):
     return {"id": run_id, "status": status, "run_attempt": run_attempt}
+
+
+def iso(epoch_s):
+    return datetime.fromtimestamp(epoch_s, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def history_path(page):
+    return f"{REPO}/actions/runs?per_page=100&page={page}&exclude_pull_requests=true"
+
+
+def history_runs(first_run_id, count, oldest_created_at, statuses=None):
+    """count runs, newest first, the last one created at oldest_created_at."""
+    statuses = statuses or {}
+    runs = []
+    for run_id in range(first_run_id, first_run_id - count, -1):
+        runs.append(run(run_id, statuses.get(run_id, "completed")))
+        runs[-1]["created_at"] = iso(NOW - 3600)
+    runs[-1]["created_at"] = oldest_created_at
+    return runs
 
 
 def runs_answer(*runs):
@@ -432,6 +455,67 @@ class ReadingTest(unittest.TestCase):
         self.assertTrue(
             all("If-None-Match" in headers for _, _, headers in second_cycle)
         )
+
+
+class HistorySweepTest(unittest.TestCase):
+    def setUp(self):
+        self.fake = FakeGitHub()
+        self.addCleanup(self.fake.close)
+        self.github = GitHubClient("test-token")
+        self.repo = self.fake.base_url + REPO
+
+    def history_page(self, page, runs, has_next_page=True):
+        link = f'<{self.fake.base_url}{history_path(page + 1)}>; rel="next"'
+        headers = {"Link": link} if has_next_page else {}
+        self.fake.script(history_path(page), Reply(200, headers, runs_answer(*runs)))
+
+    def test_next_page_until_no_next_page_an_empty_page_or_the_rerun_window(self):
+        inside = iso(NOW - RERUN_WINDOW_S + 60)
+        outside = iso(NOW - RERUN_WINDOW_S - 60)
+        rows = [
+            (history_runs(500, 100, inside), True, 4),
+            (history_runs(500, 87, inside), True, 4),  # short, and more pages follow
+            (history_runs(500, 100, inside), False, 1),
+            (history_runs(500, 100, outside), True, 1),
+            ([], True, 1),
+        ]
+        for runs, has_next_page, next_page in rows:
+            with self.subTest(runs=len(runs), has_next_page=has_next_page):
+                self.assertEqual(
+                    next_history_page(3, runs, has_next_page, NOW), next_page
+                )
+
+    def test_a_page_adds_its_runs_that_are_not_completed(self):
+        statuses = {450: "in_progress", 420: "queued"}
+        self.history_page(2, history_runs(500, 100, iso(NOW), statuses))
+        watched, next_page = watch_runs_from_history_page(
+            self.github, self.repo, {9}, 2, NOW
+        )
+        self.assertEqual((watched, next_page), ({9, 450, 420}, 3))
+
+    def test_a_page_that_cannot_be_read_adds_nothing_and_is_read_again(self):
+        self.fake.script(history_path(2), Reply(502, body={"message": "Server Error"}))
+        with self.assertLogs("demand", level="WARNING"):
+            self.assertEqual(
+                watch_runs_from_history_page(self.github, self.repo, {9}, 2, NOW),
+                ({9}, 2),
+            )
+
+    def test_a_run_every_list_misses_is_found_within_one_pass(self):
+        """A re-run of an old run, or after a restart a run the status lists lost, as master run
+        43268654241 was lost for 87 minutes. Page 1 comes back short and is not the end."""
+        self.history_page(1, history_runs(300, 87, iso(NOW)))
+        self.history_page(2, history_runs(213, 100, iso(NOW), {150: "in_progress"}))
+        self.history_page(3, history_runs(113, 100, iso(NOW - RERUN_WINDOW_S - 1)))
+        watched, page, pages_read = set(), 1, []
+        for _ in range(4):
+            self.github.start_cycle()
+            pages_read.append(page)
+            watched, page = watch_runs_from_history_page(
+                self.github, self.repo, watched, page, NOW
+            )
+        self.assertEqual(pages_read, [1, 2, 3, 1])
+        self.assertEqual(watched, {150})
 
 
 if __name__ == "__main__":
