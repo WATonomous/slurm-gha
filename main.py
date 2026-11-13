@@ -39,7 +39,8 @@ logger.addHandler(stderr_handler)
 # Load GitHub access token from .env file
 # Only secret required is the GitHub access token
 load_dotenv()
-GITHUB_ACCESS_TOKEN = os.getenv("GITHUB_ACCESS_TOKEN").strip()
+# Removed from the environment, which sbatch copies into runner jobs by default
+GITHUB_ACCESS_TOKEN = os.environ.pop("GITHUB_ACCESS_TOKEN").strip()
 os.environ["PATH"] = "/opt/slurm/bin:" + os.environ["PATH"]
 
 
@@ -322,7 +323,11 @@ def allocate_actions_runner(job_id, token, repo_api_base_url, repo_url, repo_nam
             str(run_id),
         ]
 
-        logger.info(f"Running command: {' '.join(command)}")
+        command_without_tokens = " ".join(
+            "<token>" if arg in (registration_token, removal_token) else arg
+            for arg in command
+        )
+        logger.info(f"Running command: {command_without_tokens}")
         try:
             result = subprocess.run(
                 command, capture_output=True, text=True, timeout=SLURM_COMMAND_TIMEOUT
@@ -364,7 +369,7 @@ def allocate_actions_runner(job_id, token, repo_api_base_url, repo_url, repo_nam
             return False
         except subprocess.TimeoutExpired:
             logger.error(
-                f"SLURM command timed out after {SLURM_COMMAND_TIMEOUT} seconds: {' '.join(command)}"
+                f"SLURM command timed out after {SLURM_COMMAND_TIMEOUT} seconds: {command_without_tokens}"
             )
             del allocated_jobs[(repo_name, job_id)]
             return False
