@@ -22,6 +22,7 @@ from plan import Allocation, Phase, RunnerRegistration, phase_of_allocation
 from runner_size_config import RunnerResources
 from supply import (
     JIT_CONFIG_VARIABLE,
+    SlurmTimedOut,
     SlurmUnavailable,
     cancel_pending_allocation,
     delete_registration,
@@ -51,6 +52,12 @@ class FakeSlurm:
         self.next_slurm_job_id = 812000
         self.calls = []  # (argv, the environment added to the daemon's)
         self.failing_commands = set()
+        # sbatch exits non-zero after slurmctld created the job anyway, as after a timeout on its answer
+        self.sbatch_fails_after_creating_its_job = False
+        # sbatch gets no answer within SLURM_COMMAND_TIMEOUT; its request may still be queued in slurmctld
+        self.sbatch_times_out = False
+        # every eligible node excluded: sbatch exits 1, and slurmctld leaves a FAILED record with no node
+        self.sbatch_refuses_leaving_a_failed_record = False
 
     def add_job(
         self,
@@ -61,7 +68,12 @@ class FakeSlurm:
         submitted_at=None,
         started_at="N/A",
         ended_at="N/A",
+        node=None,
     ):
+        """node (squeue %N, read only by the check after a failed sbatch) defaults to none while pending and
+        delta-slurm1 once placed."""
+        if node is None:
+            node = "" if state == "PENDING" else "delta-slurm1"
         slurm_job_id = self.next_slurm_job_id
         self.next_slurm_job_id += 1
         self.jobs[slurm_job_id] = {
@@ -72,6 +84,7 @@ class FakeSlurm:
             "submitted_at": self.now if submitted_at is None else submitted_at,
             "started_at": started_at,
             "ended_at": ended_at,
+            "node": node,
         }
         return slurm_job_id
 
@@ -87,13 +100,51 @@ class FakeSlurm:
             return subprocess.CompletedProcess(
                 argv, 1, "", f"{command}: error: Unable to contact slurm controller"
             )
+        options = dict(arg.split("=", 1) for arg in argv if "=" in arg)
+        if command == "squeue" and "--name" in options:
+            fields = {"%i": "slurm_job_id", "%T": "state", "%N": "node"}
+            lines = "".join(
+                "|".join(
+                    str({**job, "slurm_job_id": slurm_job_id}[fields[code]])
+                    for code in options["--format"].split("|")
+                )
+                + "\n"
+                for slurm_job_id, job in sorted(self.jobs.items())
+                if job["name"] == options["--name"]
+            )
+            return subprocess.CompletedProcess(argv, 0, lines, "")
         if command == "squeue":
             return subprocess.CompletedProcess(argv, 0, self.squeue_output(), "")
+        if command == "sbatch" and self.sbatch_times_out:
+            raise subprocess.TimeoutExpired(argv, timeout)
+        if command == "sbatch" and self.sbatch_refuses_leaving_a_failed_record:
+            # As job 753319 (2026-11-17): squeue lists it for MinJobAge, submit = start = end
+            self.add_job(
+                options["--job-name"],
+                state="FAILED",
+                size_label=options["--comment"],
+                started_at=self.now,
+                ended_at=self.now,
+                node="",
+            )
+            return subprocess.CompletedProcess(
+                argv,
+                1,
+                "",
+                "sbatch: error: Batch job submission failed:"
+                " Requested node configuration is not available",
+            )
         if command == "sbatch":
-            options = dict(arg.split("=", 1) for arg in argv if "=" in arg)
             slurm_job_id = self.add_job(
                 options["--job-name"], size_label=options["--comment"]
             )
+            if self.sbatch_fails_after_creating_its_job:
+                return subprocess.CompletedProcess(
+                    argv,
+                    1,
+                    "",
+                    "sbatch: error: Socket timed out on send/recv operation",
+                )
             return subprocess.CompletedProcess(
                 argv, 0, f"Submitted batch job {slurm_job_id}\n", ""
             )
@@ -395,7 +446,6 @@ class GitHubSideTest(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
     def test_deleting_an_ended_runners_registration(self):
-        ended = RunnerRegistration(12, f"{PREFIX}a", False, False)
         path = f"{REPO}/actions/runners/12"
         rows = [
             (204, True, logging.INFO, f"Deleted the registration of {PREFIX}a"),
@@ -418,7 +468,14 @@ class GitHubSideTest(unittest.TestCase):
                 self.fake.script(path, Reply(status, body={"message": "x"}))
                 with self.assertLogs("supply", level) as logs:
                     self.assertEqual(
-                        delete_registration(self.github, self.repo, ended), answered
+                        delete_registration(
+                            self.github,
+                            self.repo,
+                            12,
+                            f"{PREFIX}a",
+                            why="its Slurm job has ended",
+                        ),
+                        answered,
                     )
                 self.assertIn(logged, logs.output[-1])
         self.assertEqual(
@@ -503,6 +560,77 @@ class GitHubSideTest(unittest.TestCase):
                 with self.assertRaises(GitHubUnavailable):
                     submit_runner(self.github, self.repo, PREFIX, MEDIUM)
                 self.assertEqual(self.slurm.calls, [])
+
+    def deletes(self):
+        return [path for method, path, _ in self.fake.received if method == "DELETE"]
+
+    def test_a_refused_sbatch_deletes_the_registration_made_for_it(self):
+        self.jit_config_reply()
+        self.fake.script(f"{REPO}/actions/runners/9", Reply(204, body=None))
+        self.slurm.failing_commands.add("sbatch")
+        with self.assertLogs("supply", logging.INFO) as logs:
+            with self.assertRaises(SlurmUnavailable):
+                submit_runner(self.github, self.repo, PREFIX, MEDIUM)
+        self.assertEqual(self.deletes(), [f"{REPO}/actions/runners/9"])
+        (squeue,) = self.slurm.commands("squeue")
+        self.assertIn("--states=all", squeue)
+        self.assertTrue(any(arg.startswith(f"--name={PREFIX}") for arg in squeue))
+        self.assertIn("sbatch created no job", logs.output[-1])
+
+    def test_a_refusal_that_leaves_a_failed_record_without_a_node_still_deletes_it(
+        self,
+    ):
+        self.jit_config_reply()
+        self.fake.script(f"{REPO}/actions/runners/9", Reply(204, body=None))
+        self.slurm.sbatch_refuses_leaving_a_failed_record = True
+        with self.assertRaises(SlurmUnavailable):
+            submit_runner(self.github, self.repo, PREFIX, MEDIUM)
+        (record,) = self.slurm.jobs.values()
+        self.assertEqual((record["state"], record["node"]), ("FAILED", ""))
+        self.assertEqual(self.deletes(), [f"{REPO}/actions/runners/9"])
+
+    def test_a_failed_sbatch_whose_job_exists_or_cannot_be_checked_keeps_it(self):
+        self.jit_config_reply()
+        # slurmctld created the job although sbatch failed: its runner will need the registration
+        self.slurm.sbatch_fails_after_creating_its_job = True
+        with self.assertRaises(SlurmUnavailable):
+            submit_runner(self.github, self.repo, PREFIX, MEDIUM)
+        # A record of that name that has a node ran, or may still run
+        self.slurm.sbatch_fails_after_creating_its_job = False
+        self.slurm.failing_commands.add("sbatch")
+        for state in ("COMPLETING", "FAILED"):
+            self.slurm.jobs.clear()
+            self.slurm.add_job("x", state=state, node="delta-slurm1")
+            with mock.patch("supply.new_runner_name", return_value="x"):
+                with self.assertRaises(SlurmUnavailable):
+                    submit_runner(self.github, self.repo, PREFIX, MEDIUM)
+        # squeue cannot say whether the job exists
+        self.slurm.failing_commands.discard("sbatch")
+        self.slurm.failing_commands.update({"sbatch", "squeue"})
+        with self.assertRaises(SlurmUnavailable):
+            submit_runner(self.github, self.repo, PREFIX, MEDIUM)
+        self.assertEqual(self.deletes(), [])
+
+    def test_an_sbatch_killed_at_its_timeout_keeps_the_registration(self):
+        # Its request may still be queued in slurmctld, behind the squeue that would look for the job
+        self.jit_config_reply()
+        self.slurm.sbatch_times_out = True
+        with self.assertRaises(SlurmTimedOut):
+            submit_runner(self.github, self.repo, PREFIX, MEDIUM)
+        self.assertEqual(self.slurm.commands("squeue"), [])
+        self.assertEqual(self.deletes(), [])
+
+    def test_a_failed_delete_is_logged_and_the_sbatch_error_still_raised(self):
+        self.jit_config_reply()
+        self.fake.script(
+            f"{REPO}/actions/runners/9", Reply(500, body={"message": "Server Error"})
+        )
+        self.slurm.failing_commands.add("sbatch")
+        with self.assertLogs("supply", logging.WARNING) as logs:
+            with self.assertRaises(SlurmUnavailable) as raised:
+                submit_runner(self.github, self.repo, PREFIX, MEDIUM)
+        self.assertIn("Unable to contact slurm controller", str(raised.exception))
+        self.assertIn("Could not delete the registration", logs.output[-1])
 
     def test_a_failed_sbatch_raises_and_leaves_the_secret_out_of_the_message(self):
         self.jit_config_reply()

@@ -193,7 +193,13 @@ def run_cycle(
     for registration in registrations_to_delete(
         allocations, registrations_by_name, sightings
     ):
-        if delete_registration(github, repo.api_base_url, registration):
+        if delete_registration(
+            github,
+            repo.api_base_url,
+            registration.runner_id,
+            registration.runner_name,
+            why="its Slurm job has ended",
+        ):
             answered = sightings.deletes_answered | {registration.runner_name}
             sightings = replace(sightings, deletes_answered=answered)
 

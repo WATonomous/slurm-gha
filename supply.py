@@ -41,6 +41,10 @@ class SlurmUnavailable(Exception):
     """A Slurm command failed or timed out: what it would have reported is unknown, never empty."""
 
 
+class SlurmTimedOut(SlurmUnavailable):
+    """A Slurm command was killed at SLURM_COMMAND_TIMEOUT: whether its request took effect is unknown."""
+
+
 def read_our_allocations(runner_name_prefix: str) -> list[Allocation]:
     """squeue --me --states=all: our Slurm jobs, live and ended within MinJobAge. Raises SlurmUnavailable."""
     output = run_slurm_command(
@@ -154,8 +158,8 @@ def submit_runner(
 ) -> None:
     """POST generate-jitconfig for a new runner of size_label, then sbatch with the config in the
     environment. Raises GitHubUnavailable or SlurmUnavailable, and ValueError for a label that is not a
-    size, which demand never reports. A registration left by a failed sbatch never connects, and GitHub
-    removes it."""
+    size, which demand never reports. When sbatch fails and squeue shows no job by the runner's name, the
+    registration just created is deleted; a failed delete is only logged."""
     resources = get_runner_resources(size_label)
     if resources is None:
         raise ValueError(f"{size_label!r} is not a size label")
@@ -176,11 +180,52 @@ def submit_runner(
         raise GitHubUnavailable(
             f"generate-jitconfig for {runner_name}: no encoded_jit_config in the answer"
         )
-    sbatch_output = run_slurm_command(
-        sbatch_command(runner_name, size_label, resources),
-        {JIT_CONFIG_VARIABLE: jit_config},
-    )
+    try:
+        sbatch_output = run_slurm_command(
+            sbatch_command(runner_name, size_label, resources),
+            {JIT_CONFIG_VARIABLE: jit_config},
+        )
+    except SlurmTimedOut:
+        # The request may still be queued in slurmctld, after the squeue that would check for it
+        raise
+    except SlurmUnavailable:
+        # Otherwise the registration waits a day for a runner that will never start
+        runner_id = (jit_response.get("runner") or {}).get("id")
+        if isinstance(runner_id, int) and squeue_shows_no_job_named(runner_name):
+            delete_registration(
+                github,
+                repo_api_base_url,
+                runner_id,
+                runner_name,
+                why="sbatch created no job",
+            )
+        raise
     logger.info(f"Submitted {runner_name} for {size_label}: {sbatch_output.strip()}")
+
+
+def squeue_shows_no_job_named(job_name: str) -> bool:
+    """True only when squeue answers and lists no job of ours by that name, in any state, except records
+    that ended without a node; False when it lists one or cannot be read. sbatch can fail after slurmctld
+    created its job, whose runner needs the registration. A refused submission (every eligible node
+    excluded) leaves a record that can never run: FAILED, reason BadConstraints, no node."""
+    try:
+        output = run_slurm_command(
+            [
+                "squeue",
+                "--me",
+                "--states=all",
+                "--noheader",
+                f"--name={job_name}",
+                "--format=%T|%N",
+            ]
+        )
+    except SlurmUnavailable:
+        return False
+    for line in output.splitlines():
+        state, _, node = line.partition("|")
+        if state not in FINISHED_STATES or node.strip():
+            return False
+    return True
 
 
 def cancel_pending_allocation(allocation: Allocation) -> None:
@@ -201,31 +246,32 @@ def cancel_pending_allocation(allocation: Allocation) -> None:
 
 
 def delete_registration(
-    github: GitHubClient, repo_api_base_url: str, registration: RunnerRegistration
+    github: GitHubClient,
+    repo_api_base_url: str,
+    runner_id: int,
+    runner_name: str,
+    why: str,
 ) -> bool:
-    """DELETE the registration of a runner whose Slurm job has ended. True once GitHub has answered: deleted
-    (204), already gone (404), or refused (422: it believes a job is on that runner, and that job then
-    waits as it would without the delete). False after any other failure, logged; the next cycle tries
-    again."""
-    runner_name = registration.runner_name
+    """DELETE the registration of a runner that will take no job (why says which, for the log: its Slurm
+    job has ended, or sbatch created none). True once GitHub has answered: deleted (204), already gone
+    (404), or refused (422: it believes a job is on that runner, and that job then waits as it would
+    without the delete). False after any other failure, logged; the next cycle tries again."""
     try:
-        status = github.delete(
-            f"{repo_api_base_url}/actions/runners/{registration.runner_id}"
-        )
+        status = github.delete(f"{repo_api_base_url}/actions/runners/{runner_id}")
     except GitHubUnavailable as error:
-        logger.warning(f"Could not delete the registration of {runner_name}: {error}")
+        logger.warning(
+            f"Could not delete the registration of {runner_name} ({why}): {error}"
+        )
         return False
     if status == 422:
         logger.warning(
-            f"GitHub refused to delete the registration of {runner_name}, whose Slurm job has ended:"
+            f"GitHub refused to delete the registration of {runner_name} ({why}):"
             " it believes a job is on that runner"
         )
     elif status == 404:
-        logger.info(f"The registration of {runner_name} was already gone")
+        logger.info(f"The registration of {runner_name} was already gone ({why})")
     else:
-        logger.info(
-            f"Deleted the registration of {runner_name}, whose Slurm job has ended"
-        )
+        logger.info(f"Deleted the registration of {runner_name}: {why}")
     return True
 
 
@@ -244,7 +290,7 @@ def run_slurm_command(
             env=environment,
         )
     except subprocess.TimeoutExpired:
-        raise SlurmUnavailable(
+        raise SlurmTimedOut(
             f"{' '.join(command)}: no answer within {SLURM_COMMAND_TIMEOUT} s"
         ) from None
     except OSError as error:

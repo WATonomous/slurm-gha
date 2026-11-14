@@ -227,10 +227,21 @@ class RunCycleTest(CycleAgainstFakes):
         memory = memory_with({MEDIUM: proven})
         self.jobs(*(job(i, "queued", [MEDIUM]) for i in range(2)))
         self.slurm.failing_commands.add("sbatch")
+        # Deleting the registrations made for them fails too
+        self.fake.script(
+            f"{REPO}/actions/runners/9", Reply(500, body={"message": "Server Error"})
+        )
         with self.assertLogs(level=logging.WARNING) as logs:
             memory = self.cycle(memory)
         self.assertEqual(len(self.slurm.commands("sbatch")), 2)
-        self.assertEqual(len(logs.output), 2)
+        deletes = [path for method, path, _ in self.fake.received if method == "DELETE"]
+        self.assertEqual(deletes, [f"{REPO}/actions/runners/9"] * 2)
+        self.assertEqual(
+            sum("Could not delete the registration" in line for line in logs.output), 2
+        )
+        self.assertEqual(
+            sum("could not submit a runner" in line for line in logs.output), 2
+        )
         self.assertEqual(memory.watched_run_ids, {1})
 
     def test_the_jit_config_reaches_sbatch_only_through_the_environment(self):
