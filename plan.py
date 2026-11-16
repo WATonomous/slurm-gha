@@ -52,6 +52,10 @@ class Allocation:
     submitted_at: float  # epoch seconds; orders launch evidence
     started_at: float | None  # None while pending (squeue only estimates it then)
     ended_at: float | None  # None unless state is in FINISHED_STATES
+    # squeue %N: the node it runs or ran on, kept after it ends for MinJobAge; None while pending
+    node: str | None = None
+    # squeue %n: the node it was submitted to with --nodelist, as squeue prints it; None when not pinned
+    pinned_node: str | None = None
 
 
 @dataclass(frozen=True)

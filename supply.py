@@ -29,8 +29,9 @@ from runner_size_config import (
 
 logger = logging.getLogger(__name__)
 
-# id, name, comment (size label), state, priority, submit, start, end; none of ours contains "|"
-SQUEUE_FORMAT = "%i|%j|%k|%T|%Q|%V|%S|%e"
+# id, name, comment (size label), state, priority, submit, start, end, node, requested node; none of
+# ours contains "|"
+SQUEUE_FORMAT = "%i|%j|%k|%T|%Q|%V|%S|%e|%N|%n"
 # squeue prints times in this strftime format; epoch seconds need no time zone
 SLURM_TIME_FORMAT = "%s"
 # The batch script reads the runner's JIT config from here, so it is never in argv
@@ -65,10 +66,10 @@ def parse_squeue_line(line: str, runner_name_prefix: str) -> Allocation | None:
     fields = line.split("|")
     if len(fields) < 2 or not fields[1].startswith(runner_name_prefix):
         return None
-    if len(fields) != 8:
+    if len(fields) != 10:
         raise SlurmUnavailable(f"squeue: cannot read {line!r}")
     slurm_job_id, runner_name, size_label, state, priority = fields[:5]
-    submitted, started, ended = fields[5:]
+    submitted, started, ended, node, pinned_node = fields[5:]
     submitted_at = epoch_seconds_or_none(submitted)
     if not slurm_job_id.isdigit() or not priority.isdigit() or submitted_at is None:
         raise SlurmUnavailable(f"squeue: cannot read {line!r}")
@@ -82,6 +83,8 @@ def parse_squeue_line(line: str, runner_name_prefix: str) -> Allocation | None:
         submitted_at=submitted_at,
         started_at=None if state == "PENDING" else epoch_seconds_or_none(started),
         ended_at=epoch_seconds_or_none(ended) if state in FINISHED_STATES else None,
+        node=node or None,
+        pinned_node=pinned_node or None,
     )
 
 

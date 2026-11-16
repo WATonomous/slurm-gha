@@ -69,9 +69,9 @@ class FakeSlurm:
         started_at="N/A",
         ended_at="N/A",
         node=None,
+        pinned_node="",
     ):
-        """node (squeue %N, read only by the check after a failed sbatch) defaults to none while pending and
-        delta-slurm1 once placed."""
+        """node defaults to none while pending and delta-slurm1 once placed."""
         if node is None:
             node = "" if state == "PENDING" else "delta-slurm1"
         slurm_job_id = self.next_slurm_job_id
@@ -85,6 +85,7 @@ class FakeSlurm:
             "started_at": started_at,
             "ended_at": ended_at,
             "node": node,
+            "pinned_node": pinned_node,
         }
         return slurm_job_id
 
@@ -156,7 +157,8 @@ class FakeSlurm:
     def squeue_output(self):
         return "".join(
             f"{slurm_job_id}|{job['name']}|{job['comment']}|{job['state']}|{job['priority']}"
-            f"|{job['submitted_at']}|{job['started_at']}|{job['ended_at']}\n"
+            f"|{job['submitted_at']}|{job['started_at']}|{job['ended_at']}"
+            f"|{job['node']}|{job['pinned_node']}\n"
             for slurm_job_id, job in sorted(self.jobs.items())
         )
 
@@ -177,63 +179,59 @@ def runner(name, status="online", busy=False):
 
 class ParseSqueueLineTest(unittest.TestCase):
     def test_our_jobs_in_each_state(self):
+        def ours(state, is_held, started_at, ended_at, node=None, pinned_node=None):
+            return Allocation(
+                812345,
+                f"{PREFIX}a",
+                MEDIUM,
+                state,
+                is_held,
+                NOW,
+                started_at,
+                ended_at,
+                node,
+                pinned_node,
+            )
+
+        line = f"812345|{PREFIX}a|{MEDIUM}"
         rows = [
+            # Pending: no node yet
             (
-                f"812345|{PREFIX}a|{MEDIUM}|PENDING|4294|{NOW}|N/A|N/A",
-                Allocation(
-                    812345, f"{PREFIX}a", MEDIUM, "PENDING", False, NOW, None, None
-                ),
+                f"{line}|PENDING|4294|{NOW}|N/A|N/A||",
+                ours("PENDING", False, None, None),
             ),
             # A pending job's start time is only an estimate
             (
-                f"812345|{PREFIX}a|{MEDIUM}|PENDING|4294|{NOW}|{NOW + 60}|{NOW + 2580}",
-                Allocation(
-                    812345, f"{PREFIX}a", MEDIUM, "PENDING", False, NOW, None, None
-                ),
+                f"{line}|PENDING|4294|{NOW}|{NOW + 60}|{NOW + 2580}||",
+                ours("PENDING", False, None, None),
             ),
+            (f"{line}|PENDING|0|{NOW}|N/A|N/A||", ours("PENDING", True, None, None)),
+            # Pinned with --nodelist, still pending
             (
-                f"812345|{PREFIX}a|{MEDIUM}|PENDING|0|{NOW}|N/A|N/A",
-                Allocation(
-                    812345, f"{PREFIX}a", MEDIUM, "PENDING", True, NOW, None, None
-                ),
+                f"{line}|PENDING|4294|{NOW}|N/A|N/A||trpro-slurm1",
+                ours("PENDING", False, None, None, pinned_node="trpro-slurm1"),
             ),
             # Its end time is only the limit while it runs
             (
-                f"812345|{PREFIX}a|{MEDIUM}|RUNNING|4294|{NOW}|{NOW + 5}|{NOW + 2525}",
-                Allocation(
-                    812345, f"{PREFIX}a", MEDIUM, "RUNNING", False, NOW, NOW + 5, None
+                f"{line}|RUNNING|4294|{NOW}|{NOW + 5}|{NOW + 2525}|delta-slurm1|",
+                ours("RUNNING", False, NOW + 5, None, node="delta-slurm1"),
+            ),
+            # Ended, within MinJobAge: squeue still names its node and its pin
+            (
+                f"{line}|FAILED|0|{NOW}|{NOW + 5}|{NOW + 20}|trpro-slurm1|trpro-slurm1",
+                ours(
+                    "FAILED", False, NOW + 5, NOW + 20, "trpro-slurm1", "trpro-slurm1"
                 ),
             ),
+            # Cancelled while pending: never placed
             (
-                f"812345|{PREFIX}a|{MEDIUM}|FAILED|0|{NOW}|{NOW + 5}|{NOW + 20}",
-                Allocation(
-                    812345,
-                    f"{PREFIX}a",
-                    MEDIUM,
-                    "FAILED",
-                    False,
-                    NOW,
-                    NOW + 5,
-                    NOW + 20,
-                ),
-            ),
-            (
-                f"812345|{PREFIX}a|{MEDIUM}|CANCELLED|0|{NOW}|Unknown|{NOW + 20}",
-                Allocation(
-                    812345,
-                    f"{PREFIX}a",
-                    MEDIUM,
-                    "CANCELLED",
-                    False,
-                    NOW,
-                    None,
-                    NOW + 20,
-                ),
+                f"{line}|CANCELLED|0|{NOW}|Unknown|{NOW + 20}||",
+                ours("CANCELLED", False, None, NOW + 20),
             ),
         ]
-        for line, allocation in rows:
-            with self.subTest(line):
-                self.assertEqual(parse_squeue_line(line, PREFIX), allocation)
+        for squeue_line, allocation in rows:
+            with self.subTest(squeue_line):
+                self.assertEqual(parse_squeue_line(squeue_line, PREFIX), allocation)
 
     def test_jobs_that_are_not_ours_are_skipped(self):
         for line in (
@@ -247,10 +245,11 @@ class ParseSqueueLineTest(unittest.TestCase):
 
     def test_one_of_ours_that_cannot_be_read_makes_squeue_unknown(self):
         for line in (
-            f"812345|{PREFIX}a|{MEDIUM}|PENDING|4294|{NOW}|N/A",
-            f"812345|{PREFIX}a|{MEDIUM}|PENDING|high|{NOW}|N/A|N/A",
-            f"812345_1|{PREFIX}a|{MEDIUM}|PENDING|4294|{NOW}|N/A|N/A",
-            f"812345|{PREFIX}a|{MEDIUM}|PENDING|4294|2026-11-13T00:38:09|N/A|N/A",
+            # Without the node fields, as an older SQUEUE_FORMAT printed it
+            f"812345|{PREFIX}a|{MEDIUM}|PENDING|4294|{NOW}|N/A|N/A",
+            f"812345|{PREFIX}a|{MEDIUM}|PENDING|high|{NOW}|N/A|N/A||",
+            f"812345_1|{PREFIX}a|{MEDIUM}|PENDING|4294|{NOW}|N/A|N/A||",
+            f"812345|{PREFIX}a|{MEDIUM}|PENDING|4294|2026-11-13T00:38:09|N/A|N/A||",
         ):
             with self.subTest(line):
                 with self.assertRaises(SlurmUnavailable):
@@ -290,7 +289,7 @@ class PhaseFromSqueueAndRunnersTest(unittest.TestCase):
         def line(state, priority=4294, started=-1, submitted=-100):
             started_at = "N/A" if started is None else NOW + started
             submitted_at = NOW + submitted
-            return f"1|{PREFIX}a|{MEDIUM}|{state}|{priority}|{submitted_at}|{started_at}|N/A"
+            return f"1|{PREFIX}a|{MEDIUM}|{state}|{priority}|{submitted_at}|{started_at}|N/A||"
 
         now = NOW
         rows = [
@@ -384,10 +383,30 @@ class SlurmCommandsTest(unittest.TestCase):
                 "--me",
                 "--states=all",
                 "--noheader",
-                "--format=%i|%j|%k|%T|%Q|%V|%S|%e",
+                "--format=%i|%j|%k|%T|%Q|%V|%S|%e|%N|%n",
             ],
         )
         self.assertEqual(added_environment, {"SLURM_TIME_FORMAT": "%s"})
+
+    def test_each_allocation_carries_the_node_squeue_names(self):
+        self.slurm.add_job(f"{PREFIX}pending")
+        self.slurm.add_job(f"{PREFIX}pinned", pinned_node="trpro-slurm2")
+        self.slurm.add_job(
+            f"{PREFIX}ended",
+            "FAILED",
+            started_at=NOW - 20,
+            ended_at=NOW - 10,
+            node="trpro-slurm1",
+        )
+        by_name = {each.runner_name: each for each in read_our_allocations(PREFIX)}
+        self.assertEqual(
+            {name: (each.node, each.pinned_node) for name, each in by_name.items()},
+            {
+                f"{PREFIX}pending": (None, None),
+                f"{PREFIX}pinned": (None, "trpro-slurm2"),
+                f"{PREFIX}ended": ("trpro-slurm1", None),
+            },
+        )
 
     def test_squeue_that_fails_times_out_or_is_missing_raises(self):
         self.slurm.failing_commands.add("squeue")
