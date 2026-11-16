@@ -14,7 +14,9 @@
 #   0  a job claimed the runner, or the idle deadline did because no job came (also when the listener
 #      cannot be stopped: the container's end takes it down)
 #   1  the runner ended by itself with no claim; or Docker, apptainer or the image failed; or the deadline
-#      passed before the runner started. Slurm records FAILED, which slurm-gha counts as a failed launch.
+#      passed before the runner started; or no job held the runner and the supervisor had still not ended
+#      SUPERVISOR_EXIT_MARGIN_S after its own give-up. Slurm records FAILED, which slurm-gha counts as a
+#      failed launch.
 set -o pipefail -o errexit -o nounset
 
 readonly RUNNER_IMAGE="/cvmfs/unpacked.cern.ch/ghcr.io/watonomous/actions-runner-image:main"
@@ -23,6 +25,10 @@ readonly DOCKER_SOCKET="/tmp/run/docker.sock" # where slurm-start-dockerd.sh put
 readonly CC_PROFILE="/cvmfs/soft.computecanada.ca/config/profile/bash.sh"
 # After the idle claim, how long the listener has to stop before the supervisor exits without it
 readonly LISTENER_STOP_WAIT_S=15
+# Seconds past the supervisor's own give-up before it counts as stuck. A runner whose supervisor is stuck
+# stays online until deadline + LISTENER_STOP_WAIT_S + this, and a job it takes meanwhile must still get J:
+# keep LISTENER_STOP_WAIT_S + this below the daemon's D (SCRIPT_START_MARGIN_S) less the script's start delay
+readonly SUPERVISOR_EXIT_MARGIN_S=30
 export PATH="$PATH:/opt/slurm/bin" # slurm-start-dockerd.sh
 
 log() {
@@ -59,6 +65,9 @@ run_batch_job() {
         sleep 1
     done
 
+    if [[ -e $work_dir/runner-started ]]; then
+        watch_supervisor_and_end_job_if_stuck "$work_dir" "$deadline" "$launcher_pid"
+    fi
     local status=0
     wait "$launcher_pid" || status=$?
     if [[ ! -e $work_dir/runner-started ]]; then
@@ -66,6 +75,43 @@ run_batch_job() {
         exit 1
     fi
     exit "$status" # the supervisor's, passed on by apptainer
+}
+
+# Ends the job when the supervisor is stuck: exit 1 with no job, past its give-up plus the margin; exit 0
+# once a job's runner has ended. Never while a job holds or is setting up the runner, and never before the
+# walk from outside has once seen run.sh under the container, so a walk that cannot see in does nothing.
+watch_supervisor_and_end_job_if_stuck() {
+    local work_dir=$1 deadline=$2 launcher_pid=$3
+    local stuck_after=$((deadline + LISTENER_STOP_WAIT_S + SUPERVISOR_EXIT_MARGIN_S))
+    local walk_sees_runner=false job_claimed=false runner_ended_at=0 owner runner_pids
+    while kill -0 "$launcher_pid" 2>/dev/null; do
+        owner=""
+        read -r owner 2>/dev/null <"$work_dir/claim/owner" || true
+        if [[ $owner == job ]]; then
+            job_claimed=true
+        fi
+        runner_pids=$(descendants_named "$launcher_pid" run.sh)
+        if ! $walk_sees_runner; then
+            if [[ -n $runner_pids ]]; then
+                walk_sees_runner=true
+                log "Watching run.sh (pid ${runner_pids%%$'\n'*}) under apptainer (pid $launcher_pid)"
+            fi
+        elif $job_claimed; then
+            if [[ -n $runner_pids ]]; then
+                runner_ended_at=0
+            elif ((runner_ended_at == 0)); then
+                runner_ended_at=$(date +%s)
+            elif (($(date +%s) - runner_ended_at >= SUPERVISOR_EXIT_MARGIN_S)); then
+                log "Exit 0: a job claimed this runner and the runner ended, but the supervisor did not"
+                exit 0
+            fi
+        elif (($(date +%s) >= stuck_after)) && [[ -z $(descendants_named "$launcher_pid" Runner.Worker) ]]; then
+            log "Exit 1: no job holds the runner, and the supervisor has not ended" \
+                "$((stuck_after - deadline)) s after the idle deadline"
+            exit 1
+        fi
+        sleep 1
+    done
 }
 
 write_job_started_hook() {
@@ -225,6 +271,37 @@ listener_pids() {
             if [[ $(cat "/proc/$listener_pid/comm" 2>/dev/null) == Runner.Listener ]]; then
                 echo "$listener_pid"
             fi
+        done
+    done
+}
+
+# The live descendants of process $1 whose name is $2, from one pass over /proc (a job can run hundreds of
+# processes, and this runs every second). A zombie is not live: an ended run.sh stays one while its parent,
+# the supervisor, is too stuck to reap it.
+descendants_named() {
+    local name=$2 stat line pid state parent rest child
+    local -A children=() names=()
+    for stat in /proc/[0-9]*/stat; do
+        read -r line 2>/dev/null <"$stat" || continue
+        pid=${line%% *}
+        rest=${line##*) }  # after the name, which may hold spaces or parentheses
+        read -r state parent _ <<<"$rest"
+        if [[ $state == Z ]]; then
+            continue
+        fi
+        children[$parent]+=" $pid"
+        names[$pid]=${line#*(}
+        names[$pid]=${names[$pid]%)*}
+    done
+    local -a to_visit=("$1")
+    while ((${#to_visit[@]} > 0)); do
+        pid=${to_visit[0]}
+        to_visit=("${to_visit[@]:1}")
+        for child in ${children[$pid]:-}; do
+            if [[ ${names[$child]} == "$name" ]]; then
+                echo "$child"
+            fi
+            to_visit+=("$child")
         done
     done
 }

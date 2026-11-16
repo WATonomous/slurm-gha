@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -16,10 +17,18 @@ SCRIPT = Path(__file__).parent.parent / "allocation_scripts" / "apptainer.sh"
 IDLE_ALLOWANCE_S = 2
 # The script's LISTENER_STOP_WAIT_S, shortened
 LISTENER_STOP_WAIT_S = 2
+# The script's SUPERVISOR_EXIT_MARGIN_S, shortened; long enough that only a stuck supervisor meets it
+SUPERVISOR_EXIT_MARGIN_S = 10
 JIT_CONFIG = "secret-jit-config-value"
 
-# Ignores its options and the image; like --containall, passes on only APPTAINERENV_*, without the prefix
+# Ignores its options and the image; like --containall, passes on only APPTAINERENV_*, without the prefix.
+# The image's own programs, when a test provides some, are in container-bin, first on the PATH. With a
+# detach-container file, it runs the container's command detached (a double fork), so that nothing in it is
+# a descendant of this process, and waits for its exit status.
 APPTAINER = """#!/bin/bash
+stub_dir=$(dirname "$0")/..
+container_bin=$stub_dir/container-bin
+[[ -d $container_bin ]] && PATH="$container_bin:$PATH"
 [[ $1 == exec ]] || exit 99
 shift
 while [[ $1 == --* ]]; do
@@ -34,6 +43,11 @@ for name in $(compgen -e); do
     *) unset "$name" ;;
     esac
 done
+if [[ -e $stub_dir/detach-container ]]; then
+    ( ( "$@"; echo $? > "$stub_dir/container-status" ) & )
+    while [[ ! -s $stub_dir/container-status ]]; do sleep 0.2; done
+    exit "$(cat "$stub_dir/container-status")"
+fi
 exec "$@"
 """
 
@@ -74,6 +88,9 @@ exit 0
 #   job-cleans-tmp   the same, and a step deletes the claim 2 s in
 #   slow-setup       a job is taken after 0.3 s, but its hook runs only 1.5 s after the deadline
 #   relaunched       SIGTERM makes it exit with code 2, so run-helper.sh relaunches it, idle
+#   long-job         a job arrives after 0.3 s and runs 10 s
+#   longer-job       a job arrives after 0.3 s and runs 20 s
+#   worker-no-hook   a Runner.Worker starts after 0.3 s and lives 18 s, but no hook ever runs; then idle
 RUNNER_LISTENER = """#!/bin/bash
 runner_dir=$(dirname "$0")/..
 events="$runner_dir/events"
@@ -104,6 +121,16 @@ relaunched)
     ;;
 reject) exit 1 ;;
 job | job-cleans-tmp) sleep 0.3; run_job 3.5 ;;
+long-job) sleep 0.3; run_job 10 ;;
+longer-job) sleep 0.3; run_job 20 ;;
+worker-no-hook)
+    sleep 0.3
+    "$(dirname "$0")/Runner.Worker" &
+    sleep 18
+    kill $!
+    echo "worker ended" >> "$events"
+    while :; do sleep 0.1; done
+    ;;
 slow-setup)
     sleep 0.3
     "$(dirname "$0")/Runner.Worker" &
@@ -140,8 +167,12 @@ class BatchScriptExitTest(unittest.TestCase):
         listener_mode: str,
         idle_allowance_s: int = IDLE_ALLOWANCE_S,
         listener_stop_wait_s: int = LISTENER_STOP_WAIT_S,
+        stuck_supervisor: bool = False,
+        detach_container: bool = False,
     ) -> dict:
-        """Runs a copy of apptainer.sh as Slurm would, in the background, against the stand-ins."""
+        """Runs a copy of apptainer.sh as Slurm would, in the background, against the stand-ins. With
+        stuck_supervisor, the image's date never answers once the runner has started, as when CVMFS stops
+        answering: the supervisor stops at its next date."""
         stub_dir = Path(tempfile.mkdtemp(prefix="slurm-gha-test-"))
         self.addCleanup(shutil.rmtree, stub_dir, ignore_errors=True)
         runner_dir = stub_dir / "runner"
@@ -165,10 +196,21 @@ class BatchScriptExitTest(unittest.TestCase):
         script = with_constant(
             script, "LISTENER_STOP_WAIT_S", str(listener_stop_wait_s)
         )
+        script = with_constant(
+            script, "SUPERVISOR_EXIT_MARGIN_S", str(SUPERVISOR_EXIT_MARGIN_S)
+        )
         write_executable(stub_dir / "apptainer.sh", script)
 
         runner_name = f"gha-batch-script-test-{uuid.uuid4().hex[:12]}"
         work_dir = Path("/tmp") / runner_name
+        if detach_container:
+            (stub_dir / "detach-container").touch()
+        if stuck_supervisor:
+            write_executable(
+                stub_dir / "container-bin" / "date",
+                f"#!/bin/bash\n[[ -e {work_dir}/runner-started ]] && exec sleep 3600\n"
+                'exec /bin/date "$@"\n',
+            )
         self.addCleanup(shutil.rmtree, work_dir, ignore_errors=True)
         environment = {
             "PATH": f"{stub_dir / 'bin'}:{os.environ['PATH']}",
@@ -189,7 +231,12 @@ class BatchScriptExitTest(unittest.TestCase):
             )
         # The stand-in apptainer has no PID namespace to end what the script leaves running; the test does
         self.addCleanup(self.kill_process_group, process)
-        return {"process": process, "stub_dir": stub_dir, "runner_dir": runner_dir}
+        return {
+            "process": process,
+            "stub_dir": stub_dir,
+            "runner_dir": runner_dir,
+            "work_dir": work_dir,
+        }
 
     @staticmethod
     def kill_process_group(process: subprocess.Popen) -> None:
@@ -263,6 +310,100 @@ class BatchScriptExitTest(unittest.TestCase):
         self.assertEqual(events.count("SIGTERM"), 2, events)
         self.assertIn("Stopping a listener relaunched after the idle claim", output)
         self.assertNotIn("the listener was not stopped", output)
+
+    def finish_all(self, runs: dict, started: float) -> dict:
+        """Each run's exit status, output, events and seconds from started (time.monotonic) to its end."""
+        ended_after = {}
+        while len(ended_after) < len(runs):
+            for case, run in runs.items():
+                if case not in ended_after and run["process"].poll() is not None:
+                    ended_after[case] = time.monotonic() - started
+            self.assertLess(time.monotonic() - started, 60, "a run did not end")
+            time.sleep(0.2)
+        results = {}
+        for case, run in runs.items():
+            output = (run["stub_dir"] / "output").read_text()
+            events = (run["runner_dir"] / "events").read_text()
+            results[case] = (
+                run["process"].returncode,
+                output,
+                events,
+                ended_after[case],
+            )
+        return results
+
+    def freeze_supervisor_once_a_job_claims(self, run: dict) -> None:
+        """SIGSTOP the supervisor once the job's hook has claimed the runner. A frozen supervisor cannot
+        reap its children: the ended run.sh stays a zombie, as on the cluster (job 753309)."""
+        owner = run["work_dir"] / "claim" / "owner"
+        give_up_at = time.monotonic() + 10
+        while not (owner.exists() and owner.read_text().strip() == "job"):
+            self.assertLess(time.monotonic(), give_up_at, "no job claimed the runner")
+            time.sleep(0.1)
+        for cmdline in Path("/proc").glob("[0-9]*/cmdline"):
+            try:
+                argv = cmdline.read_bytes().split(b"\0")
+            except OSError:
+                continue
+            if b"supervise-runner" in argv and str(run["work_dir"]).encode() in argv:
+                os.kill(int(cmdline.parent.name), signal.SIGSTOP)
+                return
+        self.fail("no supervisor found")
+
+    def test_the_outer_guard_ends_a_stuck_supervisor_but_never_a_job(self):
+        # The guard may act from W + LISTENER_STOP_WAIT_S + SUPERVISOR_EXIT_MARGIN_S = 14 s
+        stuck_after = IDLE_ALLOWANCE_S + LISTENER_STOP_WAIT_S + SUPERVISOR_EXIT_MARGIN_S
+        started = time.monotonic()
+        runs = {
+            "no job": self.start("ok", "idle", stuck_supervisor=True),
+            "a job past it": self.start("ok", "long-job", stuck_supervisor=True),
+            "a worker, no claim": self.start(
+                "ok", "worker-no-hook", stuck_supervisor=True
+            ),
+            "a job, then a frozen supervisor": self.start("ok", "long-job"),
+            # The guard's walk cannot see into the container: it must do nothing
+            "a job, container out of sight": self.start(
+                "ok", "longer-job", detach_container=True
+            ),
+        }
+        self.freeze_supervisor_once_a_job_claims(
+            runs["a job, then a frozen supervisor"]
+        )
+        results = self.finish_all(runs, started)
+
+        status, output, _, ended_after = results["no job"]
+        self.assertEqual(status, 1, output)
+        self.assertIn("Exit 1: no job holds the runner", output)
+        self.assertGreaterEqual(ended_after, stuck_after - 1)
+
+        # The job holds the claim: it runs to its end, then the guard ends the stuck supervisor
+        status, output, events, _ = results["a job past it"]
+        self.assertEqual(status, 0, output)
+        self.assertIn("job finished", events)
+        self.assertIn("the runner ended, but the supervisor did not", output)
+
+        # The same with the ended run.sh left a zombie: it no longer counts as the runner
+        status, output, events, _ = results["a job, then a frozen supervisor"]
+        self.assertEqual(status, 0, output)
+        self.assertIn("job finished", events)
+        self.assertIn("the runner ended, but the supervisor did not", output)
+
+        # A walk that never saw run.sh takes neither exit: the 20 s job outlasts both of the guard's
+        # triggers (claim + margin at about 10 s, W + stop wait + margin at 14 s) and still runs to its end
+        status, output, events, ended_after = results["a job, container out of sight"]
+        self.assertEqual(status, 0, output)
+        self.assertIn("job finished", events)
+        self.assertNotIn("Watching run.sh", output)
+        self.assertNotIn("the runner ended, but the supervisor did not", output)
+        self.assertIn("Exit 0: a job claimed this runner\n", output)
+        self.assertGreaterEqual(ended_after, 20)
+        self.assertIn("Watching run.sh", results["a job past it"][1])
+
+        # A Runner.Worker under the container keeps the guard off, whatever the claim says
+        status, output, events, ended_after = results["a worker, no claim"]
+        self.assertEqual(status, 1, output)
+        self.assertIn("worker ended", events)
+        self.assertGreaterEqual(ended_after, 18)
 
     def test_docker_never_sees_the_jit_config(self):
         run = self.start("ok", "reject")
