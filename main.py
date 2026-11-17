@@ -52,7 +52,7 @@ from plan import (
     plan_submissions,
     record_refused_submission,
     registrations_to_delete,
-    runners_taking_a_job_by_size_label,
+    runners_covering_a_job_by_size_label,
     update_sightings,
 )
 from supply import (
@@ -255,7 +255,7 @@ def run_cycle(
         allocations,
         registrations_by_name,
         NO_DEMAND,
-        runners_taking_a_job={},
+        runners_covering_a_job={},
         cycle_started_at=cycle_started_at,
         seen_at=cycle_started_at,
     )
@@ -270,7 +270,7 @@ def run_cycle(
         run_read_at = clock()
         demand = demand_from_jobs(jobs_by_run)
         # Busy runners whose jobs may still say queued: those jobs count neither as waiting nor as evidence
-        runners_taking_a_job = runners_taking_a_job_by_size_label(
+        runners_covering_a_job = runners_covering_a_job_by_size_label(
             allocations, registrations_by_name, sightings, demand, run_read_at
         )
         records = file_launch_evidence(
@@ -278,7 +278,7 @@ def run_cycle(
             allocations,
             registrations_by_name,
             demand,
-            runners_taking_a_job,
+            runners_covering_a_job,
             cycle_started_at=cycle_started_at,
             seen_at=run_read_at,
         )
@@ -291,7 +291,7 @@ def run_cycle(
             registrations_by_name,
             demand,
             records,
-            runners_taking_a_job,
+            runners_covering_a_job,
             submitted_this_cycle,
             planned_at=run_read_at,
             cycle_started_at=cycle_started_at,

@@ -43,7 +43,7 @@ from plan import (
     record_refused_submission,
     registrations_to_delete,
     retry_wait_s,
-    runners_taking_a_job_by_size_label,
+    runners_covering_a_job_by_size_label,
     size_usable_somewhere,
     submission_order,
     uncovered_jobs_waiting_past_b_by_size_label,
@@ -345,7 +345,7 @@ class LaunchEvidenceTest(unittest.TestCase):
         rows = [
             (2 * B + 1, 1, Evidence.FAILED_TO_LAUNCH),
             (2 * B, 1, None),  # not yet idle for long enough
-            # No job of its size has waited over B, or a runner taking a job covers each: surplus
+            # No job of its size has waited over B, or a runner covers each: surplus
             (2 * B + 1, 0, None),
             (W, 1, None),  # its batch script has stopped it
         ]
@@ -477,23 +477,23 @@ class BusyRunnerCoversItsJobTest(unittest.TestCase):
 
     records = usable_on("thor-slurm1", MEDIUM, SMALL)
 
-    def taking(self, slurm_job_id=1, state="RUNNING", size_label=MEDIUM):
+    def covering(self, slurm_job_id=1, state="RUNNING", size_label=MEDIUM):
         """One of our runners, busy with a job that may still say queued."""
         of = allocation(slurm_job_id, state, size_label=size_label)
         return of, registration(of, is_busy=True)
 
     def plan(self, allocations, by_name, jobs, sightings, now=NOW):
-        taking = runners_taking_a_job_by_size_label(
+        covering = runners_covering_a_job_by_size_label(
             allocations, by_name, sightings, jobs, now
         )
         return unpinned_counts(
             plan_submissions(
-                allocations, by_name, jobs, self.records, taking, [], now, now
+                allocations, by_name, jobs, self.records, covering, [], now, now
             )
         )
 
     def test_inside_the_gap_nothing_extra_is_submitted(self):
-        of, reg = self.taking()
+        of, reg = self.covering()
         by_name = registrations(reg)
         sightings = update_sightings(NO_SIGHTINGS, [of], by_name, NO_DEMAND, NOW - 10)
         # Its own job, still queued and naming no runner
@@ -504,7 +504,7 @@ class BusyRunnerCoversItsJobTest(unittest.TestCase):
         )
 
     def test_past_t_it_no_longer_covers(self):
-        of, reg = self.taking()
+        of, reg = self.covering()
         by_name = registrations(reg)
         sightings = update_sightings(NO_SIGHTINGS, [of], by_name, NO_DEMAND, NOW)
         jobs = demand(waiting(1))
@@ -514,7 +514,7 @@ class BusyRunnerCoversItsJobTest(unittest.TestCase):
         )
 
     def test_a_runner_once_named_on_a_job_never_covers_again(self):
-        of, reg = self.taking()
+        of, reg = self.covering()
         by_name = registrations(reg)
         other_runs_job = demand(waiting(1))
         named_now = demand(waiting(1), [of.runner_name])
@@ -531,7 +531,7 @@ class BusyRunnerCoversItsJobTest(unittest.TestCase):
     def test_a_busy_runner_whose_slurm_job_ended_does_not_cover(self):
         for state in ("COMPLETING", "COMPLETED", "FAILED", "CANCELLED"):
             with self.subTest(state):
-                of, reg = self.taking(state=state)
+                of, reg = self.covering(state=state)
                 by_name = registrations(reg)
                 sightings = update_sightings(
                     NO_SIGHTINGS, [of], by_name, NO_DEMAND, NOW
@@ -541,7 +541,7 @@ class BusyRunnerCoversItsJobTest(unittest.TestCase):
                 )
 
     def test_after_a_restart_it_covers_from_when_it_is_first_seen(self):
-        of, reg = self.taking()
+        of, reg = self.covering()
         by_name = registrations(reg)
         jobs = demand(waiting(1))
         self.assertEqual(self.plan([of], by_name, jobs, NO_SIGHTINGS), {MEDIUM: 1})
@@ -549,7 +549,7 @@ class BusyRunnerCoversItsJobTest(unittest.TestCase):
         self.assertEqual(self.plan([of], by_name, jobs, sightings), {})
 
     def test_it_covers_only_jobs_of_its_size_and_never_below_zero(self):
-        three = [self.taking(i)[0] for i in (1, 2, 3)]
+        three = [self.covering(i)[0] for i in (1, 2, 3)]
         by_name = registrations(*(registration(each, is_busy=True) for each in three))
         sightings = update_sightings(NO_SIGHTINGS, three, by_name, NO_DEMAND, NOW)
         jobs = demand(waiting(1) + waiting(2, SMALL))
@@ -570,25 +570,25 @@ class BusyRunnerCoversItsJobTest(unittest.TestCase):
             NO_SIGHTINGS, allocations, by_name, NO_DEMAND, NOW - 10
         )
         k = demand(waiting(1, waited_s=B + 5))
-        taking = runners_taking_a_job_by_size_label(
+        covering = runners_covering_a_job_by_size_label(
             allocations, by_name, sightings, k, NOW
         )
-        self.assertEqual(taking, {MEDIUM: 1})
+        self.assertEqual(covering, {MEDIUM: 1})
         records = file_launch_evidence(
-            NO_LAUNCH_RECORDS, allocations, by_name, k, taking, NOW, NOW
+            NO_LAUNCH_RECORDS, allocations, by_name, k, covering, NOW, NOW
         )
         self.assertEqual(nodes_out(records, MEDIUM), set())
         self.assertTrue(size_usable_somewhere(records, MEDIUM))
         # A second job past B is not covered: then GitHub is passing over the idle runners
         k_and_another = demand(waiting(2, waited_s=B + 5))
         records = file_launch_evidence(
-            NO_LAUNCH_RECORDS, allocations, by_name, k_and_another, taking, NOW, NOW
+            NO_LAUNCH_RECORDS, allocations, by_name, k_and_another, covering, NOW, NOW
         )
         self.assertEqual(nodes_out(records, MEDIUM), {"thor-slurm1"})
 
     def test_sightings_keep_only_runners_squeue_still_shows(self):
-        of, reg = self.taking()
-        gone, gone_reg = self.taking(2)
+        of, reg = self.covering()
+        gone, gone_reg = self.covering(2)
         by_name = registrations(reg, gone_reg)
         jobs = demand(
             runner_names_on_jobs=[of.runner_name, gone.runner_name, "slurm-thor-1"]

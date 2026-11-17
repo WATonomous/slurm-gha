@@ -294,7 +294,7 @@ def launch_evidence(
 ) -> Evidence | None:
     """TOOK_A_JOB if busy or named on a job read this cycle. FAILED_TO_LAUNCH if it ended FAILED, NODE_FAIL
     or BOOT_FAIL, or ran and ended CANCELLED; or is RUNNING, registered and offline between B and W old; or
-    is online and idle past 2B while a job of its size has waited over B that no runner taking a job covers
+    is online and idle past 2B while a job of its size has waited over B that no runner covers
     (uncovered_jobs_waiting_past_b > 0). Otherwise None."""
     if allocation.runner_name in runner_names_on_jobs or (
         registration is not None and registration.is_busy
@@ -327,17 +327,17 @@ def launch_evidence(
 
 
 def uncovered_jobs_waiting_past_b_by_size_label(
-    demand: Demand, runners_taking_a_job: dict[str, int], now: float
+    demand: Demand, runners_covering_a_job: dict[str, int], now: float
 ) -> dict[str, int]:
     """Pure: per size label, its jobs that had waited longer than B at now, when the runners list was
-    read, less its runners taking a job; never below zero. A covered job is being taken, so an idle runner
+    read, less its runners covering a job; never below zero. A covered job is being taken, so an idle runner
     beside it says nothing."""
     waiting_past_b = {}
     for job in demand.waiting_jobs:
         if now - job.created_at > BOOT_ALLOWANCE_S:
             waiting_past_b[job.size_label] = waiting_past_b.get(job.size_label, 0) + 1
     return {
-        size_label: max(0, count - runners_taking_a_job.get(size_label, 0))
+        size_label: max(0, count - runners_covering_a_job.get(size_label, 0))
         for size_label, count in waiting_past_b.items()
     }
 
@@ -371,18 +371,18 @@ def file_launch_evidence(
     allocations: list[Allocation],
     registrations_by_name: dict[str, RunnerRegistration],
     demand: Demand,
-    runners_taking_a_job: dict[str, int],
+    runners_covering_a_job: dict[str, int],
     cycle_started_at: float,
     seen_at: float,
 ) -> LaunchRecords:
     """Pure: launch_evidence for every allocation, oldest submission first, filed under (its node, its
     size) by record_node_evidence. A failure that shows no node is filed under its size by
-    record_nodeless_failure, unless it is the FAILED record a refused submission left. A runner taking a
+    record_nodeless_failure, unless it is the FAILED record a refused submission left. A runner that took a
     job clears what is outstanding for its size if it was submitted after outstanding_since. Refused names
     older than REFUSED_NAMES_KEPT_S are dropped. What squeue and the runners list showed is judged at
     cycle_started_at, when they were read; what is recorded is stamped seen_at, when this is filed."""
     uncovered = uncovered_jobs_waiting_past_b_by_size_label(
-        demand, runners_taking_a_job, cycle_started_at
+        demand, runners_covering_a_job, cycle_started_at
     )
     by_node_and_size = dict(records.by_node_and_size)
     by_size = {
@@ -724,12 +724,12 @@ def plan_submissions(
     registrations_by_name: dict[str, RunnerRegistration],
     demand: Demand,
     records: LaunchRecords,
-    runners_taking_a_job: dict[str, int],
+    runners_covering_a_job: dict[str, int],
     submitted_this_cycle: list[Submission],
     planned_at: float,
     cycle_started_at: float,
 ) -> list[Submission]:
-    """Pure: per size label with a job waiting that no runner taking a job covers.
+    """Pure: per size label with a job waiting that no runner covers.
     - Usable somewhere: one pinned runner per node due a retry (rule 2), then the waiting jobs less the
       unpinned runners that can still take one (this cycle's submissions included), each excluding the
       nodes out for the size (rule 1).
@@ -739,10 +739,10 @@ def plan_submissions(
     back. What squeue and the runners list showed is judged at cycle_started_at, when they were read;
     which nodes are due, at planned_at."""
     waiting_jobs_by_size_label = jobs_left_waiting_by_size_label(
-        demand, runners_taking_a_job
+        demand, runners_covering_a_job
     )
     uncovered = uncovered_jobs_waiting_past_b_by_size_label(
-        demand, runners_taking_a_job, cycle_started_at
+        demand, runners_covering_a_job, cycle_started_at
     )
     unpinned_in_flight = Counter(
         submission.size_label
@@ -838,7 +838,7 @@ def update_sightings(
     return RunnerSightings(first_seen_busy_at, seen_on_a_job, deletes_answered)
 
 
-def runners_taking_a_job_by_size_label(
+def runners_covering_a_job_by_size_label(
     allocations: list[Allocation],
     registrations_by_name: dict[str, RunnerRegistration],
     sightings: RunnerSightings,
@@ -850,7 +850,7 @@ def runners_taking_a_job_by_size_label(
     less than BUSY_COVER_S ago. Past that, a busy runner no job names serves a job the daemon cannot see;
     one whose Slurm job ended died holding its offer."""
     named = sightings.seen_on_a_job | demand.runner_names_on_jobs
-    taking = {}
+    covering = {}
     for allocation in allocations:
         registration = registrations_by_name.get(allocation.runner_name)
         first_seen_busy_at = sightings.first_seen_busy_at.get(allocation.runner_name)
@@ -863,20 +863,20 @@ def runners_taking_a_job_by_size_label(
             and now - first_seen_busy_at < BUSY_COVER_S
         ):
             size_label = allocation.size_label
-            taking[size_label] = taking.get(size_label, 0) + 1
-    return taking
+            covering[size_label] = covering.get(size_label, 0) + 1
+    return covering
 
 
 def jobs_left_waiting_by_size_label(
-    demand: Demand, runners_taking_a_job: dict[str, int]
+    demand: Demand, runners_covering_a_job: dict[str, int]
 ) -> dict[str, int]:
-    """Pure: per size label with a waiting job, how many no runner taking a job of that size covers; never
+    """Pure: per size label with a waiting job, how many no runner of that size covers; never
     below zero."""
     waiting = {}
     for job in demand.waiting_jobs:
         waiting[job.size_label] = waiting.get(job.size_label, 0) + 1
     return {
-        size_label: max(0, count - runners_taking_a_job.get(size_label, 0))
+        size_label: max(0, count - runners_covering_a_job.get(size_label, 0))
         for size_label, count in waiting.items()
     }
 
