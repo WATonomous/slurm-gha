@@ -41,6 +41,7 @@ from plan import (
     NO_SIGHTINGS,
     Allocation,
     LaunchRecords,
+    RunnerRegistration,
     RunnerSightings,
     Submission,
     allocations_to_cancel,
@@ -200,7 +201,7 @@ def run_cycle(
     read, and what is recorded is stamped with clock(): a cycle that submits 150 runners lasts about 3
     minutes, nodes come due during it, and runners submitted earlier in it must count as submitted before
     what is recorded later."""
-    # Supply
+    # 1. Supply: squeue and the runners list, read now
     allocations = read_our_allocations(repo.runner_name_prefix)
     registrations_by_name = read_our_registrations(
         github, repo.api_base_url, repo.runner_name_prefix
@@ -213,27 +214,12 @@ def run_cycle(
         NO_DEMAND,
         cycle_started_at,
     )
+    # 2. Clean up what can never take a job
+    sightings = clean_up_runners(
+        github, repo, allocations, registrations_by_name, sightings, cycle_started_at
+    )
 
-    # Only pending jobs, which hold no job: the daemon never ends a started runner
-    for allocation in allocations_to_cancel(
-        allocations, registrations_by_name, cycle_started_at
-    ):
-        cancel_pending_allocation(allocation)
-    # Runners Slurm shows ended: GitHub would keep offering their sessions jobs for about 75 s
-    for registration in registrations_to_delete(
-        allocations, registrations_by_name, sightings
-    ):
-        if delete_registration(
-            github,
-            repo.api_base_url,
-            registration.runner_id,
-            registration.runner_name,
-            why="its Slurm job has ended",
-        ):
-            answered = sightings.deletes_answered | {registration.runner_name}
-            sightings = replace(sightings, deletes_answered=answered)
-
-    # Demand: the queued jobs of every watched run, whatever the run's own status says (#39)
+    # 3. Demand: which runs to read. Their queued jobs count whatever the run's own status says (#39)
     watched_run_ids = watch_new_runs(github, repo.api_base_url, memory.watched_run_ids)
     next_history_page = memory.next_history_page
     next_history_page_at = memory.next_history_page_at
@@ -247,9 +233,7 @@ def run_cycle(
         )
         next_history_page_at = cycle_started_at + HISTORY_PAGE_INTERVAL_S
 
-    # Newest run first, submitting after each: demand read so far is a lower bound, so a new wave need not
-    # wait for older runs to be read. Runners are counted, never matched to jobs (#38).
-    # Launch evidence from supply alone first, so a cycle with no run to read still weighs failures (#37).
+    # 4. Launch evidence from supply alone, so a cycle with no run to read still weighs failures (#37)
     records = file_launch_evidence(
         memory.launch_records,
         allocations,
@@ -259,8 +243,11 @@ def run_cycle(
         cycle_started_at=cycle_started_at,
         seen_at=cycle_started_at,
     )
-    # Rule 4, once per cycle and before demand is read, so a released pending runner can start meanwhile
+    # 5. Rule 4, once per cycle and before demand is read, so a released pending runner can start meanwhile
     narrow_pending_runners(repo, allocations, records, cycle_started_at)
+
+    # 6. Each run, newest first: read its jobs, weigh evidence, submit. Demand read so far is a lower bound,
+    # so a new wave need not wait for older runs to be read. Runners are counted, never matched to jobs (#38)
     jobs_by_run = {}
     submitted_this_cycle = []
     # sbatch failures this cycle that left no job and named no node Slurm does not know
@@ -303,9 +290,12 @@ def run_cycle(
             github, repo, submissions, records, clock, sbatch_left_no_job
         )
         submitted_this_cycle += submitted
+
+    # 7. Log what the node rule now believes, where it changed
     for line in launch_record_log_lines(memory.launch_records, records, clock()):
         logger.info(f"{repo.name}: {line}")
 
+    # 8. Remember what this cycle saw
     sightings = update_sightings(
         sightings,
         allocations,
@@ -319,6 +309,36 @@ def run_cycle(
     return RepositoryMemory(
         watched_run_ids, next_history_page, next_history_page_at, records, sightings
     )
+
+
+def clean_up_runners(
+    github: GitHubClient,
+    repo: Repository,
+    allocations: list[Allocation],
+    registrations_by_name: dict[str, RunnerRegistration],
+    sightings: RunnerSightings,
+    now: float,
+) -> RunnerSightings:
+    """Cancel our pending runners that can never start, and delete the registrations of runners whose
+    Slurm job has ended; sightings, with the deletes GitHub answered. Neither can touch a runner that holds
+    a job: only pending jobs are cancelled, and the daemon never ends a started runner."""
+    for allocation in allocations_to_cancel(allocations, registrations_by_name, now):
+        cancel_pending_allocation(allocation)
+    # Runners Slurm shows ended: GitHub would keep offering their sessions jobs for about 75 s
+    for registration in registrations_to_delete(
+        allocations, registrations_by_name, sightings
+    ):
+        github_answered = delete_registration(
+            github,
+            repo.api_base_url,
+            registration.runner_id,
+            registration.runner_name,
+            why="its Slurm job has ended",
+        )
+        if github_answered:
+            answered = sightings.deletes_answered | {registration.runner_name}
+            sightings = replace(sightings, deletes_answered=answered)
+    return sightings
 
 
 def narrow_pending_runners(
