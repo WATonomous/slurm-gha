@@ -364,6 +364,24 @@ class SubmitAsRunsAreReadTest(CycleAgainstFakes):
         memory = self.cycle(memory_with({MEDIUM: LabelBreaker(NOW - 3600, ())}))
         self.assertEqual(len(memory.breakers[MEDIUM].failures_since_success), 1)
 
+    def test_waiting_runners_exclusions_are_narrowed_once_per_pass_not_per_run(self):
+        self.jobs_of(2, job(20, "queued", [MEDIUM]))
+        self.jobs_of(1, job(10, "queued", [MEDIUM]))
+        first = self.slurm.add_job(f"{PREFIX}a", excluded="trpro-slurm[1-2]")
+        second = self.slurm.add_job(f"{PREFIX}b", excluded="trpro-slurm[1-2]")
+        with self.assertLogs(level=logging.INFO) as logs:
+            self.cycle(memory_with({MEDIUM: LabelBreaker(NOW - 3600, ())}))
+        # No runner is submitted with an exclusion yet, so the ones found are cleared, in one call
+        self.assertEqual(
+            self.slurm.commands("scontrol"),
+            [["scontrol", "update", f"JobId={first},{second}", "ExcNodeList="]],
+        )
+        self.assertIn(
+            f"{MEDIUM}: narrowed the exclusion of 2 pending runners from"
+            " trpro-slurm1,trpro-slurm2 to none",
+            "\n".join(logs.output),
+        )
+
     def test_an_unproven_label_still_gets_one_runner_in_the_whole_cycle(self):
         self.jobs_of(2, job(20, "queued", [MEDIUM]))
         self.jobs_of(1, job(10, "queued", [MEDIUM]))

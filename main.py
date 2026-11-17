@@ -35,11 +35,13 @@ from github_client import GitHubClient, GitHubUnavailable
 from KubernetesLogFormatter import KubernetesLogFormatter
 from plan import (
     NO_DEMAND,
+    Allocation,
     NO_SIGHTINGS,
     LabelBreaker,
     RunnerSightings,
     allocations_to_cancel,
     breaker_log_lines,
+    narrowed_exclusions,
     plan_submissions,
     registrations_to_delete,
     runners_taking_a_job_by_label,
@@ -53,6 +55,7 @@ from supply import (
     delete_registration,
     read_our_allocations,
     read_our_registrations,
+    narrow_pending_exclusions,
     submit_runner,
 )
 
@@ -224,6 +227,9 @@ def run_cycle(
         runners_taking_a_job={},
         now=now,
     )
+    # Once per pass and before demand is read, so a released runner can start meanwhile. No runner is
+    # submitted with an exclusion yet
+    narrow_waiting_runners(repo, allocations, nodes_a_new_runner_excludes={})
     jobs_by_run = {}
     runners_submitted_this_cycle = Counter()
     for run_id in sorted(watched_run_ids, reverse=True):
@@ -269,6 +275,31 @@ def run_cycle(
     return RepositoryMemory(
         watched_run_ids, next_history_page, next_history_page_at, breakers, sightings
     )
+
+
+def narrow_waiting_runners(
+    repo: Repository,
+    allocations: list[Allocation],
+    nodes_a_new_runner_excludes: dict[str, frozenset[str]],
+) -> None:
+    """narrow_pending_exclusions for each group of narrowed_exclusions, and one log line per size and
+    change."""
+    narrowed = Counter()
+    groups = narrowed_exclusions(allocations, nodes_a_new_runner_excludes)
+    for excluded_nodes, waiting in sorted(
+        groups.items(), key=lambda item: sorted(item[0])
+    ):
+        refused = narrow_pending_exclusions(waiting, excluded_nodes)
+        for allocation in waiting:
+            if allocation.slurm_job_id not in refused:
+                before = ",".join(sorted(allocation.excluded_nodes))
+                after = ",".join(sorted(excluded_nodes)) or "none"
+                narrowed[(allocation.size_label, before, after)] += 1
+    for (size_label, before, after), count in sorted(narrowed.items()):
+        logger.info(
+            f"{repo.name}: {size_label}: narrowed the exclusion of {count} pending"
+            f" runner{'' if count == 1 else 's'} from {before} to {after}"
+        )
 
 
 def submit_runners(

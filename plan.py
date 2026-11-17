@@ -56,6 +56,9 @@ class Allocation:
     node: str | None = None
     # squeue %n: the node it was submitted to with --nodelist, as squeue prints it; None when not pinned
     pinned_node: str | None = None
+    # squeue %x, ranges expanded: the nodes it may not be placed on; empty when none, None when %x did not
+    # parse (then it is left alone)
+    excluded_nodes: frozenset[str] | None = frozenset()
 
 
 @dataclass(frozen=True)
@@ -426,6 +429,33 @@ def plan_submissions(
             waiting_jobs - can_take, can_take, breakers.get(label, UNPROVEN), now
         )
     return runners_to_submit
+
+
+def narrowed_exclusions(
+    allocations: list[Allocation],
+    nodes_a_new_runner_excludes: dict[str, frozenset[str]],
+) -> dict[frozenset[str], list[Allocation]]:
+    """Pure: our unpinned runners waiting for a node whose exclusion names a node that a runner of their
+    size submitted now would be allowed on, grouped by their new exclusion (the old one less those nodes),
+    so that each group is one scontrol call. Never adds a node: a waiting runner left out of nodes that came
+    back would hold its job until they are full, and one that excluded every node would never start. A
+    size missing from the dict excludes nothing; a runner whose exclusion could not be read is left alone."""
+    groups = {}
+    for allocation in allocations:
+        if (
+            allocation.state != "PENDING"
+            or allocation.is_held
+            or allocation.pinned_node is not None
+            or allocation.excluded_nodes is None
+        ):
+            continue
+        would_exclude = nodes_a_new_runner_excludes.get(
+            allocation.size_label, frozenset()
+        )
+        kept = allocation.excluded_nodes & would_exclude
+        if kept != allocation.excluded_nodes:
+            groups.setdefault(kept, []).append(allocation)
+    return groups
 
 
 def update_sightings(

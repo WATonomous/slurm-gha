@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import uuid
 
@@ -29,13 +30,19 @@ from runner_size_config import (
 
 logger = logging.getLogger(__name__)
 
-# id, name, comment (size label), state, priority, submit, start, end, node, requested node; none of
-# ours contains "|"
-SQUEUE_FORMAT = "%i|%j|%k|%T|%Q|%V|%S|%e|%N|%n"
+# id, name, comment (size label), state, priority, submit, start, end, node, requested node, excluded
+# nodes; none of ours contains "|"
+SQUEUE_FORMAT = "%i|%j|%k|%T|%Q|%V|%S|%e|%N|%n|%x"
 # squeue prints times in this strftime format; epoch seconds need no time zone
 SLURM_TIME_FORMAT = "%s"
+# Job ids per scontrol update: about 10 ms each in slurmctld, so a call stays well inside the timeout
+SCONTROL_JOB_IDS_PER_CALL = 100
 # The batch script reads the runner's JIT config from here, so it is never in argv
 JIT_CONFIG_VARIABLE = "RUNNER_JIT_CONFIG"
+
+
+# Slurm job ids whose unreadable %x was logged: once each
+unreadable_exclusions_logged: set[int] = set()
 
 
 class SlurmUnavailable(Exception):
@@ -55,24 +62,39 @@ def read_our_allocations(runner_name_prefix: str) -> list[Allocation]:
     allocations = []
     for line in output.splitlines():
         allocation = parse_squeue_line(line, runner_name_prefix)
-        if allocation is not None:
-            allocations.append(allocation)
+        if allocation is None:
+            continue
+        allocations.append(allocation)
+        if (
+            allocation.excluded_nodes is None
+            and allocation.slurm_job_id not in unreadable_exclusions_logged
+        ):
+            unreadable_exclusions_logged.add(allocation.slurm_job_id)
+            logger.warning(
+                f"{allocation.runner_name}: cannot read its excluded nodes in {line!r};"
+                " its exclusion is left as it is"
+            )
     return allocations
 
 
 def parse_squeue_line(line: str, runner_name_prefix: str) -> Allocation | None:
     """Pure: one SQUEUE_FORMAT line; None for a job that is not ours, such as the old daemon's.
-    SlurmUnavailable for one of ours that cannot be read."""
+    SlurmUnavailable for one of ours that cannot be read, except its excluded nodes: None when %x does not
+    parse."""
     fields = line.split("|")
     if len(fields) < 2 or not fields[1].startswith(runner_name_prefix):
         return None
-    if len(fields) != 10:
+    if len(fields) != 11:
         raise SlurmUnavailable(f"squeue: cannot read {line!r}")
     slurm_job_id, runner_name, size_label, state, priority = fields[:5]
-    submitted, started, ended, node, pinned_node = fields[5:]
+    submitted, started, ended, node, pinned_node, excluded = fields[5:]
     submitted_at = epoch_seconds_or_none(submitted)
     if not slurm_job_id.isdigit() or not priority.isdigit() or submitted_at is None:
         raise SlurmUnavailable(f"squeue: cannot read {line!r}")
+    try:
+        excluded_nodes = node_names_in_hostlist(excluded)
+    except ValueError:
+        excluded_nodes = None  # left alone rather than guessed
     return Allocation(
         slurm_job_id=int(slurm_job_id),
         runner_name=runner_name,
@@ -85,7 +107,54 @@ def parse_squeue_line(line: str, runner_name_prefix: str) -> Allocation | None:
         ended_at=epoch_seconds_or_none(ended) if state in FINISHED_STATES else None,
         node=node or None,
         pinned_node=pinned_node or None,
+        excluded_nodes=excluded_nodes,
     )
+
+
+def node_names_in_hostlist(hostlist: str) -> frozenset[str]:
+    """Pure: the node names in a hostlist as squeue prints %x: sorted and compressed into ranges,
+    "tr-slurm2,trpro-slurm[1-2]" for tr-slurm2, trpro-slurm1 and trpro-slurm2. Each range keeps the width
+    of its first number ("node[08-11]", "node[1-03]"), as `scontrol show hostnames` does. Empty for "";
+    ValueError for anything it does not fully parse, where `scontrol show hostnames` exits 0 regardless."""
+    names = set()
+    item, depth = "", 0
+    for character in hostlist + ",":
+        depth += {"[": 1, "]": -1}.get(character, 0)
+        if depth not in (0, 1):
+            raise ValueError(f"unbalanced brackets in {hostlist!r}")
+        if character == "," and depth == 0:
+            names |= hostlist_item_names(item)
+            item = ""
+        else:
+            item += character
+    if depth != 0:
+        raise ValueError(f"unbalanced brackets in {hostlist!r}")
+    return frozenset(names - {""})
+
+
+def hostlist_item_names(item: str) -> set[str]:
+    """Pure: one comma-free hostlist entry with any number of bracketed ranges, e.g. "rack[1-2]-n[1,3]"."""
+    if "[" not in item:
+        if not re.fullmatch(r"[A-Za-z0-9._-]*", item):
+            raise ValueError(f"not a node name: {item!r}")
+        return {item}
+    start = item.index("[")
+    end = item.index("]", start)
+    prefix, ranges, rest = item[:start], item[start + 1 : end], item[end + 1 :]
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", prefix):
+        raise ValueError(f"not a node name: {item!r}")
+    numbers = []
+    for bounds in ranges.split(","):
+        first, _, last = bounds.partition("-")
+        last = last or first
+        if not first.isdigit() or not last.isdigit() or int(first) > int(last):
+            raise ValueError(f"cannot read the range {bounds!r} in {item!r}")
+        numbers += [str(n).zfill(len(first)) for n in range(int(first), int(last) + 1)]
+    return {
+        prefix + number + tail
+        for number in numbers
+        for tail in hostlist_item_names(rest)
+    }
 
 
 def epoch_seconds_or_none(squeue_time: str) -> float | None:
@@ -229,6 +298,38 @@ def squeue_shows_no_job_named(job_name: str) -> bool:
         if state not in FINISHED_STATES or node.strip():
             return False
     return True
+
+
+def narrow_pending_exclusions(
+    allocations: list[Allocation], excluded_nodes: frozenset[str]
+) -> set[int]:
+    """scontrol update JobId=<id>,<id>,... ExcNodeList=<nodes> for these pending runners of ours, at most
+    SCONTROL_JOB_IDS_PER_CALL ids a call: the whole new list, empty to clear it. The ids Slurm refused.
+    slurmctld updates each listed job still pending, starts it at once if it can now run, and refuses the
+    others (started, ended, gone) while still updating the rest; it then exits 1 with one "<reason> for job
+    <id>" line each, logged at debug. A call that fails otherwise is logged at warning and all its ids are
+    returned. Either way the next pass reads %x again."""
+    refused = set()
+    ids = [allocation.slurm_job_id for allocation in allocations]
+    for first in range(0, len(ids), SCONTROL_JOB_IDS_PER_CALL):
+        chunk = ids[first : first + SCONTROL_JOB_IDS_PER_CALL]
+        command = [
+            "scontrol",
+            "update",
+            f"JobId={','.join(map(str, chunk))}",
+            f"ExcNodeList={','.join(sorted(excluded_nodes))}",
+        ]
+        try:
+            run_slurm_command(command)
+        except SlurmUnavailable as error:
+            named = {int(job_id) for job_id in re.findall(r"for job (\d+)", str(error))}
+            if named:
+                logger.debug(f"Slurm left some waiting runners as they were: {error}")
+                refused |= named
+            else:
+                logger.warning(f"Could not narrow waiting runners' exclusions: {error}")
+                refused |= set(chunk)
+    return refused
 
 
 def cancel_pending_allocation(allocation: Allocation) -> None:

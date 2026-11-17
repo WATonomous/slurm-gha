@@ -18,7 +18,13 @@ from config import (
     UNUSED_REGISTRATION_LIFETIME_S,
 )
 from github_client import GitHubClient, GitHubUnavailable
-from plan import Allocation, Phase, RunnerRegistration, phase_of_allocation
+from plan import (
+    FINISHED_STATES,
+    Allocation,
+    Phase,
+    RunnerRegistration,
+    phase_of_allocation,
+)
 from runner_size_config import RunnerResources
 from supply import (
     JIT_CONFIG_VARIABLE,
@@ -31,6 +37,8 @@ from supply import (
     read_our_allocations,
     read_our_registrations,
     sbatch_command,
+    narrow_pending_exclusions,
+    node_names_in_hostlist,
     submit_runner,
 )
 from test_github_client import FakeGitHub, Reply
@@ -70,8 +78,10 @@ class FakeSlurm:
         ended_at="N/A",
         node=None,
         pinned_node="",
+        excluded="",
     ):
-        """node defaults to none while pending and delta-slurm1 once placed."""
+        """node defaults to none while pending and delta-slurm1 once placed; excluded is squeue's %x, as
+        squeue prints it."""
         if node is None:
             node = "" if state == "PENDING" else "delta-slurm1"
         slurm_job_id = self.next_slurm_job_id
@@ -86,6 +96,7 @@ class FakeSlurm:
             "ended_at": ended_at,
             "node": node,
             "pinned_node": pinned_node,
+            "excluded": excluded,
         }
         return slurm_job_id
 
@@ -149,6 +160,24 @@ class FakeSlurm:
             return subprocess.CompletedProcess(
                 argv, 0, f"Submitted batch job {slurm_job_id}\n", ""
             )
+        if command == "scontrol" and argv[1] == "update":
+            # As slurmctld 24.05.1 did on the cluster: each pending job updated, each other refused
+            refusals = []
+            for slurm_job_id in map(int, options["JobId"].split(",")):
+                job = self.jobs.get(slurm_job_id)
+                if job is None:
+                    refusals.append(f"Invalid job id specified for job {slurm_job_id}")
+                elif job["state"] in FINISHED_STATES:
+                    refusals.append(f"Job has already finished for job {slurm_job_id}")
+                elif job["state"] != "PENDING":
+                    refusals.append(
+                        f"Job is no longer pending execution for job {slurm_job_id}"
+                    )
+                else:
+                    job["excluded"] = options["ExcNodeList"]
+            return subprocess.CompletedProcess(
+                argv, 1 if refusals else 0, "", "\n".join(refusals)
+            )
         if command == "scancel":
             # Only slurmctld can test the state atomically, so the fake records the call and changes nothing
             return subprocess.CompletedProcess(argv, 0, "", "")
@@ -158,7 +187,7 @@ class FakeSlurm:
         return "".join(
             f"{slurm_job_id}|{job['name']}|{job['comment']}|{job['state']}|{job['priority']}"
             f"|{job['submitted_at']}|{job['started_at']}|{job['ended_at']}"
-            f"|{job['node']}|{job['pinned_node']}\n"
+            f"|{job['node']}|{job['pinned_node']}|{job['excluded']}\n"
             for slurm_job_id, job in sorted(self.jobs.items())
         )
 
@@ -179,7 +208,15 @@ def runner(name, status="online", busy=False):
 
 class ParseSqueueLineTest(unittest.TestCase):
     def test_our_jobs_in_each_state(self):
-        def ours(state, is_held, started_at, ended_at, node=None, pinned_node=None):
+        def ours(
+            state,
+            is_held,
+            started_at,
+            ended_at,
+            node=None,
+            pinned_node=None,
+            excluded_nodes=frozenset(),
+        ):
             return Allocation(
                 812345,
                 f"{PREFIX}a",
@@ -191,41 +228,58 @@ class ParseSqueueLineTest(unittest.TestCase):
                 ended_at,
                 node,
                 pinned_node,
+                excluded_nodes,
             )
 
         line = f"812345|{PREFIX}a|{MEDIUM}"
         rows = [
             # Pending: no node yet
             (
-                f"{line}|PENDING|4294|{NOW}|N/A|N/A||",
+                f"{line}|PENDING|4294|{NOW}|N/A|N/A|||",
                 ours("PENDING", False, None, None),
             ),
             # A pending job's start time is only an estimate
             (
-                f"{line}|PENDING|4294|{NOW}|{NOW + 60}|{NOW + 2580}||",
+                f"{line}|PENDING|4294|{NOW}|{NOW + 60}|{NOW + 2580}|||",
                 ours("PENDING", False, None, None),
             ),
-            (f"{line}|PENDING|0|{NOW}|N/A|N/A||", ours("PENDING", True, None, None)),
+            (f"{line}|PENDING|0|{NOW}|N/A|N/A|||", ours("PENDING", True, None, None)),
             # Pinned with --nodelist, still pending
             (
-                f"{line}|PENDING|4294|{NOW}|N/A|N/A||trpro-slurm1",
+                f"{line}|PENDING|4294|{NOW}|N/A|N/A||trpro-slurm1|",
                 ours("PENDING", False, None, None, pinned_node="trpro-slurm1"),
             ),
             # Its end time is only the limit while it runs
             (
-                f"{line}|RUNNING|4294|{NOW}|{NOW + 5}|{NOW + 2525}|delta-slurm1|",
+                f"{line}|RUNNING|4294|{NOW}|{NOW + 5}|{NOW + 2525}|delta-slurm1||",
                 ours("RUNNING", False, NOW + 5, None, node="delta-slurm1"),
             ),
             # Ended, within MinJobAge: squeue still names its node and its pin
             (
-                f"{line}|FAILED|0|{NOW}|{NOW + 5}|{NOW + 20}|trpro-slurm1|trpro-slurm1",
+                f"{line}|FAILED|0|{NOW}|{NOW + 5}|{NOW + 20}|trpro-slurm1|trpro-slurm1|",
                 ours(
                     "FAILED", False, NOW + 5, NOW + 20, "trpro-slurm1", "trpro-slurm1"
                 ),
             ),
+            # Excluded nodes, sorted and compressed into ranges as squeue prints them (753312)
+            (
+                f"{line}|PENDING|4294|{NOW}|N/A|N/A|||tr-slurm2,trpro-slurm[1-2]",
+                ours(
+                    "PENDING",
+                    False,
+                    None,
+                    None,
+                    excluded_nodes={"tr-slurm2", "trpro-slurm1", "trpro-slurm2"},
+                ),
+            ),
+            # Excluded nodes it cannot parse: left alone, never guessed
+            (
+                f"{line}|PENDING|4294|{NOW}|N/A|N/A|||trpro-slurm[1-",
+                ours("PENDING", False, None, None, excluded_nodes=None),
+            ),
             # Cancelled while pending: never placed
             (
-                f"{line}|CANCELLED|0|{NOW}|Unknown|{NOW + 20}||",
+                f"{line}|CANCELLED|0|{NOW}|Unknown|{NOW + 20}|||",
                 ours("CANCELLED", False, None, NOW + 20),
             ),
         ]
@@ -247,13 +301,84 @@ class ParseSqueueLineTest(unittest.TestCase):
         for line in (
             # Without the node fields, as an older SQUEUE_FORMAT printed it
             f"812345|{PREFIX}a|{MEDIUM}|PENDING|4294|{NOW}|N/A|N/A",
-            f"812345|{PREFIX}a|{MEDIUM}|PENDING|high|{NOW}|N/A|N/A||",
-            f"812345_1|{PREFIX}a|{MEDIUM}|PENDING|4294|{NOW}|N/A|N/A||",
-            f"812345|{PREFIX}a|{MEDIUM}|PENDING|4294|2026-11-13T00:38:09|N/A|N/A||",
+            # Without the excluded nodes
+            f"812345|{PREFIX}a|{MEDIUM}|PENDING|4294|{NOW}|N/A|N/A||",
+            f"812345|{PREFIX}a|{MEDIUM}|PENDING|high|{NOW}|N/A|N/A|||",
+            f"812345_1|{PREFIX}a|{MEDIUM}|PENDING|4294|{NOW}|N/A|N/A|||",
+            f"812345|{PREFIX}a|{MEDIUM}|PENDING|4294|2026-11-13T00:38:09|N/A|N/A|||",
         ):
             with self.subTest(line):
                 with self.assertRaises(SlurmUnavailable):
                     parse_squeue_line(line, PREFIX)
+
+
+class NodeNamesInHostlistTest(unittest.TestCase):
+    def test_what_scontrol_show_hostnames_gives_on_the_cluster(self):
+        # What `scontrol show hostnames <expression>` printed on wato-login1, 2026-11-17
+        all_six = {
+            "delta-slurm1",
+            "thor-slurm1",
+            "tr-slurm2",
+            "trpro-slurm1",
+            "trpro-slurm2",
+            "wato2-slurm1",
+        }
+        rows = [
+            ("", set()),
+            ("trpro-slurm1", {"trpro-slurm1"}),
+            ("trpro-slurm[1-2]", {"trpro-slurm1", "trpro-slurm2"}),
+            ("trpro-slurm[1,2]", {"trpro-slurm1", "trpro-slurm2"}),
+            ("trpro-slurm[2,1]", {"trpro-slurm1", "trpro-slurm2"}),
+            (
+                "tr-slurm2,trpro-slurm[1-2]",
+                {"tr-slurm2", "trpro-slurm1", "trpro-slurm2"},
+            ),
+            (
+                "delta-slurm1,thor-slurm1,tr-slurm2",
+                {"delta-slurm1", "thor-slurm1", "tr-slurm2"},
+            ),
+            ("trpro-slurm2,wato2-slurm1", {"trpro-slurm2", "wato2-slurm1"}),
+            (
+                "delta-slurm1,thor-slurm1,tr-slurm2,trpro-slurm[1-2],wato2-slurm1",
+                all_six,
+            ),
+            ("node[01-03]", {"node01", "node02", "node03"}),
+            ("node[08-11]", {"node08", "node09", "node10", "node11"}),
+            ("node[009-011]", {"node009", "node010", "node011"}),
+            # The padding comes from the first number of each range
+            ("node[1-03]", {"node1", "node2", "node3"}),
+            ("node[1-3,5,7-8]", {"node1", "node2", "node3", "node5", "node7", "node8"}),
+            ("node[01-02,10]", {"node01", "node02", "node10"}),
+            ("a[1-2],b[3-4],c5", {"a1", "a2", "b3", "b4", "c5"}),
+            ("node[1-2]-ib", {"node1-ib", "node2-ib"}),
+            (
+                "rack[1-2]-node[1-2]",
+                {"rack1-node1", "rack1-node2", "rack2-node1", "rack2-node2"},
+            ),
+            ("wato[2-3]-slurm1", {"wato2-slurm1", "wato3-slurm1"}),
+            ("node1,,node2", {"node1", "node2"}),
+            ("node[1-2],node2", {"node1", "node2"}),
+        ]
+        for hostlist, names in rows:
+            with self.subTest(hostlist):
+                self.assertEqual(node_names_in_hostlist(hostlist), names)
+
+    def test_anything_it_does_not_fully_parse_raises(self):
+        # The first two scontrol rejects (printing an error, exit 0); the rest are not hostlists
+        for hostlist in (
+            "node[3-1]",
+            "node[1-2",
+            "trpro-slurm[a-b]",
+            "n]1[",
+            "node[]",
+            "[1-2]",
+            "node[[1]]",
+            "node 1",
+            "(null)",
+        ):
+            with self.subTest(hostlist):
+                with self.assertRaises(ValueError):
+                    node_names_in_hostlist(hostlist)
 
 
 class ParseRegistrationTest(unittest.TestCase):
@@ -289,7 +414,7 @@ class PhaseFromSqueueAndRunnersTest(unittest.TestCase):
         def line(state, priority=4294, started=-1, submitted=-100):
             started_at = "N/A" if started is None else NOW + started
             submitted_at = NOW + submitted
-            return f"1|{PREFIX}a|{MEDIUM}|{state}|{priority}|{submitted_at}|{started_at}|N/A||"
+            return f"1|{PREFIX}a|{MEDIUM}|{state}|{priority}|{submitted_at}|{started_at}|N/A|||"
 
         now = NOW
         rows = [
@@ -383,7 +508,7 @@ class SlurmCommandsTest(unittest.TestCase):
                 "--me",
                 "--states=all",
                 "--noheader",
-                "--format=%i|%j|%k|%T|%Q|%V|%S|%e|%N|%n",
+                "--format=%i|%j|%k|%T|%Q|%V|%S|%e|%N|%n|%x",
             ],
         )
         self.assertEqual(added_environment, {"SLURM_TIME_FORMAT": "%s"})
@@ -407,6 +532,15 @@ class SlurmCommandsTest(unittest.TestCase):
                 f"{PREFIX}ended": ("trpro-slurm1", None),
             },
         )
+
+    def test_an_exclusion_it_cannot_read_is_logged_once(self):
+        self.slurm.add_job(f"{PREFIX}a", excluded="trpro-slurm[1-")
+        with self.assertLogs("supply", logging.WARNING) as logs:
+            (allocation,) = read_our_allocations(PREFIX)
+            read_our_allocations(PREFIX)
+        self.assertIsNone(allocation.excluded_nodes)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("cannot read its excluded nodes", logs.output[0])
 
     def test_squeue_that_fails_times_out_or_is_missing_raises(self):
         self.slurm.failing_commands.add("squeue")
@@ -448,6 +582,61 @@ class SlurmCommandsTest(unittest.TestCase):
             cancel_pending_allocation(allocation)
         self.assertIn(f"Could not cancel {PREFIX}a", logs.output[0])
         self.assertEqual(self.slurm.jobs[pending]["state"], "PENDING")
+
+    def test_one_update_narrows_every_waiting_runner_given_the_same_list(self):
+        first = self.slurm.add_job(
+            f"{PREFIX}a", excluded="thor-slurm1,trpro-slurm[1-2]"
+        )
+        second = self.slurm.add_job(f"{PREFIX}b", excluded="trpro-slurm[1-2]")
+        waiting = read_our_allocations(PREFIX)
+        trpro = frozenset({"trpro-slurm2", "trpro-slurm1"})
+        self.assertEqual(narrow_pending_exclusions(waiting, trpro), set())
+        self.assertEqual(narrow_pending_exclusions(waiting, frozenset()), set())
+        self.assertEqual(
+            self.slurm.commands("scontrol"),
+            [
+                [
+                    "scontrol",
+                    "update",
+                    f"JobId={first},{second}",
+                    "ExcNodeList=trpro-slurm1,trpro-slurm2",
+                ],
+                # An empty value clears it
+                ["scontrol", "update", f"JobId={first},{second}", "ExcNodeList="],
+            ],
+        )
+
+    def test_at_most_a_hundred_job_ids_a_call(self):
+        for index in range(250):
+            self.slurm.add_job(f"{PREFIX}{index}", excluded="trpro-slurm1")
+        narrow_pending_exclusions(read_our_allocations(PREFIX), frozenset())
+        updates = self.slurm.commands("scontrol")
+        self.assertEqual(
+            [len(update[2].split(",")) for update in updates], [100, 100, 50]
+        )
+
+    def test_runners_that_started_or_ended_meanwhile_are_left_alone(self):
+        for name in ("pending", "running", "ended"):
+            self.slurm.add_job(f"{PREFIX}{name}", excluded="trpro-slurm1")
+        pending, running, ended = read_our_allocations(PREFIX)
+        self.slurm.jobs[running.slurm_job_id]["state"] = "RUNNING"
+        self.slurm.jobs[ended.slurm_job_id]["state"] = "COMPLETED"
+        with self.assertLogs("supply", logging.DEBUG) as logs:
+            refused = narrow_pending_exclusions([pending, running, ended], frozenset())
+        self.assertEqual(refused, {running.slurm_job_id, ended.slurm_job_id})
+        self.assertEqual(logs.records[0].levelno, logging.DEBUG)
+        self.assertEqual(self.slurm.jobs[pending.slurm_job_id]["excluded"], "")
+        self.assertEqual(
+            self.slurm.jobs[running.slurm_job_id]["excluded"], "trpro-slurm1"
+        )
+
+    def test_an_update_that_fails_outright_narrows_none(self):
+        self.slurm.add_job(f"{PREFIX}a", excluded="trpro-slurm1")
+        waiting = read_our_allocations(PREFIX)
+        self.slurm.failing_commands.add("scontrol")
+        with self.assertLogs("supply", logging.WARNING):
+            refused = narrow_pending_exclusions(waiting, frozenset())
+        self.assertEqual(refused, {waiting[0].slurm_job_id})
 
 
 class GitHubSideTest(unittest.TestCase):

@@ -1,6 +1,7 @@
 """plan without Slurm or GitHub: every pure function by table, and the breaker through its whole life."""
 
 import unittest
+from dataclasses import replace
 
 from config import (
     BOOT_ALLOWANCE_S as B,
@@ -29,6 +30,7 @@ from plan import (
     allocations_to_cancel,
     breaker_log_lines,
     earliest_next_probe_at,
+    narrowed_exclusions,
     is_proven,
     jobs_left_waiting_by_label,
     launch_evidence,
@@ -673,6 +675,48 @@ class BusyRunnerCoversItsJobTest(unittest.TestCase):
                 frozenset({of.runner_name}),
                 frozenset({of.runner_name}),
             ),
+        )
+
+
+class NarrowedExclusionsTest(unittest.TestCase):
+    def test_only_waiting_unpinned_runners_and_never_a_node_added(self):
+        def pending(slurm_job_id, excluded, **changes):
+            return replace(
+                allocation(slurm_job_id, "PENDING"),
+                excluded_nodes=None if excluded is None else frozenset(excluded),
+                **changes,
+            )
+
+        trpro = {"trpro-slurm1", "trpro-slurm2"}
+        allowed_back = pending(1, trpro)
+        also_allowed_back = pending(2, {"trpro-slurm2"})
+        unchanged = pending(3, {"trpro-slurm1"})
+        small = pending(4, trpro, size_label=SMALL)
+        pinned = pending(5, set(), pinned_node="trpro-slurm1")
+        held = pending(6, trpro, is_held=True)
+        running = replace(allocation(7), excluded_nodes=frozenset(trpro))
+        unreadable = pending(8, None)
+        groups = narrowed_exclusions(
+            [
+                allowed_back,
+                also_allowed_back,
+                unchanged,
+                small,
+                pinned,
+                held,
+                running,
+                unreadable,
+            ],
+            # A new medium runner would exclude trpro-slurm1 and thor-slurm1; a small one nothing
+            {MEDIUM: frozenset({"trpro-slurm1", "thor-slurm1"})},
+        )
+        # Grouped by new exclusion: one scontrol call each
+        self.assertEqual(
+            groups,
+            {
+                frozenset({"trpro-slurm1"}): [allowed_back],
+                frozenset(): [also_allowed_back, small],
+            },
         )
 
 
