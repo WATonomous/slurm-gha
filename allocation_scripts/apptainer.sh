@@ -178,14 +178,18 @@ supervise_runner() {
     local runner_pid=$!
     log "Started run.sh (pid $runner_pid)"
 
-    local job_claimed=false stopped_idle=false stop_given_up_at=0 setup_logged=false signalled_pids=" "
+    local job_claimed=false stopped_idle=false stop_given_up_at=0 setup_logged=false listener_pid
+    local -A signalled=()
     while kill -0 "$runner_pid" 2>/dev/null; do
         # Remembered: a step that cleans /tmp could delete the claim, and the deadline must not take it then
         if ! $stopped_idle && [[ -d $work_dir/claim ]]; then
             job_claimed=true
         fi
         if ! $job_claimed && ! $stopped_idle && (($(date +%s) >= deadline)); then
-            if job_being_set_up "$runner_pid"; then
+            # The listener starts a Runner.Worker for a job it has taken, before the job's actions are
+            # downloaded and its hook runs. The name is undocumented: if it changed, no worker would be found,
+            # and the deadline would claim exactly as it does without this check
+            if [[ -n $(descendants_named "$runner_pid" Runner.Worker) ]]; then
                 if ! $setup_logged; then
                     setup_logged=true
                     log "A job is being set up at the idle deadline; leaving the runner to it"
@@ -206,12 +210,20 @@ supervise_runner() {
                 log "Exit 0: the listener was not stopped ${LISTENER_STOP_WAIT_S} s after the idle claim"
                 exit 0
             fi
-            # run-helper.sh relaunches a listener that exits with code 2 or for an update
-            local before=$signalled_pids
-            signalled_pids=$(stop_new_listeners "$runner_pid" "$signalled_pids")
-            if [[ $before != " " && $signalled_pids != "$before" ]]; then
-                log "Stopping a listener relaunched after the idle claim"
-            fi
+            # SIGTERM to Runner.Listener is the only signal that stops the runner: run.sh runs in the background
+            # of a non-interactive shell, so it and its children ignore SIGINT, and SIGTERM to run.sh orphans
+            # the listener. No signal makes it sign off; slurm-gha deletes the registration once Slurm shows
+            # the job ended. Each listener is signalled once: it exits within about a second, but run-helper.sh
+            # relaunches one that exits with code 2 or for an update, and that one needs its own
+            for listener_pid in $(descendants_named "$runner_pid" Runner.Listener); do
+                if [[ -z ${signalled[$listener_pid]:-} ]]; then
+                    if ((${#signalled[@]} > 0)); then
+                        log "Stopping a listener relaunched after the idle claim"
+                    fi
+                    kill -TERM "$listener_pid" 2>/dev/null || true
+                    signalled[$listener_pid]=1
+                fi
+            done
         fi
         sleep 1
     done
@@ -231,53 +243,10 @@ supervise_runner() {
     exit 1
 }
 
-# SIGTERM to Runner.Listener is the only signal that stops the runner: run.sh runs in the background of a
-# non-interactive shell, so it and its children ignore SIGINT, and SIGTERM to run.sh orphans the listener.
-# Sent once per listener: it exits within about a second, and sending it again changes nothing, but a
-# listener relaunched by run-helper.sh needs its own. No signal makes it sign off; slurm-gha deletes the
-# registration once Slurm shows the job ended.
-# Only listeners under this run.sh are signalled (run.sh -> run-helper.sh -> Runner.Listener). Prints the
-# PIDs signalled so far, given those signalled before as " pid pid ".
-stop_new_listeners() {
-    local run_sh_pid=$1 signalled=$2 listener_pid
-    for listener_pid in $(listener_pids "$run_sh_pid"); do
-        if [[ $signalled != *" $listener_pid "* ]]; then
-            kill -TERM "$listener_pid" 2>/dev/null || true
-            signalled+="$listener_pid "
-        fi
-    done
-    echo "$signalled"
-}
-
-# The listener starts a Runner.Worker for a job it has taken, before the job's actions are downloaded and
-# its hook runs. Like Runner.Listener, the name is undocumented: if it changed, no worker would ever be
-# found, and the deadline would claim exactly as it does without this check.
-job_being_set_up() {
-    local listener_pid worker_pid
-    for listener_pid in $(listener_pids "$1"); do
-        for worker_pid in $(child_pids "$listener_pid"); do
-            if [[ $(cat "/proc/$worker_pid/comm" 2>/dev/null) == Runner.Worker ]]; then
-                return 0
-            fi
-        done
-    done
-    return 1
-}
-
-listener_pids() {
-    local run_sh_pid=$1 helper_pid listener_pid
-    for helper_pid in $(child_pids "$run_sh_pid"); do
-        for listener_pid in $(child_pids "$helper_pid"); do
-            if [[ $(cat "/proc/$listener_pid/comm" 2>/dev/null) == Runner.Listener ]]; then
-                echo "$listener_pid"
-            fi
-        done
-    done
-}
-
 # The live descendants of process $1 whose name is $2, from one pass over /proc (a job can run hundreds of
-# processes, and this runs every second). A zombie is not live: an ended run.sh stays one while its parent,
-# the supervisor, is too stuck to reap it.
+# processes, and this runs every second); the runner image may not have pgrep. Used both outside the
+# container and inside it. A zombie is not live: an ended run.sh stays one while its parent, the
+# supervisor, is too stuck to reap it.
 descendants_named() {
     local name=$2 stat line pid state parent rest child
     local -A children=() names=()
@@ -303,17 +272,6 @@ descendants_named() {
             fi
             to_visit+=("$child")
         done
-    done
-}
-
-# The children of a process, read from /proc: the runner image may not have pgrep
-child_pids() {
-    local stat fields
-    for stat in /proc/[0-9]*/stat; do
-        read -r -a fields 2>/dev/null <"$stat" || continue
-        if [[ ${fields[3]} == "$1" ]]; then
-            echo "${fields[0]}"
-        fi
     done
 }
 

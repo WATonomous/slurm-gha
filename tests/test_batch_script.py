@@ -1,5 +1,6 @@
 """The batch script's exit status, which slurm-gha reads as launch evidence, against stand-ins for apptainer,
-rootless Docker and the runner. Linux only: the script finds the runner's listener through /proc."""
+rootless Docker and the runner; Linux only, since the script finds the runner's processes through /proc.
+And the bound the script's constants keep against the daemon's, everywhere."""
 
 import os
 import re
@@ -12,6 +13,8 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+
+import config
 
 SCRIPT = Path(__file__).parent.parent / "allocation_scripts" / "apptainer.sh"
 IDLE_ALLOWANCE_S = 2
@@ -157,6 +160,30 @@ def with_constant(script: str, name: str, value: str) -> str:
     if len(pattern.findall(script)) != 1:
         raise AssertionError(f"apptainer.sh has no single readonly {name}")
     return pattern.sub(f'readonly {name}="{value}"', script)
+
+
+# slurm.conf's BatchStartTimeout: the most the script's start can lag its job's start
+BATCH_START_TIMEOUT_S = 10
+
+
+class ConstantsAcrossFilesTest(unittest.TestCase):
+    """Runs everywhere: what the script's constants promise the daemon's."""
+
+    def test_a_job_taken_by_a_stuck_runner_still_gets_its_budget(self):
+        # A runner whose supervisor is stuck stays online until its deadline plus LISTENER_STOP_WAIT_S plus
+        # SUPERVISOR_EXIT_MARGIN_S. A job it takes then still gets J only while those two stay below D less
+        # the script's start delay, since its time limit is J + W + D
+        script = SCRIPT.read_text()
+
+        def script_constant(name):
+            return int(re.search(rf"^readonly {name}=(\d+)$", script, re.M)[1])
+
+        stuck_for_s = script_constant("LISTENER_STOP_WAIT_S") + script_constant(
+            "SUPERVISOR_EXIT_MARGIN_S"
+        )
+        self.assertLess(
+            stuck_for_s, config.SCRIPT_START_MARGIN_S - BATCH_START_TIMEOUT_S
+        )
 
 
 @unittest.skipUnless(sys.platform == "linux", "the script reads /proc")
