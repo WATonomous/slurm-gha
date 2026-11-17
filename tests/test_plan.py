@@ -385,7 +385,8 @@ class LaunchEvidenceTest(unittest.TestCase):
 
 
 class PlanSubmissionsTest(unittest.TestCase):
-    """The count of unpinned runners, as v8 had it, for a size usable somewhere."""
+    """The count of unpinned runners for a size usable somewhere: the waiting jobs less the runners that
+    can still take one."""
 
     def test_waiting_jobs_minus_runners_that_can_take_one(self):
         pending = allocation(1, "PENDING")
@@ -1138,7 +1139,7 @@ class RuleFiveNodelessFailuresTest(unittest.TestCase):
         )
 
     def test_the_failed_record_of_a_refused_submission_is_not_counted_again(self):
-        # As job 753319: sbatch refused it, and squeue lists it FAILED with no node for MinJobAge. sbatch
+        # As on the cluster: sbatch refused it, and squeue lists it FAILED with no node for MinJobAge. sbatch
         # ran 5 s into the cycle, so its record is newer than anything the refusal stamped
         refused = Allocation(
             1, "gha-test-1", MEDIUM, "FAILED", False, NOW + 5, NOW + 5, NOW + 5

@@ -29,8 +29,8 @@ Words, as the code uses them (for one size):
 - retry: a runner pinned to an out node after it went out, or a size's next runner after a nodeless
   failure.
 
-No I/O. The records it decides on are defined here, so that the tests and a model of the daemon can
-import this module alone; supply.py and demand.py fill them in.
+No I/O. The records it decides on are defined here, so that the tests can import this module alone;
+supply.py and demand.py fill them in.
 """
 
 from __future__ import annotations
@@ -103,7 +103,7 @@ class RunnerRegistration:
 class WaitingJob:
     """A job GitHub reported queued this cycle, for a size label we serve."""
 
-    job_id: int
+    job_id: int  # GitHub's; the tests tell waiting jobs apart by it
     size_label: str
     created_at: float  # epoch seconds, from GitHub; the job has waited since then
 
@@ -220,8 +220,9 @@ class Submission:
 
 @dataclass(frozen=True)
 class RunnerSightings:
-    """What the daemon has seen of its runners on GitHub, for those squeue still shows. A cache: a restart
-    starts empty, after which a busy runner can cover a waiting job for up to BUSY_COVER_S longer."""
+    """What the daemon has seen of its runners on GitHub, for those squeue still shows, and the
+    registrations GitHub has answered a delete for. A cache: a restart starts empty, after which a busy
+    runner can cover a waiting job for up to BUSY_COVER_S longer."""
 
     # Runner name -> when the daemon first saw it busy
     first_seen_busy_at: dict[str, float]
@@ -378,7 +379,7 @@ def runner_can_still_take_a_job(
     now: float,
 ) -> bool:
     """Pure: pending, booting or idle, and no evidence (it took a job, or GitHub left it idle while a job
-    of its size waited), judged at now, when the supply was read: v8's supply test, and what "in flight"
+    of its size waited), judged at now, when the supply was read: the supply test, and what "in flight"
     means for the node rule."""
     phase = phase_of_allocation(allocation, registration, now)
     evidence = launch_evidence(

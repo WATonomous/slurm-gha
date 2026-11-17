@@ -42,7 +42,8 @@ SCONTROL_JOB_IDS_PER_CALL = 100
 JIT_CONFIG_VARIABLE = "RUNNER_JIT_CONFIG"
 
 
-# Slurm job ids whose unreadable %x was logged: once each
+# Slurm job ids whose unreadable %x was logged, so each is logged once; only those squeue still shows are
+# kept
 unreadable_exclusions_logged: set[int] = set()
 
 
@@ -111,6 +112,9 @@ def read_our_allocations(runner_name_prefix: str) -> list[Allocation]:
                 f"{allocation.runner_name}: cannot read its excluded nodes in {line!r};"
                 " its exclusion is left as it is"
             )
+    unreadable_exclusions_logged.intersection_update(
+        allocation.slurm_job_id for allocation in allocations
+    )
     return allocations
 
 
@@ -345,7 +349,7 @@ def what_squeue_shows_after_failed_sbatch(
     """squeue --me --states=all --name=<runner_name>; None when squeue cannot be read. sbatch can fail after
     slurmctld created its job, whose runner needs the registration. A submission refused because every
     eligible node is excluded still leaves a record under the name for MinJobAge, which can never run:
-    FAILED, reason BadConstraints, no node (job 753319)."""
+    FAILED, reason BadConstraints, no node, as seen on the cluster (Slurm 24.05)."""
     try:
         output = run_slurm_command(
             [

@@ -152,7 +152,7 @@ class FakeSlurm:
         cpus = int(options["--cpus-per-task"])
         submitted_at = self.now
         if not self.nodes_allowed(cpus, excluded, pinned or ""):
-            # As job 753319: squeue lists it for MinJobAge, submit = start = end, no node
+            # As on the cluster: squeue lists it for MinJobAge, submit = start = end, no node
             self.add_job(
                 name,
                 "FAILED",
@@ -184,7 +184,7 @@ class FakeSlurm:
         )
 
     def refuse_leaving_a_failed_record(self, argv):
-        """As job 753319 (2026-11-17): squeue lists it for MinJobAge, submit = start = end, no node."""
+        """As on the cluster (Slurm 24.05): squeue lists it for MinJobAge, submit = start = end, no node."""
         options = dict(arg.split("=", 1) for arg in argv if "=" in arg)
         self.add_job(
             options["--job-name"],
@@ -504,7 +504,7 @@ class ParseSqueueLineTest(unittest.TestCase):
                     "FAILED", False, NOW + 5, NOW + 20, "trpro-slurm1", "trpro-slurm1"
                 ),
             ),
-            # Excluded nodes, sorted and compressed into ranges as squeue prints them (753312)
+            # Excluded nodes, sorted and compressed into ranges as squeue prints them on the cluster
             (
                 f"{line}|PENDING|4294|{NOW}|N/A|N/A|||tr-slurm2,trpro-slurm[1-2]",
                 ours(
@@ -804,6 +804,11 @@ class SlurmCommandsTest(unittest.TestCase):
         self.assertIsNone(allocation.excluded_nodes)
         self.assertEqual(len(logs.output), 1)
         self.assertIn("cannot read its excluded nodes", logs.output[0])
+        # Its id is kept only while squeue still shows the job
+        self.assertIn(allocation.slurm_job_id, supply.unreadable_exclusions_logged)
+        self.slurm.jobs.clear()
+        read_our_allocations(PREFIX)
+        self.assertNotIn(allocation.slurm_job_id, supply.unreadable_exclusions_logged)
 
     def test_squeue_that_fails_times_out_or_is_missing_raises(self):
         self.slurm.failing_commands.add("squeue")

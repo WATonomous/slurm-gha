@@ -5,12 +5,13 @@ ALLOCATE_RUNNER_SCRIPT_PATH = "apptainer.sh"
 
 # Timeout configurations
 NETWORK_TIMEOUT = 30  # seconds per HTTP request; GitHub gives up at 10 s on its side
-SLURM_COMMAND_TIMEOUT = 60  # seconds for Slurm commands (squeue, sbatch, scancel)
+# Seconds for Slurm commands (squeue, sbatch, scancel, scontrol, sinfo)
+SLURM_COMMAND_TIMEOUT = 60
 
 # GitHub API
 # Pinned so response shapes cannot change under a running daemon
 GITHUB_API_VERSION = "2022-11-28"
-# Today's poll interval; trades latency against requests, nothing else
+# The shortest gap between cycles; trades latency against requests, nothing else
 MIN_SECONDS_BETWEEN_CYCLES = 2
 # GitHub REST best practices: at least 1 s between mutative requests
 MIN_SECONDS_BETWEEN_WRITES = 1
@@ -54,9 +55,11 @@ MAX_RETRY_WAIT_S = 10 * 60
 # cycle submits nothing more: the first may be a blip, since the squeue that classified it answered; the
 # second means slurmctld is not answering. A refusal that leaves no record costs at most this many a cycle
 NO_JOB_SBATCH_FAILURES_TO_STOP_A_CYCLE = 2
+# The cluster's MinJobAge: how long squeue still lists an ended job
+SLURM_MIN_JOB_AGE_S = 5 * 60
 # How long the name of a refused submission is kept: twice MinJobAge, so the FAILED record Slurm leaves for
 # it in squeue is gone first and is never counted as a failed launch
-REFUSED_NAMES_KEPT_S = 2 * 5 * 60
+REFUSED_NAMES_KEPT_S = 2 * SLURM_MIN_JOB_AGE_S
 # A pending runner's JIT registration can only vanish through GitHub removing a runner that has not
 # connected for more than a day (GitHub docs, removing runners); missing for less, the list has not caught up
 UNUSED_REGISTRATION_LIFETIME_S = 24 * 60 * 60

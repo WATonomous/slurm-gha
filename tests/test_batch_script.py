@@ -334,7 +334,7 @@ class BatchScriptExitTest(unittest.TestCase):
 
     def freeze_supervisor_once_a_job_claims(self, run: dict) -> None:
         """SIGSTOP the supervisor once the job's hook has claimed the runner. A frozen supervisor cannot
-        reap its children: the ended run.sh stays a zombie, as on the cluster (job 753309)."""
+        reap its children: the ended run.sh stays a zombie, as on the cluster."""
         owner = run["work_dir"] / "claim" / "owner"
         give_up_at = time.monotonic() + 10
         while not (owner.exists() and owner.read_text().strip() == "job"):
