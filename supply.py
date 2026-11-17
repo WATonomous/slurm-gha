@@ -36,6 +36,9 @@ logger = logging.getLogger(__name__)
 SQUEUE_FORMAT = "%i|%j|%k|%T|%Q|%V|%S|%e|%N|%n|%x"
 # squeue prints times in this strftime format; epoch seconds need no time zone
 SLURM_TIME_FORMAT = "%s"
+# One hostlist item: a node name, or a prefix and one bracket of numbers and ranges ("trpro-slurm[1-2,4]")
+HOSTLIST_ITEM = r"[A-Za-z0-9._-]+(?:\[[0-9,-]+\])?"
+HOSTLIST_ITEM_PARTS = r"([A-Za-z0-9._-]+)(?:\[([0-9,-]+)\])?"
 # Job ids per scontrol update: about 10 ms each in slurmctld, so a call stays well inside the timeout
 SCONTROL_JOB_IDS_PER_CALL = 100
 # The batch script reads the runner's JIT config from here, so it is never in argv
@@ -153,49 +156,28 @@ def parse_squeue_line(line: str, runner_name_prefix: str) -> Allocation | None:
 
 
 def node_names_in_hostlist(hostlist: str) -> frozenset[str]:
-    """Pure: the node names in a hostlist as squeue prints %x: sorted and compressed into ranges,
-    "tr-slurm2,trpro-slurm[1-2]" for tr-slurm2, trpro-slurm1 and trpro-slurm2. Each range keeps the width
-    of its first number ("node[08-11]", "node[1-03]"), as `scontrol show hostnames` does. Empty for "";
-    ValueError for anything it does not fully parse, where `scontrol show hostnames` exits 0 regardless."""
+    """Pure: the node names in a hostlist as squeue prints %x for our nodes: sorted, names that share a
+    prefix compressed into one bracket on their trailing number, "tr-slurm2,trpro-slurm[1-2]" for
+    tr-slurm2, trpro-slurm1 and trpro-slurm2. A range keeps the width of its first number ("node[08-11]",
+    "node[1-03]"), as `scontrol show hostnames` does. Empty for "". ValueError for anything else, such as
+    a second bracket or text after one: valid Slurm, but not what squeue prints for our node names."""
+    if not hostlist:
+        return frozenset()
+    if not re.fullmatch(rf"{HOSTLIST_ITEM}(?:,{HOSTLIST_ITEM})*", hostlist):
+        raise ValueError(f"not a hostlist squeue prints for our nodes: {hostlist!r}")
     names = set()
-    item, depth = "", 0
-    for character in hostlist + ",":
-        depth += {"[": 1, "]": -1}.get(character, 0)
-        if depth not in (0, 1):
-            raise ValueError(f"unbalanced brackets in {hostlist!r}")
-        if character == "," and depth == 0:
-            names |= hostlist_item_names(item)
-            item = ""
-        else:
-            item += character
-    if depth != 0:
-        raise ValueError(f"unbalanced brackets in {hostlist!r}")
-    return frozenset(names - {""})
-
-
-def hostlist_item_names(item: str) -> set[str]:
-    """Pure: one comma-free hostlist entry with any number of bracketed ranges, e.g. "rack[1-2]-n[1,3]"."""
-    if "[" not in item:
-        if not re.fullmatch(r"[A-Za-z0-9._-]*", item):
-            raise ValueError(f"not a node name: {item!r}")
-        return {item}
-    start = item.index("[")
-    end = item.index("]", start)
-    prefix, ranges, rest = item[:start], item[start + 1 : end], item[end + 1 :]
-    if not re.fullmatch(r"[A-Za-z0-9._-]+", prefix):
-        raise ValueError(f"not a node name: {item!r}")
-    numbers = []
-    for bounds in ranges.split(","):
-        first, _, last = bounds.partition("-")
-        last = last or first
-        if not first.isdigit() or not last.isdigit() or int(first) > int(last):
-            raise ValueError(f"cannot read the range {bounds!r} in {item!r}")
-        numbers += [str(n).zfill(len(first)) for n in range(int(first), int(last) + 1)]
-    return {
-        prefix + number + tail
-        for number in numbers
-        for tail in hostlist_item_names(rest)
-    }
+    for prefix, ranges in re.findall(HOSTLIST_ITEM_PARTS, hostlist):
+        if not ranges:
+            names.add(prefix)
+            continue
+        for bounds in ranges.split(","):
+            first, _, last = bounds.partition("-")
+            last = last or first
+            if not first.isdigit() or not last.isdigit() or int(first) > int(last):
+                raise ValueError(f"cannot read the range {bounds!r} in {hostlist!r}")
+            for number in range(int(first), int(last) + 1):
+                names.add(prefix + str(number).zfill(len(first)))
+    return frozenset(names)
 
 
 def epoch_seconds_or_none(squeue_time: str) -> float | None:

@@ -593,13 +593,6 @@ class NodeNamesInHostlistTest(unittest.TestCase):
             ("node[1-3,5,7-8]", {"node1", "node2", "node3", "node5", "node7", "node8"}),
             ("node[01-02,10]", {"node01", "node02", "node10"}),
             ("a[1-2],b[3-4],c5", {"a1", "a2", "b3", "b4", "c5"}),
-            ("node[1-2]-ib", {"node1-ib", "node2-ib"}),
-            (
-                "rack[1-2]-node[1-2]",
-                {"rack1-node1", "rack1-node2", "rack2-node1", "rack2-node2"},
-            ),
-            ("wato[2-3]-slurm1", {"wato2-slurm1", "wato3-slurm1"}),
-            ("node1,,node2", {"node1", "node2"}),
             ("node[1-2],node2", {"node1", "node2"}),
         ]
         for hostlist, names in rows:
@@ -607,10 +600,17 @@ class NodeNamesInHostlistTest(unittest.TestCase):
                 self.assertEqual(node_names_in_hostlist(hostlist), names)
 
     def test_anything_it_does_not_fully_parse_raises(self):
-        # The first two scontrol rejects (printing an error, exit 0); the rest are not hostlists
+        # The first two scontrol rejects (printing an error, exit 0). The next four it accepts, but squeue
+        # does not print them for our node names: text after a bracket, two brackets, an empty item. The
+        # rest are not hostlists
         for hostlist in (
             "node[3-1]",
             "node[1-2",
+            "node[1-2]-ib",
+            "rack[1-2]-node[1-2]",
+            "wato[2-3]-slurm1",
+            "node1,,node2",
+            "node1,",
             "trpro-slurm[a-b]",
             "n]1[",
             "node[]",
