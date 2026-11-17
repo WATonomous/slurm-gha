@@ -282,9 +282,12 @@ def run_cycle(
             cycle_started_at=cycle_started_at,
             seen_at=run_read_at,
         )
-        if sbatch_left_no_job >= NO_JOB_SBATCH_FAILURES_TO_STOP_A_CYCLE:
-            # Slurm is not answering. The rest of the runs are still read: their jobs give evidence, and
-            # finished runs stop being watched
+        slurm_not_answering = (
+            sbatch_left_no_job >= NO_JOB_SBATCH_FAILURES_TO_STOP_A_CYCLE
+        )
+        if slurm_not_answering:
+            # Nothing more is submitted, but the rest of the runs are still read: their jobs still give
+            # evidence, and stop_watching_finished_runs needs them
             continue
         submissions = plan_submissions(
             allocations,
@@ -388,12 +391,12 @@ def submit_runners(
                 if sbatch_left_no_job < NO_JOB_SBATCH_FAILURES_TO_STOP_A_CYCLE:
                     logger.warning(
                         f"{repo.name}: {size_label}: sbatch failed and squeue shows no"
-                        f" {left.runner_name} ({left.message}); not counted"
+                        f" {left.runner_name} ({left}); not counted"
                     )
                     continue
                 logger.warning(
                     f"{repo.name}: {size_label}: sbatch failed and squeue shows no"
-                    f" {left.runner_name} ({left.message}); not counted, and Slurm is"
+                    f" {left.runner_name} ({left}); not counted, and Slurm is"
                     f" taken as not answering: no more submissions this cycle"
                 )
                 return submitted, records, sbatch_left_no_job
@@ -405,9 +408,12 @@ def submit_runners(
             )
             continue
         except SlurmTimedOut as error:
+            # Its job may exist: in flight
             logger.warning(
                 f"{repo.name}: a runner for {size_label} may have been submitted: {error}"
             )
+            submitted.append(submission)
+            continue
         except (GitHubUnavailable, SlurmUnavailable) as error:
             logger.warning(
                 f"{repo.name}: could not submit a runner for {size_label}: {error}"
@@ -444,7 +450,7 @@ def refusal_log_line(
 ) -> str:
     """Pure: e.g. "slurm-runner-medium: Slurm refused gha-runner-1a2b3c (<sbatch's message>), excluding
     trpro-slurm1; next runner in 40 s at the earliest"."""
-    line = f"{submission.size_label}: Slurm refused {refused.runner_name} ({refused.message})"
+    line = f"{submission.size_label}: Slurm refused {refused.runner_name} ({refused})"
     if submission.pinned_node is not None:
         return f"{line}, pinned to {submission.pinned_node}; forgot {submission.pinned_node}"
     if submission.excluded_nodes:

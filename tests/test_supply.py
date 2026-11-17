@@ -1073,7 +1073,7 @@ class GitHubSideTest(unittest.TestCase):
         self.slurm.sbatch_refuses_leaving_a_failed_record = True
         with self.assertRaises(SubmissionRefused) as raised:
             submit_runner(self.github, self.repo, PREFIX, ANYWHERE)
-        self.assertIn("node configuration is not available", raised.exception.message)
+        self.assertIn("node configuration is not available", str(raised.exception))
         (record,) = self.slurm.jobs.values()
         self.assertEqual((record["state"], record["node"]), ("FAILED", ""))
         self.assertEqual(self.deletes(), [f"{REPO}/actions/runners/9"])
@@ -1082,8 +1082,10 @@ class GitHubSideTest(unittest.TestCase):
         self.jit_config_reply()
         # slurmctld created the job although sbatch failed: its runner will need the registration
         self.slurm.sbatch_fails_after_creating_its_job = True
-        name = submit_runner(self.github, self.repo, PREFIX, ANYWHERE)
-        self.assertEqual([job["name"] for job in self.slurm.jobs.values()], [name])
+        with self.assertLogs("supply", logging.INFO) as logs:
+            submit_runner(self.github, self.repo, PREFIX, ANYWHERE)
+        (job,) = self.slurm.jobs.values()
+        self.assertIn(f"Submitted {job['name']} for {MEDIUM} although", logs.output[-1])
         # A record of that name that has a node ran, or may still run
         self.slurm.sbatch_fails_after_creating_its_job = False
         self.slurm.failing_commands.add("sbatch")
@@ -1091,9 +1093,7 @@ class GitHubSideTest(unittest.TestCase):
             self.slurm.jobs.clear()
             self.slurm.add_job("x", state=state, node="delta-slurm1")
             with mock.patch("supply.new_runner_name", return_value="x"):
-                self.assertEqual(
-                    submit_runner(self.github, self.repo, PREFIX, ANYWHERE), "x"
-                )
+                submit_runner(self.github, self.repo, PREFIX, ANYWHERE)
         self.assertEqual(self.deletes(), [])
 
     def test_a_failed_sbatch_that_squeue_cannot_check_keeps_the_registration(self):
@@ -1120,7 +1120,7 @@ class GitHubSideTest(unittest.TestCase):
         )
         self.slurm.failing_commands.add("sbatch")
         with self.assertLogs("supply", logging.WARNING) as logs:
-            with self.assertRaises(SlurmUnavailable) as raised:
+            with self.assertRaises(SbatchLeftNoJob) as raised:
                 submit_runner(self.github, self.repo, PREFIX, ANYWHERE)
         self.assertIn("Unable to contact slurm controller", str(raised.exception))
         self.assertIn("Could not delete the registration", logs.output[-1])
@@ -1128,7 +1128,7 @@ class GitHubSideTest(unittest.TestCase):
     def test_a_failed_sbatch_raises_and_leaves_the_secret_out_of_the_message(self):
         self.jit_config_reply()
         self.slurm.failing_commands.add("sbatch")
-        with self.assertRaises(SlurmUnavailable) as raised:
+        with self.assertRaises(SbatchLeftNoJob) as raised:
             submit_runner(self.github, self.repo, PREFIX, ANYWHERE)
         self.assertNotIn(JIT_CONFIG, str(raised.exception))
         self.assertIn("Unable to contact slurm controller", str(raised.exception))

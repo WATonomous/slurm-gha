@@ -59,25 +59,25 @@ class SlurmTimedOut(SlurmUnavailable):
     """A Slurm command was killed at SLURM_COMMAND_TIMEOUT: whether its request took effect is unknown."""
 
 
-class SubmissionRefused(SlurmUnavailable):
-    """sbatch failed and squeue shows only the FAILED record, with no node, that Slurm leaves for a
-    submission it refused for its constraints; the registration made for it has been deleted."""
+class SubmissionRefused(Exception):
+    """An answer, not an unknown: sbatch failed and squeue shows only the FAILED record, with no node, that
+    Slurm leaves for a submission it refused for its constraints; the registration made for it has been
+    deleted. str() is sbatch's stderr."""
 
-    def __init__(self, runner_name: str, message: str):
-        super().__init__(message)
+    def __init__(self, runner_name: str, stderr: str):
+        super().__init__(stderr)
         self.runner_name = runner_name
-        self.message = message  # sbatch's stderr, for the log
 
 
-class SbatchLeftNoJob(SlurmUnavailable):
-    """sbatch failed and squeue shows nothing by the runner's name; the registration made for it has been
-    deleted. Not a refusal: slurmctld may not have answered, or a node the submission named may be unknown
-    to it, which only nodes_slurm_knows can tell."""
+class SbatchLeftNoJob(Exception):
+    """An answer, not an unknown: sbatch failed and squeue shows nothing by the runner's name; the
+    registration made for it has been deleted. Not a refusal: slurmctld may not have answered, or a node
+    the submission named may be unknown to it, which only nodes_slurm_knows can tell. str() is sbatch's
+    stderr."""
 
-    def __init__(self, runner_name: str, message: str):
-        super().__init__(message)
+    def __init__(self, runner_name: str, stderr: str):
+        super().__init__(stderr)
         self.runner_name = runner_name
-        self.message = message  # sbatch's stderr, for the log
 
 
 class AfterFailedSbatch(Enum):
@@ -271,14 +271,14 @@ def submit_runner(
     repo_api_base_url: str,
     runner_name_prefix: str,
     submission: Submission,
-) -> str:
+) -> None:
     """POST generate-jitconfig for a new runner of the submission's size, then sbatch with the config in the
-    environment; the runner's name. Raises GitHubUnavailable or SlurmUnavailable, and ValueError for a label
-    that is not a size, which demand never reports. When sbatch exits non-zero, squeue decides: a live job
-    is a submitted runner after all; otherwise the registration is deleted (a failed delete is only
-    logged) and SubmissionRefused raised for a FAILED record with no node, SbatchLeftNoJob for nothing. If
-    squeue cannot be read, or sbatch timed out and its request may still be queued in slurmctld, the
-    registration is left and SlurmUnavailable raised."""
+    environment. Raises GitHubUnavailable or SlurmUnavailable, and ValueError for a label that is not a
+    size, which demand never reports. When sbatch exits non-zero, squeue decides: a live job is a submitted
+    runner after all; otherwise the registration is deleted (a failed delete is only logged) and
+    SubmissionRefused raised for a FAILED record with no node, SbatchLeftNoJob for nothing. If squeue
+    cannot be read, or sbatch timed out (SlurmTimedOut) and its request may still be queued in slurmctld,
+    the registration is left and SlurmUnavailable raised."""
     size_label = submission.size_label
     resources = get_runner_resources(size_label)
     if resources is None:
@@ -314,7 +314,7 @@ def submit_runner(
             raise
         if after is AfterFailedSbatch.LIVE_JOB:
             logger.info(f"Submitted {runner_name} for {size_label} although {error}")
-            return runner_name
+            return
         # Otherwise the registration waits a day for a runner that will never start
         runner_id = (jit_response.get("runner") or {}).get("id")
         if isinstance(runner_id, int):
@@ -337,7 +337,6 @@ def submit_runner(
     logger.info(
         f"Submitted {runner_name} for {size_label}{placement}: {sbatch_output.strip()}"
     )
-    return runner_name
 
 
 def what_squeue_shows_after_failed_sbatch(
