@@ -45,14 +45,18 @@ SLURM_PARTITION_MAX_TIME_MINUTES = 24 * 60
 # recorded boots took under 63 s and 31 of 4,704 over 2 min; it trades a duplicate runner against a job
 # waiting on a boot that may never finish. Must stay below W, or such a boot would go unnoticed
 BOOT_ALLOWANCE_S = 2 * 60
-# Failures in a row a proven size label tolerates before it gets one runner at a time: one slow or broken
-# node should not hold back a whole wave
-TOLERATED_FAILURES_IN_A_ROW = 1
-# The first wait for an unproven label's one runner, once a proven label has failed past its tolerance;
-# it doubles per further failure
-FIRST_PROBE_WAIT_S = 60
-# Cap on that wait: a size label that cannot launch at all costs about 6 allocations an hour
-MAX_PROBE_WAIT_S = 10 * 60
+# After a size failed to launch on a node, the wait before a runner pinned to it tries again; also before a
+# size's next runner after a failure with no node. It doubles per further failure
+FIRST_RETRY_WAIT_S = 60
+# Cap on that wait: a size that launches nowhere costs at most one runner per node every 10 minutes
+MAX_RETRY_WAIT_S = 10 * 60
+# sbatch failures in one cycle that leave nothing in squeue and name no node Slurm does not know, before the
+# cycle submits nothing more: the first may be a blip, since the squeue that classified it answered; the
+# second means slurmctld is not answering. A refusal that leaves no record costs at most this many a cycle
+NO_JOB_SBATCH_FAILURES_TO_STOP_A_CYCLE = 2
+# How long the name of a refused submission is kept: twice MinJobAge, so the FAILED record Slurm leaves for
+# it in squeue is gone first and is never counted as a failed launch
+REFUSED_NAMES_KEPT_S = 2 * 5 * 60
 # A pending runner's JIT registration can only vanish through GitHub removing a runner that has not
 # connected for more than a day (GitHub docs, removing runners); missing for less, the list has not caught up
 UNUSED_REGISTRATION_LIFETIME_S = 24 * 60 * 60

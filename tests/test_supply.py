@@ -3,6 +3,7 @@ and the JIT config against the fake GitHub."""
 
 import json
 import logging
+import re
 import subprocess
 import unittest
 from unittest import mock
@@ -23,13 +24,16 @@ from plan import (
     Allocation,
     Phase,
     RunnerRegistration,
+    Submission,
     phase_of_allocation,
 )
 from runner_size_config import RunnerResources
 from supply import (
     JIT_CONFIG_VARIABLE,
     SlurmTimedOut,
+    SbatchLeftNoJob,
     SlurmUnavailable,
+    SubmissionRefused,
     cancel_pending_allocation,
     delete_registration,
     parse_registration,
@@ -39,6 +43,7 @@ from supply import (
     sbatch_command,
     narrow_pending_exclusions,
     node_names_in_hostlist,
+    nodes_slurm_knows,
     submit_runner,
 )
 from test_github_client import FakeGitHub, Reply
@@ -47,15 +52,43 @@ NOW = 1_800_000_000
 PREFIX = "gha-test-"
 REPO = "/repos/WATonomous/infra-config"
 MEDIUM = "slurm-runner-medium"
+# A medium runner that Slurm may put on any node
+ANYWHERE = Submission(MEDIUM, frozenset())
 # Stands in for a real, secret config
 JIT_CONFIG = "eyJzZWNyZXQiOiAianVzdC1pbi10aW1lIn0="
 
 
-class FakeSlurm:
-    """squeue, sbatch and scancel as supply calls them through subprocess.run, over a dict of jobs."""
+# The compute nodes sinfo lists when a test gives FakeSlurm none
+CLUSTER_NODES = (
+    "delta-slurm1",
+    "thor-slurm1",
+    "tr-slurm2",
+    "trpro-slurm1",
+    "trpro-slurm2",
+    "wato2-slurm1",
+)
 
-    def __init__(self, now=NOW):
+
+class FakeSlurm:
+    """squeue, sbatch, scontrol update and scancel as supply calls them through subprocess.run, over a dict
+    of jobs. With nodes set, sbatch places jobs as slurmctld does on our cluster: names checked first, a
+    request no allowed node can ever hold refused with a FAILED record, then first fit in node order."""
+
+    def __init__(self, now=NOW, nodes=None):
         self.now = now
+        # Node name -> CPUs, in slurmctld's order; None: sbatch only queues the job, unplaced
+        self.nodes = nodes
+        # Take no new job; a job pinned to one is accepted and pends
+        self.drained = set()
+        # Seconds each sbatch moves now on before it is submitted, as the daemon spaces its JIT POSTs; now
+        # is also the clock the daemon stamps refusals and evidence with during a cycle
+        self.submit_spacing_s = 0
+        # The sbatch calls, counted from 1, that get no answer from slurmctld and leave no job
+        self.sbatch_unreachable_calls = set()
+        # sbatch calls after this many are refused with a FAILED record; None: never
+        self.sbatch_refused_after = None
+        # sinfo exits 0 and prints nothing
+        self.sinfo_lists_nothing = False
         self.jobs = {}  # Slurm job id -> squeue fields after the id
         self.next_slurm_job_id = 812000
         self.calls = []  # (argv, the environment added to the daemon's)
@@ -79,9 +112,12 @@ class FakeSlurm:
         node=None,
         pinned_node="",
         excluded="",
+        cpus=1,
+        excluded_as_printed=None,
     ):
-        """node defaults to none while pending and delta-slurm1 once placed; excluded is squeue's %x, as
-        squeue prints it."""
+        """node defaults to none while pending and delta-slurm1 once placed. excluded is a comma-separated
+        list of node names, which squeue prints sorted and compressed (%x); excluded_as_printed replaces
+        what squeue prints."""
         if node is None:
             node = "" if state == "PENDING" else "delta-slurm1"
         slurm_job_id = self.next_slurm_job_id
@@ -96,9 +132,108 @@ class FakeSlurm:
             "ended_at": ended_at,
             "node": node,
             "pinned_node": pinned_node,
-            "excluded": excluded,
+            "excluded": frozenset(filter(None, excluded.split(","))),
+            "excluded_as_printed": excluded_as_printed,
+            "cpus": cpus,
         }
         return slurm_job_id
+
+    def sbatch_on_nodes(self, argv, options):
+        excluded = set(filter(None, options.get("--exclude", "").split(",")))
+        pinned = options.get("--nodelist")
+        if excluded - set(self.nodes) or (pinned and pinned not in self.nodes):
+            return subprocess.CompletedProcess(
+                argv,
+                1,
+                "",
+                "sbatch: error: Batch job submission failed: Invalid node name specified",
+            )
+        name, size_label = options["--job-name"], options["--comment"]
+        cpus = int(options["--cpus-per-task"])
+        submitted_at = self.now
+        if not self.nodes_allowed(cpus, excluded, pinned or ""):
+            # As job 753319: squeue lists it for MinJobAge, submit = start = end, no node
+            self.add_job(
+                name,
+                "FAILED",
+                size_label=size_label,
+                submitted_at=submitted_at,
+                started_at=submitted_at,
+                ended_at=submitted_at,
+                node="",
+                excluded=options.get("--exclude", ""),
+            )
+            return subprocess.CompletedProcess(
+                argv,
+                1,
+                "",
+                "sbatch: error: Batch job submission failed:"
+                " Requested node configuration is not available",
+            )
+        slurm_job_id = self.add_job(
+            name,
+            size_label=size_label,
+            submitted_at=submitted_at,
+            pinned_node=pinned or "",
+            excluded=options.get("--exclude", ""),
+            cpus=cpus,
+        )
+        self.start_pending_jobs()
+        return subprocess.CompletedProcess(
+            argv, 0, f"Submitted batch job {slurm_job_id}\n", ""
+        )
+
+    def refuse_leaving_a_failed_record(self, argv):
+        """As job 753319 (2026-11-17): squeue lists it for MinJobAge, submit = start = end, no node."""
+        options = dict(arg.split("=", 1) for arg in argv if "=" in arg)
+        self.add_job(
+            options["--job-name"],
+            state="FAILED",
+            size_label=options["--comment"],
+            started_at=self.now,
+            ended_at=self.now,
+            node="",
+            excluded=options.get("--exclude", ""),
+        )
+        return subprocess.CompletedProcess(
+            argv,
+            1,
+            "",
+            "sbatch: error: Batch job submission failed:"
+            " Requested node configuration is not available",
+        )
+
+    def nodes_allowed(self, cpus, excluded, pinned):
+        """The nodes that could ever hold such a job, in slurmctld's order."""
+        return [
+            node
+            for node, node_cpus in self.nodes.items()
+            if node not in excluded and pinned in ("", node) and node_cpus >= cpus
+        ]
+
+    def start_pending_jobs(self):
+        """First fit, oldest job first, onto nodes not drained with the CPUs free."""
+        for slurm_job_id, job in sorted(self.jobs.items()):
+            if job["state"] != "PENDING" or job["priority"] == 0:
+                continue
+            for node in self.nodes_allowed(
+                job["cpus"], job["excluded"], job["pinned_node"]
+            ):
+                in_use = sum(
+                    other["cpus"]
+                    for other in self.jobs.values()
+                    if other["node"] == node and other["state"] == "RUNNING"
+                )
+                if (
+                    node not in self.drained
+                    and in_use + job["cpus"] <= self.nodes[node]
+                ):
+                    started_at = max(self.now, job["submitted_at"])
+                    job.update(state="RUNNING", node=node, started_at=started_at)
+                    break
+
+    def end_job(self, slurm_job_id, state):
+        self.jobs[slurm_job_id].update(state=state, ended_at=self.now)
 
     def run(self, argv, capture_output, text, timeout, env):
         added = {
@@ -108,6 +243,17 @@ class FakeSlurm:
         }
         self.calls.append((list(argv), added))
         command = argv[0]
+        if command == "sbatch":
+            self.now += self.submit_spacing_s
+            if len(self.commands("sbatch")) in self.sbatch_unreachable_calls:
+                return subprocess.CompletedProcess(
+                    argv, 1, "", "sbatch: error: Unable to contact slurm controller"
+                )
+            if (
+                self.sbatch_refused_after is not None
+                and len(self.commands("sbatch")) > self.sbatch_refused_after
+            ):
+                return self.refuse_leaving_a_failed_record(argv)
         if command in self.failing_commands:
             return subprocess.CompletedProcess(
                 argv, 1, "", f"{command}: error: Unable to contact slurm controller"
@@ -127,25 +273,18 @@ class FakeSlurm:
             return subprocess.CompletedProcess(argv, 0, lines, "")
         if command == "squeue":
             return subprocess.CompletedProcess(argv, 0, self.squeue_output(), "")
+        if command == "sbatch" and self.nodes is not None:
+            return self.sbatch_on_nodes(argv, options)
         if command == "sbatch" and self.sbatch_times_out:
             raise subprocess.TimeoutExpired(argv, timeout)
         if command == "sbatch" and self.sbatch_refuses_leaving_a_failed_record:
-            # As job 753319 (2026-11-17): squeue lists it for MinJobAge, submit = start = end
-            self.add_job(
-                options["--job-name"],
-                state="FAILED",
-                size_label=options["--comment"],
-                started_at=self.now,
-                ended_at=self.now,
-                node="",
-            )
-            return subprocess.CompletedProcess(
-                argv,
-                1,
-                "",
-                "sbatch: error: Batch job submission failed:"
-                " Requested node configuration is not available",
-            )
+            return self.refuse_leaving_a_failed_record(argv)
+        if command == "sinfo":
+            # Every node once per partition (two here), the login nodes too, never compressed
+            names = [*(self.nodes or CLUSTER_NODES), "wato-login1", "wato-login2"]
+            if self.sinfo_lists_nothing:
+                names = []
+            return subprocess.CompletedProcess(argv, 0, "\n".join(names * 2) + "\n", "")
         if command == "sbatch":
             slurm_job_id = self.add_job(
                 options["--job-name"], size_label=options["--comment"]
@@ -174,7 +313,11 @@ class FakeSlurm:
                         f"Job is no longer pending execution for job {slurm_job_id}"
                     )
                 else:
-                    job["excluded"] = options["ExcNodeList"]
+                    job["excluded"] = frozenset(
+                        filter(None, options["ExcNodeList"].split(","))
+                    )
+            if self.nodes is not None:
+                self.start_pending_jobs()
             return subprocess.CompletedProcess(
                 argv, 1 if refusals else 0, "", "\n".join(refusals)
             )
@@ -187,12 +330,36 @@ class FakeSlurm:
         return "".join(
             f"{slurm_job_id}|{job['name']}|{job['comment']}|{job['state']}|{job['priority']}"
             f"|{job['submitted_at']}|{job['started_at']}|{job['ended_at']}"
-            f"|{job['node']}|{job['pinned_node']}|{job['excluded']}\n"
+            f"|{job['node']}|{job['pinned_node']}"
+            f"|{job['excluded_as_printed'] or compressed_hostlist(job['excluded'])}\n"
             for slurm_job_id, job in sorted(self.jobs.items())
         )
 
     def commands(self, command):
         return [argv for argv, _ in self.calls if argv[0] == command]
+
+
+def compressed_hostlist(names):
+    """A node list as slurmctld prints it in squeue's %x: sorted, and the trailing numbers of names that
+    share a prefix compressed into one bracket, "tr-slurm2,trpro-slurm[1-2]"."""
+    by_prefix = {}
+    for name in sorted(names):
+        prefix, digits = re.fullmatch(r"(.*?)(\d*)", name).groups()
+        by_prefix.setdefault(prefix, []).append(digits)
+    printed = []
+    for prefix, numbers in by_prefix.items():
+        if len(numbers) == 1:
+            printed.append(prefix + numbers[0])
+            continue
+        ranges, first, last = [], numbers[0], numbers[0]
+        for number in numbers[1:] + [None]:
+            if number is not None and int(number) == int(last) + 1:
+                last = number
+                continue
+            ranges.append(first if first == last else f"{first}-{last}")
+            first = last = number
+        printed.append(f"{prefix}[{','.join(ranges)}]")
+    return ",".join(printed)
 
 
 def runner(name, status="online", busy=False):
@@ -204,6 +371,82 @@ def runner(name, status="online", busy=False):
         "busy": busy,
         "labels": [{"id": 0, "name": MEDIUM, "type": "read-only"}],
     }
+
+
+class FakeSlurmPlacementTest(unittest.TestCase):
+    """The fake's sbatch, checked against what slurmctld 24.05.1 did on the cluster on 2026-11-17."""
+
+    def setUp(self):
+        # Two medium runners (2 CPUs) fit on each
+        self.slurm = FakeSlurm(nodes={"trpro-slurm1": 4, "thor-slurm1": 4})
+        patcher = mock.patch.object(supply.subprocess, "run", self.slurm.run)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def sbatch(self, name, excluded="", pinned=None):
+        argv = [
+            "sbatch",
+            f"--job-name={name}",
+            f"--comment={MEDIUM}",
+            "--cpus-per-task=2",
+        ]
+        if excluded:
+            argv.append(f"--exclude={excluded}")
+        if pinned:
+            argv += ["--nodes=1", f"--nodelist={pinned}"]
+        return self.slurm.run(argv, True, True, 60, {})
+
+    def placed(self):
+        return {
+            job["name"]: (job["state"], job["node"]) for job in self.slurm.jobs.values()
+        }
+
+    def test_first_fit_honouring_exclude_and_nodelist(self):
+        for name in ("a", "b", "c"):
+            self.sbatch(name)
+        self.sbatch("d", excluded="thor-slurm1")
+        self.sbatch("e", pinned="trpro-slurm1")
+        self.assertEqual(
+            self.placed(),
+            {
+                "a": ("RUNNING", "trpro-slurm1"),
+                "b": ("RUNNING", "trpro-slurm1"),
+                "c": ("RUNNING", "thor-slurm1"),
+                "d": ("PENDING", ""),
+                "e": ("PENDING", ""),
+            },
+        )
+        # A node freed, or an exclusion narrowed, starts the oldest that fits
+        self.slurm.end_job(min(self.slurm.jobs), "COMPLETED")
+        self.slurm.start_pending_jobs()
+        self.assertEqual(self.placed()["d"], ("RUNNING", "trpro-slurm1"))
+
+    def test_squeue_prints_exclusions_as_slurmctld_does(self):
+        rows = [
+            ({"tr-slurm2"}, "tr-slurm2"),
+            ({"trpro-slurm2", "trpro-slurm1"}, "trpro-slurm[1-2]"),
+            (
+                {"trpro-slurm2", "tr-slurm2", "trpro-slurm1"},
+                "tr-slurm2,trpro-slurm[1-2]",
+            ),
+            ({"trpro-slurm2", "wato2-slurm1"}, "trpro-slurm2,wato2-slurm1"),
+            ({"n1", "n2", "n3", "n5"}, "n[1-3,5]"),
+        ]
+        for names, printed in rows:
+            with self.subTest(printed):
+                self.assertEqual(compressed_hostlist(names), printed)
+                self.assertEqual(node_names_in_hostlist(printed), names)
+
+    def test_refusals(self):
+        refused = self.sbatch("all-out", excluded="trpro-slurm1,thor-slurm1")
+        self.assertIn("Requested node configuration is not available", refused.stderr)
+        unknown = self.sbatch("unknown", excluded="wato3-slurm1")
+        self.assertIn("Invalid node name specified", unknown.stderr)
+        self.assertEqual(self.placed(), {"all-out": ("FAILED", "")})
+        # Pinned to a drained node: accepted, and it pends
+        self.slurm.drained.add("trpro-slurm1")
+        self.assertEqual(self.sbatch("pinned", pinned="trpro-slurm1").returncode, 0)
+        self.assertEqual(self.placed()["pinned"], ("PENDING", ""))
 
 
 class ParseSqueueLineTest(unittest.TestCase):
@@ -471,7 +714,7 @@ class SbatchCommandTest(unittest.TestCase):
     def test_every_option(self):
         resources = RunnerResources(2, "2G", 16384, 30)
         self.assertEqual(
-            sbatch_command(f"{PREFIX}abc", MEDIUM, resources),
+            sbatch_command(f"{PREFIX}abc", ANYWHERE, resources),
             [
                 "sbatch",
                 "--output=/var/log/slurm-ci/slurm-ci-%j.out",
@@ -486,6 +729,26 @@ class SbatchCommandTest(unittest.TestCase):
                 str(W),
             ],
         )
+
+    def test_where_it_may_go(self):
+        resources = RunnerResources(2, "2G", 16384, 30)
+        rows = [
+            (
+                Submission(MEDIUM, frozenset({"trpro-slurm2", "trpro-slurm1"})),
+                ["--exclude=trpro-slurm1,trpro-slurm2"],
+            ),
+            # Exactly that node: --nodelist alone lets Slurm add others
+            (
+                Submission(MEDIUM, frozenset(), pinned_node="trpro-slurm1"),
+                ["--nodes=1", "--nodelist=trpro-slurm1"],
+            ),
+        ]
+        anywhere = sbatch_command(f"{PREFIX}abc", ANYWHERE, resources)
+        for submission, placement in rows:
+            with self.subTest(submission):
+                argv = sbatch_command(f"{PREFIX}abc", submission, resources)
+                # Before the script and its argument, after every other option
+                self.assertEqual(argv, anywhere[:-2] + placement + anywhere[-2:])
 
 
 class SlurmCommandsTest(unittest.TestCase):
@@ -534,7 +797,7 @@ class SlurmCommandsTest(unittest.TestCase):
         )
 
     def test_an_exclusion_it_cannot_read_is_logged_once(self):
-        self.slurm.add_job(f"{PREFIX}a", excluded="trpro-slurm[1-")
+        self.slurm.add_job(f"{PREFIX}a", excluded_as_printed="trpro-slurm[1-")
         with self.assertLogs("supply", logging.WARNING) as logs:
             (allocation,) = read_our_allocations(PREFIX)
             read_our_allocations(PREFIX)
@@ -558,6 +821,22 @@ class SlurmCommandsTest(unittest.TestCase):
                 with mock.patch.object(supply.subprocess, "run", fake):
                     with self.assertRaises(SlurmUnavailable):
                         read_our_allocations(PREFIX)
+
+    def test_the_nodes_slurm_knows_are_every_node_sinfo_lists(self):
+        self.assertEqual(
+            nodes_slurm_knows(), {*CLUSTER_NODES, "wato-login1", "wato-login2"}
+        )
+        self.assertEqual(
+            self.slurm.commands("sinfo"),
+            [["sinfo", "--all", "--noheader", "--Node", "--format=%N"]],
+        )
+        # Could not ask is never "unknown", and neither is a list with no node
+        self.slurm.sinfo_lists_nothing = True
+        with self.assertRaises(SlurmUnavailable):
+            nodes_slurm_knows()
+        self.slurm.failing_commands.add("sinfo")
+        with self.assertRaises(SlurmUnavailable):
+            nodes_slurm_knows()
 
     def test_cancel_asks_slurmctld_to_cancel_only_if_still_pending(self):
         pending = self.slurm.add_job(f"{PREFIX}a", priority=0)
@@ -585,9 +864,9 @@ class SlurmCommandsTest(unittest.TestCase):
 
     def test_one_update_narrows_every_waiting_runner_given_the_same_list(self):
         first = self.slurm.add_job(
-            f"{PREFIX}a", excluded="thor-slurm1,trpro-slurm[1-2]"
+            f"{PREFIX}a", excluded="thor-slurm1,trpro-slurm1,trpro-slurm2"
         )
-        second = self.slurm.add_job(f"{PREFIX}b", excluded="trpro-slurm[1-2]")
+        second = self.slurm.add_job(f"{PREFIX}b", excluded="trpro-slurm2,trpro-slurm1")
         waiting = read_our_allocations(PREFIX)
         trpro = frozenset({"trpro-slurm2", "trpro-slurm1"})
         self.assertEqual(narrow_pending_exclusions(waiting, trpro), set())
@@ -625,9 +904,9 @@ class SlurmCommandsTest(unittest.TestCase):
             refused = narrow_pending_exclusions([pending, running, ended], frozenset())
         self.assertEqual(refused, {running.slurm_job_id, ended.slurm_job_id})
         self.assertEqual(logs.records[0].levelno, logging.DEBUG)
-        self.assertEqual(self.slurm.jobs[pending.slurm_job_id]["excluded"], "")
+        self.assertEqual(self.slurm.jobs[pending.slurm_job_id]["excluded"], set())
         self.assertEqual(
-            self.slurm.jobs[running.slurm_job_id]["excluded"], "trpro-slurm1"
+            self.slurm.jobs[running.slurm_job_id]["excluded"], {"trpro-slurm1"}
         )
 
     def test_an_update_that_fails_outright_narrows_none(self):
@@ -735,7 +1014,7 @@ class GitHubSideTest(unittest.TestCase):
     def test_a_runner_is_registered_with_its_one_size_label_then_submitted(self):
         self.jit_config_reply()
         with self.assertLogs(level=logging.DEBUG) as logs:
-            submit_runner(self.github, self.repo, PREFIX, MEDIUM)
+            submit_runner(self.github, self.repo, PREFIX, ANYWHERE)
 
         ((method, path, body),) = self.fake.received_bodies
         self.assertEqual(
@@ -766,19 +1045,20 @@ class GitHubSideTest(unittest.TestCase):
             with self.subTest(status=reply.status):
                 self.fake.script(f"{REPO}/actions/runners/generate-jitconfig", reply)
                 with self.assertRaises(GitHubUnavailable):
-                    submit_runner(self.github, self.repo, PREFIX, MEDIUM)
+                    submit_runner(self.github, self.repo, PREFIX, ANYWHERE)
                 self.assertEqual(self.slurm.calls, [])
 
     def deletes(self):
         return [path for method, path, _ in self.fake.received if method == "DELETE"]
 
-    def test_a_refused_sbatch_deletes_the_registration_made_for_it(self):
+    def test_a_sbatch_that_left_no_job_deletes_the_registration_made_for_it(self):
         self.jit_config_reply()
         self.fake.script(f"{REPO}/actions/runners/9", Reply(204, body=None))
         self.slurm.failing_commands.add("sbatch")
         with self.assertLogs("supply", logging.INFO) as logs:
-            with self.assertRaises(SlurmUnavailable):
-                submit_runner(self.github, self.repo, PREFIX, MEDIUM)
+            with self.assertRaises(SbatchLeftNoJob) as raised:
+                submit_runner(self.github, self.repo, PREFIX, ANYWHERE)
+        self.assertNotIsInstance(raised.exception, SubmissionRefused)
         self.assertEqual(self.deletes(), [f"{REPO}/actions/runners/9"])
         (squeue,) = self.slurm.commands("squeue")
         self.assertIn("--states=all", squeue)
@@ -791,18 +1071,19 @@ class GitHubSideTest(unittest.TestCase):
         self.jit_config_reply()
         self.fake.script(f"{REPO}/actions/runners/9", Reply(204, body=None))
         self.slurm.sbatch_refuses_leaving_a_failed_record = True
-        with self.assertRaises(SlurmUnavailable):
-            submit_runner(self.github, self.repo, PREFIX, MEDIUM)
+        with self.assertRaises(SubmissionRefused) as raised:
+            submit_runner(self.github, self.repo, PREFIX, ANYWHERE)
+        self.assertIn("node configuration is not available", raised.exception.message)
         (record,) = self.slurm.jobs.values()
         self.assertEqual((record["state"], record["node"]), ("FAILED", ""))
         self.assertEqual(self.deletes(), [f"{REPO}/actions/runners/9"])
 
-    def test_a_failed_sbatch_whose_job_exists_or_cannot_be_checked_keeps_it(self):
+    def test_a_failed_sbatch_whose_job_exists_is_a_submitted_runner(self):
         self.jit_config_reply()
         # slurmctld created the job although sbatch failed: its runner will need the registration
         self.slurm.sbatch_fails_after_creating_its_job = True
-        with self.assertRaises(SlurmUnavailable):
-            submit_runner(self.github, self.repo, PREFIX, MEDIUM)
+        name = submit_runner(self.github, self.repo, PREFIX, ANYWHERE)
+        self.assertEqual([job["name"] for job in self.slurm.jobs.values()], [name])
         # A record of that name that has a node ran, or may still run
         self.slurm.sbatch_fails_after_creating_its_job = False
         self.slurm.failing_commands.add("sbatch")
@@ -810,13 +1091,17 @@ class GitHubSideTest(unittest.TestCase):
             self.slurm.jobs.clear()
             self.slurm.add_job("x", state=state, node="delta-slurm1")
             with mock.patch("supply.new_runner_name", return_value="x"):
-                with self.assertRaises(SlurmUnavailable):
-                    submit_runner(self.github, self.repo, PREFIX, MEDIUM)
-        # squeue cannot say whether the job exists
-        self.slurm.failing_commands.discard("sbatch")
+                self.assertEqual(
+                    submit_runner(self.github, self.repo, PREFIX, ANYWHERE), "x"
+                )
+        self.assertEqual(self.deletes(), [])
+
+    def test_a_failed_sbatch_that_squeue_cannot_check_keeps_the_registration(self):
+        self.jit_config_reply()
         self.slurm.failing_commands.update({"sbatch", "squeue"})
-        with self.assertRaises(SlurmUnavailable):
-            submit_runner(self.github, self.repo, PREFIX, MEDIUM)
+        with self.assertRaises(SlurmUnavailable) as raised:
+            submit_runner(self.github, self.repo, PREFIX, ANYWHERE)
+        self.assertNotIsInstance(raised.exception, SubmissionRefused)
         self.assertEqual(self.deletes(), [])
 
     def test_an_sbatch_killed_at_its_timeout_keeps_the_registration(self):
@@ -824,7 +1109,7 @@ class GitHubSideTest(unittest.TestCase):
         self.jit_config_reply()
         self.slurm.sbatch_times_out = True
         with self.assertRaises(SlurmTimedOut):
-            submit_runner(self.github, self.repo, PREFIX, MEDIUM)
+            submit_runner(self.github, self.repo, PREFIX, ANYWHERE)
         self.assertEqual(self.slurm.commands("squeue"), [])
         self.assertEqual(self.deletes(), [])
 
@@ -836,7 +1121,7 @@ class GitHubSideTest(unittest.TestCase):
         self.slurm.failing_commands.add("sbatch")
         with self.assertLogs("supply", logging.WARNING) as logs:
             with self.assertRaises(SlurmUnavailable) as raised:
-                submit_runner(self.github, self.repo, PREFIX, MEDIUM)
+                submit_runner(self.github, self.repo, PREFIX, ANYWHERE)
         self.assertIn("Unable to contact slurm controller", str(raised.exception))
         self.assertIn("Could not delete the registration", logs.output[-1])
 
@@ -844,7 +1129,7 @@ class GitHubSideTest(unittest.TestCase):
         self.jit_config_reply()
         self.slurm.failing_commands.add("sbatch")
         with self.assertRaises(SlurmUnavailable) as raised:
-            submit_runner(self.github, self.repo, PREFIX, MEDIUM)
+            submit_runner(self.github, self.repo, PREFIX, ANYWHERE)
         self.assertNotIn(JIT_CONFIG, str(raised.exception))
         self.assertIn("Unable to contact slurm controller", str(raised.exception))
 
@@ -853,7 +1138,7 @@ class GitHubSideTest(unittest.TestCase):
 
         with mock.patch.object(supply.subprocess, "run", times_out):
             with self.assertRaises(SlurmUnavailable) as raised:
-                submit_runner(self.github, self.repo, PREFIX, MEDIUM)
+                submit_runner(self.github, self.repo, PREFIX, ANYWHERE)
         self.assertNotIn(JIT_CONFIG, str(raised.exception))
         self.assertIsNone(raised.exception.__cause__)
 

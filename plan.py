@@ -1,25 +1,38 @@
 """
 Pure decisions about one repository's runners, from what was read this cycle: where each allocation
-stands, what it says about whether its size label can launch runners now (a circuit breaker per size
-label), which pending jobs to cancel and how many runners to submit.
+stands, what it says about where its size label can launch runners, which pending jobs to cancel, and
+which runners to submit where.
 
-No I/O. The records it decides on are defined here, so that the tests and the model in sim/ can import
-this module alone; supply.py and demand.py fill them in.
+Where a size may go is the node rule. For each size and node, the daemon remembers how the newest runner
+of that size on that node fared:
+1. A size is not sent to a node where its newest runner failed to launch. It is used there again as soon
+   as a runner of that size takes a job there.
+2. Such a node is tried again with one extra runner pinned to it, 1 minute after the failure, then 2, 4, 8
+   and at most 10 minutes after each further failure there, while a job of that size waits.
+3. A size with no node where it is known to work (after a restart, or when it fails everywhere) gets one
+   runner at a time.
+4. A runner still waiting in Slurm's queue is never left excluding a node that a new runner of its size
+   would now be allowed on.
+5. A failure that belongs to no node (Slurm refused the submission, or the failed job shows no node)
+   counts against the size: its next runner waits 1, 2, 4, 8, at most 10 minutes.
+
+No I/O. The records it decides on are defined here, so that the tests and a model of the daemon can
+import this module alone; supply.py and demand.py fill them in.
 """
 
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field, replace
 from enum import Enum
 
 from config import (
     BOOT_ALLOWANCE_S,
     BUSY_COVER_S,
-    FIRST_PROBE_WAIT_S,
+    FIRST_RETRY_WAIT_S,
     IDLE_ALLOWANCE_S,
-    MAX_PROBE_WAIT_S,
-    TOLERATED_FAILURES_IN_A_ROW,
+    MAX_RETRY_WAIT_S,
+    REFUSED_NAMES_KEPT_S,
     UNUSED_REGISTRATION_LIFETIME_S,
 )
 
@@ -106,33 +119,76 @@ class Phase(Enum):
 
 
 class Evidence(Enum):
-    """What one allocation says, this cycle, about whether its size label can launch runners now."""
+    """What one allocation says, this cycle, about whether its size label can launch runners on its node."""
 
     TOOK_A_JOB = "took a job"
     FAILED_TO_LAUNCH = "failed to launch"
 
 
 @dataclass(frozen=True)
-class LaunchFailure:
-    """One allocation that failed to launch, as a breaker remembers it."""
+class NodeRecord:
+    """Rules 1 and 2: how runners of one size have fared on one node, ordered by submit time. A cache: after
+    a restart there is none. NodeRecord() is an untried node, allowed like a usable one."""
 
-    slurm_job_id: int  # the same failure seen on many cycles is recorded once
-    submitted_at: float  # orders evidence: a newer launch says more about now
-    recorded_at: float  # when the daemon first saw it; the next probe's wait counts from the newest
+    # The newest runner of the size there that took a job, and its Slurm job (for the log)
+    newest_success_submitted_at: float | None = None
+    newest_success_slurm_job_id: int | None = None
+    # The newest that failed to launch there; the node is out when this is newer (a tie is usable)
+    newest_failure_submitted_at: float | None = None
+    newest_failure_slurm_job_id: int | None = None
+    # When that failure was first seen: the retry wait counts from here
+    newest_failure_seen_at: float | None = None
+    # When the failure that put the node out was seen; None while usable
+    out_since: float | None = None
+    # Failures there of runners submitted after out_since: the wait doubles per one
+    failed_retries: int = 0
+    # When Slurm refused a submission naming the node and the record was forgotten: untried since, and
+    # evidence from runners submitted before then is not filed again
+    forgotten_at: float | None = None
 
 
 @dataclass(frozen=True)
-class LabelBreaker:
-    """What runners of one size label have shown since the daemon started. A cache: a restart starts from
-    UNPROVEN, which costs one runner's boot before that label's waiting jobs are served in full."""
+class SizeRecord:
+    """What holds one size usable nowhere beyond its node records: refused submissions, and failures that
+    belong to no node (rule 5). Outstanding until a runner of the size submitted after outstanding_since
+    takes a job, on any node; then everything resets but the names and newest_evidence_submitted_at."""
 
-    # Submit time of the newest allocation seen taking a job; None: none yet
-    newest_success_submitted_at: float | None
-    # Failures of allocations submitted after it, oldest submission first
-    failures_since_success: tuple[LaunchFailure, ...]
+    # The newest refusal or failure with no node; None: nothing outstanding
+    outstanding_since: float | None = None
+    # Rule 5: the next runner waits from here; None: no failure with no node outstanding
+    nodeless_failure_seen_at: float | None = None
+    # Failures with no node of runners submitted after the previous one was seen
+    nodeless_retries: int = 0
+    # The nodes the last refused unpinned submission excluded; empty: none
+    refused_exclusion: frozenset[str] = frozenset()
+    # Every refused runner's name -> when; kept REFUSED_NAMES_KEPT_S, so the FAILED record its refusal may
+    # leave in squeue is never counted as a launch failure
+    refused_runner_names: dict[str, float] = field(default_factory=dict)
+    # The newest runner of the size whose failure with no node was counted, or that took a job: a failure
+    # with no node of a runner submitted no later changes nothing (the same one seen again included)
+    newest_evidence_submitted_at: float | None = None
 
 
-UNPROVEN = LabelBreaker(newest_success_submitted_at=None, failures_since_success=())
+@dataclass(frozen=True)
+class LaunchRecords:
+    """Everything the node rule remembers. A cache: a restart starts with none, so every size is usable
+    nowhere and gets one runner until squeue and the runners list show where it works."""
+
+    by_node_and_size: dict[tuple[str, str], NodeRecord]
+    by_size: dict[str, SizeRecord]
+
+
+NO_LAUNCH_RECORDS = LaunchRecords(by_node_and_size={}, by_size={})
+
+
+@dataclass(frozen=True)
+class Submission:
+    """One runner to submit, and where Slurm may put it."""
+
+    size_label: str
+    excluded_nodes: frozenset[str]  # sbatch --exclude; empty for a pinned runner
+    # sbatch --nodes=1 --nodelist: the retry of a node that is out for the size (rule 2)
+    pinned_node: str | None = None
 
 
 @dataclass(frozen=True)
@@ -155,12 +211,6 @@ PHASES_THAT_CAN_TAKE_A_JOB = frozenset(
 # The batch script exits non-zero only when its runner ended before the idle deadline with no job begun.
 # A launch failure as in #37 ends CANCELLED by slurmd, but so does a job we cancelled while pending.
 LAUNCH_FAILURE_STATES = frozenset({"FAILED", "CANCELLED", "NODE_FAIL", "BOOT_FAIL"})
-# From this many failures in a row the probe wait is at its cap, so older failures change nothing
-FAILURES_REMEMBERED = (
-    TOLERATED_FAILURES_IN_A_ROW
-    + 1
-    + math.ceil(math.log2(MAX_PROBE_WAIT_S / FIRST_PROBE_WAIT_S))
-)
 
 
 def phase_of_allocation(
@@ -168,7 +218,8 @@ def phase_of_allocation(
 ) -> Phase:
     """Checked in order: finished; pending (held, or unregistered for a day -> CANNOT_START); busy,
     completing, unregistered or W or older -> UNAVAILABLE; online -> IDLE; younger than B -> BOOTING;
-    otherwise UNAVAILABLE."""
+    otherwise UNAVAILABLE. now is when squeue and the runners list were read: an observation is judged
+    at the time it was observed."""
     if allocation.state in FINISHED_STATES:
         return Phase.ENDED
     if allocation.state == "PENDING":
@@ -276,73 +327,12 @@ def launch_evidence(
     return None
 
 
-def record_evidence(
-    breaker: LabelBreaker, allocation: Allocation, evidence: Evidence, now: float
-) -> LabelBreaker:
-    """Newest by submit time wins: a success drops failures submitted at or before it; evidence submitted
-    at or before the newest success, or a failure already recorded, changes nothing; at most
-    FAILURES_REMEMBERED failures are kept, the most recently submitted."""
-    newest_success = breaker.newest_success_submitted_at
-    if newest_success is not None and allocation.submitted_at <= newest_success:
-        return breaker
-    if evidence is Evidence.TOOK_A_JOB:
-        newer_failures = tuple(
-            failure
-            for failure in breaker.failures_since_success
-            if failure.submitted_at > allocation.submitted_at
-        )
-        return LabelBreaker(allocation.submitted_at, newer_failures)
-    if any(
-        failure.slurm_job_id == allocation.slurm_job_id
-        for failure in breaker.failures_since_success
-    ):
-        return breaker
-    failure = LaunchFailure(allocation.slurm_job_id, allocation.submitted_at, now)
-    failures = sorted(
-        breaker.failures_since_success + (failure,),
-        key=lambda remembered: remembered.submitted_at,
-    )[-FAILURES_REMEMBERED:]
-    if failure not in failures:
-        # Older than every failure it would displace; recording it would only restart the wait
-        return breaker
-    return LabelBreaker(newest_success, tuple(failures))
-
-
-def update_breakers(
-    breakers: dict[str, LabelBreaker],
-    allocations: list[Allocation],
-    registrations_by_name: dict[str, RunnerRegistration],
-    demand: Demand,
-    runners_taking_a_job: dict[str, int],
-    now: float,
-) -> dict[str, LabelBreaker]:
-    """record_evidence for every allocation with evidence this cycle; returns a new dict, in which a
-    missing size label means UNPROVEN."""
-    uncovered = uncovered_jobs_waiting_past_b_by_label(
-        demand, runners_taking_a_job, now
-    )
-    updated = dict(breakers)
-    for allocation in sorted(allocations, key=lambda each: each.submitted_at):
-        evidence = launch_evidence(
-            allocation,
-            registrations_by_name.get(allocation.runner_name),
-            demand.runner_names_on_jobs,
-            uncovered.get(allocation.size_label, 0),
-            now,
-        )
-        if evidence is not None:
-            breaker = updated.get(allocation.size_label, UNPROVEN)
-            updated[allocation.size_label] = record_evidence(
-                breaker, allocation, evidence, now
-            )
-    return updated
-
-
 def uncovered_jobs_waiting_past_b_by_label(
     demand: Demand, runners_taking_a_job: dict[str, int], now: float
 ) -> dict[str, int]:
-    """Pure: per size label, its jobs that have waited longer than B, less its runners taking a job; never
-    below zero. A covered job is being taken, so an idle runner beside it says nothing."""
+    """Pure: per size label, its jobs that had waited longer than B at now, when the runners list was
+    read, less its runners taking a job; never below zero. A covered job is being taken, so an idle runner
+    beside it says nothing."""
     waiting_past_b = {}
     for job in demand.waiting_jobs:
         if now - job.created_at > BOOT_ALLOWANCE_S:
@@ -353,93 +343,246 @@ def uncovered_jobs_waiting_past_b_by_label(
     }
 
 
-def is_proven(breaker: LabelBreaker) -> bool:
-    """A runner of the label took a job since the daemon started, and at most TOLERATED_FAILURES_IN_A_ROW
-    launches submitted after it have failed."""
-    return (
-        breaker.newest_success_submitted_at is not None
-        and len(breaker.failures_since_success) <= TOLERATED_FAILURES_IN_A_ROW
+def runner_can_still_take_a_job(
+    allocation: Allocation,
+    registration: RunnerRegistration | None,
+    demand: Demand,
+    uncovered_jobs_waiting_past_b: int,
+    now: float,
+) -> bool:
+    """Pure: pending, booting or idle, and no evidence (it took a job, or GitHub left it idle while a job
+    of its size waited), judged at now, when the supply was read: v8's supply test, and what "in flight"
+    means for the node rule."""
+    phase = phase_of_allocation(allocation, registration, now)
+    evidence = launch_evidence(
+        allocation,
+        registration,
+        demand.runner_names_on_jobs,
+        uncovered_jobs_waiting_past_b,
+        now,
     )
+    return phase in PHASES_THAT_CAN_TAKE_A_JOB and evidence is None
 
 
-def earliest_next_probe_at(breaker: LabelBreaker) -> float:
-    """No wait while the failures in a row are within TOLERATED_FAILURES_IN_A_ROW + 1; from the first count
-    that leaves a proven label unproven, FIRST_PROBE_WAIT_S doubling per further failure, at most
-    MAX_PROBE_WAIT_S, from when the newest was recorded."""
-    failures = breaker.failures_since_success
-    doublings = len(failures) - TOLERATED_FAILURES_IN_A_ROW - 1
-    if doublings < 0:
-        return 0.0
-    wait_s = min(FIRST_PROBE_WAIT_S * 2**doublings, MAX_PROBE_WAIT_S)
-    return max(failure.recorded_at for failure in failures) + wait_s
+# Evidence, filed per node and size
 
 
-def runners_to_submit_for_label(
-    shortfall: int, runners_that_can_take_a_job: int, breaker: LabelBreaker, now: float
-) -> int:
-    """Proven: the shortfall. Unproven: one, only when no runner of the label can still take a job and the
-    wait is over."""
-    if shortfall <= 0:
-        return 0
-    if is_proven(breaker):
-        return shortfall
-    if runners_that_can_take_a_job > 0 or now < earliest_next_probe_at(breaker):
-        return 0
-    return 1
-
-
-def plan_submissions(
+def file_launch_evidence(
+    records: LaunchRecords,
     allocations: list[Allocation],
     registrations_by_name: dict[str, RunnerRegistration],
     demand: Demand,
-    breakers: dict[str, LabelBreaker],
     runners_taking_a_job: dict[str, int],
-    runners_submitted_this_cycle: dict[str, int],
-    now: float,
-) -> dict[str, int]:
-    """Runners to submit per size label with a waiting job: waiting jobs, less those runners_taking_a_job
-    cover, minus runners that can still take one (counting runners_submitted_this_cycle), through the
-    label's breaker. A runner that is evidence this cycle cannot: it took a job, or it failed to launch,
-    which includes one GitHub left idle while an uncovered job of its size waited."""
-    waiting_jobs_by_label = jobs_left_waiting_by_label(demand, runners_taking_a_job)
+    cycle_started_at: float,
+    seen_at: float,
+) -> LaunchRecords:
+    """Pure: launch_evidence for every allocation, oldest submission first, filed under (its node, its
+    size) by record_node_evidence. A failure that shows no node is filed under its size by
+    record_nodeless_failure, unless it is the FAILED record a refused submission left. A runner taking a
+    job clears what is outstanding for its size if it was submitted after outstanding_since. Refused names
+    older than REFUSED_NAMES_KEPT_S are dropped. What squeue and the runners list showed is judged at
+    cycle_started_at, when they were read; what is recorded is stamped seen_at, when this is filed."""
     uncovered = uncovered_jobs_waiting_past_b_by_label(
-        demand, runners_taking_a_job, now
+        demand, runners_taking_a_job, cycle_started_at
     )
-    runners_that_can_take_a_job_by_label = dict(runners_submitted_this_cycle)
-    for allocation in allocations:
-        registration = registrations_by_name.get(allocation.runner_name)
-        phase = phase_of_allocation(allocation, registration, now)
-        evidence = launch_evidence(
+    by_node_and_size = dict(records.by_node_and_size)
+    by_size = {
+        size_label: replace(
+            record,
+            refused_runner_names={
+                name: refused_at
+                for name, refused_at in record.refused_runner_names.items()
+                if seen_at - refused_at < REFUSED_NAMES_KEPT_S
+            },
+        )
+        for size_label, record in records.by_size.items()
+    }
+    evidence_by_allocation = [
+        (
             allocation,
-            registration,
-            demand.runner_names_on_jobs,
-            uncovered.get(allocation.size_label, 0),
-            now,
+            launch_evidence(
+                allocation,
+                registrations_by_name.get(allocation.runner_name),
+                demand.runner_names_on_jobs,
+                uncovered.get(allocation.size_label, 0),
+                cycle_started_at,
+            ),
         )
-        if phase in PHASES_THAT_CAN_TAKE_A_JOB and evidence is None:
-            label = allocation.size_label
-            runners_that_can_take_a_job_by_label[label] = (
-                runners_that_can_take_a_job_by_label.get(label, 0) + 1
+        for allocation in sorted(allocations, key=lambda each: each.submitted_at)
+    ]
+    # A failure with no node of a runner no newer than one of its size that took a job says nothing about
+    # now, also before the size has a record (after a restart)
+    newest_success_by_size = {
+        allocation.size_label: allocation.submitted_at
+        for allocation, evidence in evidence_by_allocation
+        if evidence is Evidence.TOOK_A_JOB
+    }
+    for allocation, evidence in evidence_by_allocation:
+        if evidence is None:
+            continue
+        size_label = allocation.size_label
+        size_record = by_size.get(size_label)
+        if evidence is Evidence.TOOK_A_JOB and size_record is not None:
+            by_size[size_label] = record_size_took_a_job(
+                size_record, allocation.submitted_at
             )
+        if allocation.node is not None:
+            key = (allocation.node, size_label)
+            by_node_and_size[key] = record_node_evidence(
+                by_node_and_size.get(key), allocation, evidence, seen_at
+            )
+        elif (
+            evidence is Evidence.FAILED_TO_LAUNCH
+            and allocation.submitted_at > newest_success_by_size.get(size_label, 0.0)
+            and (
+                size_record is None
+                or allocation.runner_name not in size_record.refused_runner_names
+            )
+        ):
+            by_size[size_label] = record_nodeless_failure(
+                size_record, allocation.submitted_at, seen_at
+            )
+    return LaunchRecords(by_node_and_size, by_size)
 
-    runners_to_submit = {}
-    for label, waiting_jobs in sorted(waiting_jobs_by_label.items()):
-        can_take = runners_that_can_take_a_job_by_label.get(label, 0)
-        runners_to_submit[label] = runners_to_submit_for_label(
-            waiting_jobs - can_take, can_take, breakers.get(label, UNPROVEN), now
+
+# Rule 1: not sent to a node where its newest runner failed to launch; used there again once one takes a job
+
+
+def record_node_evidence(
+    record: NodeRecord | None,
+    allocation: Allocation,
+    evidence: Evidence,
+    seen_at: float,
+) -> NodeRecord:
+    """Pure: the newest runner by submit time decides, a success winning a tie, and evidence from a runner
+    no newer than the newest with evidence there changes nothing (the same failure seen on many cycles
+    included). A success at or after the newest failure makes the node usable. A failure puts a usable node
+    out; while the node is out, it restarts the wait from when it was seen, and doubles it only if its
+    runner was submitted after the node went out (rule 2): runners already in flight then are one event.
+    Runners submitted before the record was forgotten are not filed."""
+    record = record or NodeRecord()
+    submitted_at = allocation.submitted_at
+    if record.forgotten_at is not None and submitted_at <= record.forgotten_at:
+        return record
+    if evidence is Evidence.TOOK_A_JOB:
+        if submitted_at <= (record.newest_success_submitted_at or 0.0):
+            return record
+        record = replace(
+            record,
+            newest_success_submitted_at=submitted_at,
+            newest_success_slurm_job_id=allocation.slurm_job_id,
         )
-    return runners_to_submit
+        if submitted_at >= (record.newest_failure_submitted_at or 0.0):
+            return replace(record, out_since=None, failed_retries=0)
+        return record
+    newest = max(
+        record.newest_success_submitted_at or 0.0,
+        record.newest_failure_submitted_at or 0.0,
+    )
+    if submitted_at <= newest:
+        return record
+    record = replace(
+        record,
+        newest_failure_submitted_at=submitted_at,
+        newest_failure_slurm_job_id=allocation.slurm_job_id,
+        newest_failure_seen_at=seen_at,
+    )
+    if record.out_since is None:
+        return replace(record, out_since=seen_at, failed_retries=0)
+    if submitted_at > record.out_since:
+        return replace(record, failed_retries=record.failed_retries + 1)
+    return record
+
+
+def node_is_out(record: NodeRecord | None) -> bool:
+    """Pure: the newest runner of the size with evidence on the node failed to launch."""
+    return record is not None and record.out_since is not None
+
+
+def nodes_out(records: LaunchRecords, size_label: str) -> frozenset[str]:
+    """Pure: the nodes out for the size."""
+    return frozenset(
+        node
+        for (node, size), record in records.by_node_and_size.items()
+        if size == size_label and node_is_out(record)
+    )
+
+
+# Rule 2: such a node is retried with one extra pinned runner after 1, 2, 4, 8, at most 10 minutes. The wait
+# doubles in record_node_evidence, where a failed retry is filed
+
+
+def retry_wait_s(failed_retries: int) -> float:
+    """Pure: FIRST_RETRY_WAIT_S doubled per failed retry, at most MAX_RETRY_WAIT_S (rules 2 and 5)."""
+    return min(FIRST_RETRY_WAIT_S * 2**failed_retries, MAX_RETRY_WAIT_S)
+
+
+def node_retry_due_at(record: NodeRecord) -> float:
+    """Pure: when a node out for a size may get a runner of it pinned to it."""
+    return (record.newest_failure_seen_at or 0.0) + retry_wait_s(record.failed_retries)
+
+
+def nodes_due_a_pinned_runner(
+    records: LaunchRecords,
+    size_label: str,
+    nodes_with_a_pinned_runner_in_flight: set[str],
+    now: float,
+) -> list[str]:
+    """Pure: the nodes out for the size whose retry is due and with no runner of the size pinned to them in
+    flight; none while the size is usable nowhere, whose one runner is the retry (rule 3)."""
+    if not size_usable_somewhere(records, size_label):
+        return []
+    return sorted(
+        node
+        for node in nodes_out(records, size_label)
+        if node not in nodes_with_a_pinned_runner_in_flight
+        and now >= node_retry_due_at(records.by_node_and_size[(node, size_label)])
+    )
+
+
+# Rule 3: a size with no node where it is known to work gets one runner at a time
+
+
+def size_usable_somewhere(records: LaunchRecords, size_label: str) -> bool:
+    """Pure: some node is usable for the size, and nothing is outstanding (no refusal or failure with no
+    node, rule 5)."""
+    size_record = records.by_size.get(size_label)
+    if size_record is not None and size_record.outstanding_since is not None:
+        return False
+    return any(
+        size == size_label
+        and not node_is_out(record)
+        and record.newest_success_submitted_at is not None
+        for (_, size), record in records.by_node_and_size.items()
+    )
+
+
+def nodes_a_new_runner_excludes(
+    records: LaunchRecords, size_label: str, now: float
+) -> frozenset[str]:
+    """Pure: usable somewhere, every node out for the size (rule 1). Usable nowhere, only those whose retry
+    is not yet due, so that its one runner can be the retry of any other (rule 3)."""
+    out = nodes_out(records, size_label)
+    if size_usable_somewhere(records, size_label):
+        return out
+    return frozenset(
+        node
+        for node in out
+        if now < node_retry_due_at(records.by_node_and_size[(node, size_label)])
+    )
+
+
+# Rule 4: a waiting runner never keeps excluding a node a new runner of its size may use
 
 
 def narrowed_exclusions(
-    allocations: list[Allocation],
-    nodes_a_new_runner_excludes: dict[str, frozenset[str]],
+    allocations: list[Allocation], records: LaunchRecords, now: float
 ) -> dict[frozenset[str], list[Allocation]]:
     """Pure: our unpinned runners waiting for a node whose exclusion names a node that a runner of their
     size submitted now would be allowed on, grouped by their new exclusion (the old one less those nodes),
     so that each group is one scontrol call. Never adds a node: a waiting runner left out of nodes that came
     back would hold its job until they are full, and one that excluded every node would never start. A
-    size missing from the dict excludes nothing; a runner whose exclusion could not be read is left alone."""
+    runner whose exclusion could not be read is left alone."""
     groups = {}
     for allocation in allocations:
         if (
@@ -449,13 +592,211 @@ def narrowed_exclusions(
             or allocation.excluded_nodes is None
         ):
             continue
-        would_exclude = nodes_a_new_runner_excludes.get(
-            allocation.size_label, frozenset()
+        kept = allocation.excluded_nodes & nodes_a_new_runner_excludes(
+            records, allocation.size_label, now
         )
-        kept = allocation.excluded_nodes & would_exclude
         if kept != allocation.excluded_nodes:
             groups.setdefault(kept, []).append(allocation)
     return groups
+
+
+# Rule 5: a failure that belongs to no node makes the size's next runner wait 1, 2, 4, 8, at most 10 minutes
+
+
+def record_nodeless_failure(
+    record: SizeRecord | None, submitted_at: float, seen_at: float
+) -> SizeRecord:
+    """Pure: a runner of the size failed with no node (a refused one counts as submitted when refused).
+    Outstanding from seen_at, and the next runner waits retry_wait_s(nodeless_retries) from then; the retries
+    grow only if this runner was submitted after the previous outstanding failure with no node was seen."""
+    record = record or SizeRecord()
+    if submitted_at <= (record.newest_evidence_submitted_at or 0.0):
+        return record
+    retries = 0
+    if record.nodeless_failure_seen_at is not None:
+        retries = record.nodeless_retries
+        if submitted_at > record.nodeless_failure_seen_at:
+            retries += 1
+    return replace(
+        record,
+        outstanding_since=seen_at,
+        nodeless_failure_seen_at=seen_at,
+        nodeless_retries=retries,
+        newest_evidence_submitted_at=submitted_at,
+    )
+
+
+def record_size_took_a_job(record: SizeRecord, submitted_at: float) -> SizeRecord:
+    """Pure: a runner of the size took a job, on any node. Submitted after outstanding_since, it clears
+    what was outstanding."""
+    newest = max(record.newest_evidence_submitted_at or 0.0, submitted_at)
+    record = replace(record, newest_evidence_submitted_at=newest)
+    if record.outstanding_since is None or submitted_at <= record.outstanding_since:
+        return record
+    return replace(
+        record,
+        outstanding_since=None,
+        nodeless_failure_seen_at=None,
+        nodeless_retries=0,
+        refused_exclusion=frozenset(),
+    )
+
+
+def next_unpinned_runner_at(records: LaunchRecords, size_label: str) -> float:
+    """Pure: when a size usable nowhere may send its one runner, given what is outstanding; 0 when nothing
+    is. The later of rule 5's wait after a failure with no node, and, after a refused exclusion, the
+    earliest retry due among its nodes, or no wait if one of them is no longer out (usable again, or
+    forgotten)."""
+    record = records.by_size.get(size_label)
+    if record is None or record.outstanding_since is None:
+        return 0.0
+    times = [0.0]
+    if record.nodeless_failure_seen_at is not None:
+        times.append(
+            record.nodeless_failure_seen_at + retry_wait_s(record.nodeless_retries)
+        )
+    excluded = [
+        records.by_node_and_size.get((node, size_label))
+        for node in record.refused_exclusion
+    ]
+    if excluded and all(node_is_out(node_record) for node_record in excluded):
+        times.append(min(node_retry_due_at(node_record) for node_record in excluded))
+    return max(times)
+
+
+# A failed sbatch: what squeue shows by the runner's name decides (supply.AfterFailedSbatch)
+
+
+def record_refused_submission(
+    records: LaunchRecords, submission: Submission, runner_name: str, refused_at: float
+) -> LaunchRecords:
+    """Pure: Slurm refused a submission for its constraints, leaving a FAILED record with no node. It makes
+    the size usable nowhere until a runner of it submitted after refused_at takes a job, and keeps the
+    runner's name, so that record is not counted again. Then:
+    - unpinned with nothing excluded: a failure with no node (rule 5), whose wait doubles;
+    - unpinned with nodes excluded: nothing doubles; the size's next runner waits for the earliest of those
+      nodes to come due (next_unpinned_runner_at), when its own exclusion will be smaller;
+    - pinned: the node's record is forgotten, or a node that can no longer hold the size would be refused
+      at every retry; not rule 5."""
+    size_label = submission.size_label
+    record = records.by_size.get(size_label, SizeRecord())
+    record = replace(
+        record,
+        outstanding_since=refused_at,
+        refused_runner_names={**record.refused_runner_names, runner_name: refused_at},
+    )
+    by_node_and_size = dict(records.by_node_and_size)
+    if submission.pinned_node is not None:
+        by_node_and_size[(submission.pinned_node, size_label)] = NodeRecord(
+            forgotten_at=refused_at
+        )
+    elif submission.excluded_nodes:
+        record = replace(record, refused_exclusion=submission.excluded_nodes)
+    else:
+        record = record_nodeless_failure(record, refused_at, refused_at)
+    return LaunchRecords(by_node_and_size, {**records.by_size, size_label: record})
+
+
+def forget_nodes_slurm_does_not_know(
+    records: LaunchRecords, unknown_nodes: frozenset[str], forgotten_at: float
+) -> LaunchRecords:
+    """Pure: after a sbatch that left no job, named nodes Slurm does not know (removed or renamed): their
+    records are forgotten for every size, or every submission naming them would fail the same way. Nothing
+    is counted against any size."""
+    by_node_and_size = dict(records.by_node_and_size)
+    for node, size_label in records.by_node_and_size:
+        if node in unknown_nodes:
+            by_node_and_size[(node, size_label)] = NodeRecord(forgotten_at=forgotten_at)
+    return replace(records, by_node_and_size=by_node_and_size)
+
+
+# What to submit, from the five rules
+
+
+def plan_submissions(
+    allocations: list[Allocation],
+    registrations_by_name: dict[str, RunnerRegistration],
+    demand: Demand,
+    records: LaunchRecords,
+    runners_taking_a_job: dict[str, int],
+    submitted_this_cycle: list[Submission],
+    planned_at: float,
+    cycle_started_at: float,
+) -> list[Submission]:
+    """Pure: per size label with a job waiting that no runner taking a job covers.
+    - Usable somewhere: one pinned runner per node due a retry (rule 2), then the waiting jobs less the
+      unpinned runners that can still take one (this cycle's submissions included), each excluding the
+      nodes out for the size (rule 1).
+    - Usable nowhere: one unpinned runner, only when no unpinned runner of the size can still take a job and
+      next_unpinned_runner_at has come (rules 3 and 5); no pinned runner.
+    Pinned runners never count as able to take a job, so one pending on a drained node never holds a size
+    back. What squeue and the runners list showed is judged at cycle_started_at, when they were read;
+    which nodes are due, at planned_at."""
+    waiting_jobs_by_label = jobs_left_waiting_by_label(demand, runners_taking_a_job)
+    uncovered = uncovered_jobs_waiting_past_b_by_label(
+        demand, runners_taking_a_job, cycle_started_at
+    )
+    unpinned_in_flight = Counter(
+        submission.size_label
+        for submission in submitted_this_cycle
+        if submission.pinned_node is None
+    )
+    pinned_in_flight = {
+        (submission.pinned_node, submission.size_label)
+        for submission in submitted_this_cycle
+        if submission.pinned_node is not None
+    }
+    for allocation in allocations:
+        if not runner_can_still_take_a_job(
+            allocation,
+            registrations_by_name.get(allocation.runner_name),
+            demand,
+            uncovered.get(allocation.size_label, 0),
+            cycle_started_at,
+        ):
+            continue
+        if allocation.pinned_node is None:
+            unpinned_in_flight[allocation.size_label] += 1
+        else:
+            pinned_in_flight.add((allocation.pinned_node, allocation.size_label))
+
+    submissions = []
+    for label, waiting_jobs in sorted(waiting_jobs_by_label.items()):
+        if waiting_jobs == 0:
+            continue
+        nodes_in_flight = {node for node, size in pinned_in_flight if size == label}
+        for node in nodes_due_a_pinned_runner(
+            records, label, nodes_in_flight, planned_at
+        ):
+            submissions.append(Submission(label, frozenset(), pinned_node=node))
+        excluded = nodes_a_new_runner_excludes(records, label, planned_at)
+        shortfall = waiting_jobs - unpinned_in_flight[label]
+        size_record = records.by_size.get(label, SizeRecord())
+        if size_usable_somewhere(records, label):
+            submissions += [Submission(label, excluded)] * max(0, shortfall)
+        elif (
+            shortfall > 0
+            and unpinned_in_flight[label] == 0
+            and planned_at >= next_unpinned_runner_at(records, label)
+            # A refusal, or a failure with no node, recorded this cycle ends its submissions for the cycle
+            and (size_record.outstanding_since or 0.0) < cycle_started_at
+        ):
+            submissions.append(Submission(label, excluded))
+    return submission_order(submissions)
+
+
+def submission_order(submissions: list[Submission]) -> list[Submission]:
+    """Pure: size labels taken in turn, each label's pinned runners first, so a large wave cannot hold up
+    another label's single job."""
+    by_label = {}
+    for submission in sorted(submissions, key=lambda each: each.pinned_node is None):
+        by_label.setdefault(submission.size_label, []).append(submission)
+    ordered = []
+    for round_index in range(max(map(len, by_label.values()), default=0)):
+        for label in sorted(by_label):
+            if round_index < len(by_label[label]):
+                ordered.append(by_label[label][round_index])
+    return ordered
 
 
 def update_sightings(
@@ -463,7 +804,7 @@ def update_sightings(
     allocations: list[Allocation],
     registrations_by_name: dict[str, RunnerRegistration],
     demand: Demand,
-    now: float,
+    seen_at: float,
 ) -> RunnerSightings:
     """Pure: sightings plus when each busy runner was first seen busy and every name on a job read so far;
     runners squeue no longer shows are forgotten, along with the deletes answered for them."""
@@ -475,7 +816,7 @@ def update_sightings(
     }
     for name, registration in registrations_by_name.items():
         if registration.is_busy and name in shown:
-            first_seen_busy_at.setdefault(name, now)
+            first_seen_busy_at.setdefault(name, seen_at)
     seen_on_a_job = frozenset(
         name
         for name in sightings.seen_on_a_job | demand.runner_names_on_jobs
@@ -528,47 +869,44 @@ def jobs_left_waiting_by_label(
     }
 
 
-def submission_order(runners_to_submit: dict[str, int]) -> list[str]:
-    """Size labels taken in turn, one runner each, so a large wave cannot hold up another label's single
-    job."""
-    order = []
-    for round_index in range(max(runners_to_submit.values(), default=0)):
-        for label in sorted(runners_to_submit):
-            if runners_to_submit[label] > round_index:
-                order.append(label)
-    return order
-
-
-def breaker_log_lines(
-    before: dict[str, LabelBreaker], after: dict[str, LabelBreaker]
+def launch_record_log_lines(
+    before: LaunchRecords, after: LaunchRecords, now: float
 ) -> list[str]:
-    """One line per size label that became proven or unproven or whose failures in a row changed, e.g.
-    "slurm-runner-medium: unproven, 2 failures in a row (newest: Slurm job 812345); one runner at a time,
-    the next 60 s after the newest failure"."""
+    """Pure: one line per change: a node out for a size (or its retry failed) or usable again, a size
+    usable nowhere or somewhere again, a failure with no node. A refusal, and what it made the daemon
+    forget, is logged where it happens, with sbatch's message."""
     lines = []
-    for label in sorted(after):
-        breaker = after[label]
-        old = before.get(label, UNPROVEN)
-        failures = breaker.failures_since_success
-        # Not the count alone: past FAILURES_REMEMBERED a new failure replaces the oldest
-        if (
-            is_proven(old) == is_proven(breaker)
-            and old.failures_since_success == failures
+    for (node, label), new in sorted(after.by_node_and_size.items()):
+        old = before.by_node_and_size.get((node, label))
+        if node_is_out(new) and (
+            not node_is_out(old) or new.failed_retries != old.failed_retries
         ):
-            continue
-        at_cap = len(failures) == FAILURES_REMEMBERED
-        count = f"{len(failures)}{' or more' if at_cap else ''}"
-        line = f"{label}: {'proven' if is_proven(breaker) else 'unproven'}"
-        line += f", {count} failure{'' if len(failures) == 1 else 's'} in a row"
-        if failures:
-            newest = max(failures, key=lambda failure: failure.recorded_at)
-            line += f" (newest: Slurm job {newest.slurm_job_id})"
-            if not is_proven(breaker):
-                line += "; one runner at a time"
-                wait_s = earliest_next_probe_at(breaker) - newest.recorded_at
-                if wait_s > 0:
-                    line += f", the next {wait_s:.0f} s after the newest failure"
-        elif not is_proven(breaker):
-            line += "; one runner at a time"
-        lines.append(line)
+            retry = f", retry {new.failed_retries}" if new.failed_retries else ""
+            lines.append(
+                f"{label}: out on {node} (Slurm job {new.newest_failure_slurm_job_id} failed to"
+                f" launch{retry}); retry there in {node_retry_due_at(new) - now:.0f} s"
+            )
+        elif node_is_out(old) and not node_is_out(new) and new.forgotten_at is None:
+            lines.append(
+                f"{label}: usable again on {node} (Slurm job {new.newest_success_slurm_job_id}"
+                " took a job)"
+            )
+    labels = {label for _, label in before.by_node_and_size} | set(before.by_size)
+    labels |= {label for _, label in after.by_node_and_size} | set(after.by_size)
+    for label in sorted(labels):
+        new = after.by_size.get(label, SizeRecord())
+        old = before.by_size.get(label, SizeRecord())
+        refused = new.refused_runner_names.keys() - old.refused_runner_names.keys()
+        if new.nodeless_failure_seen_at not in (None, old.nodeless_failure_seen_at):
+            # A refusal is logged where it happens, with sbatch's message
+            if not refused:
+                wait_s = next_unpinned_runner_at(after, label) - now
+                lines.append(
+                    f"{label}: a runner failed with no node; next runner in {wait_s:.0f} s"
+                )
+        was_usable = size_usable_somewhere(before, label)
+        if was_usable and not size_usable_somewhere(after, label):
+            lines.append(f"{label}: usable on no node; one runner at a time")
+        elif not was_usable and size_usable_somewhere(after, label):
+            lines.append(f"{label}: usable again; served in full")
     return lines

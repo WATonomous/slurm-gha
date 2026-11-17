@@ -1,4 +1,4 @@
-"""plan without Slurm or GitHub: every pure function by table, and the breaker through its whole life."""
+"""plan without Slurm or GitHub: every pure function by table, and each rule of the node rule."""
 
 import unittest
 from dataclasses import replace
@@ -6,43 +6,47 @@ from dataclasses import replace
 from config import (
     BOOT_ALLOWANCE_S as B,
     BUSY_COVER_S as T,
-    FIRST_PROBE_WAIT_S,
+    FIRST_RETRY_WAIT_S,
     IDLE_ALLOWANCE_S as W,
-    MAX_PROBE_WAIT_S,
-    TOLERATED_FAILURES_IN_A_ROW,
+    MAX_RETRY_WAIT_S,
+    REFUSED_NAMES_KEPT_S,
     UNUSED_REGISTRATION_LIFETIME_S as A_DAY,
 )
 from plan import (
-    FAILURES_REMEMBERED,
     FINISHED_STATES,
     NO_DEMAND,
+    NO_LAUNCH_RECORDS,
     NO_SIGHTINGS,
-    UNPROVEN,
     Allocation,
     Demand,
     Evidence,
-    LabelBreaker,
-    LaunchFailure,
+    LaunchRecords,
+    NodeRecord,
     Phase,
     RunnerRegistration,
     RunnerSightings,
+    Submission,
     WaitingJob,
     allocations_to_cancel,
-    breaker_log_lines,
-    earliest_next_probe_at,
-    narrowed_exclusions,
-    is_proven,
+    file_launch_evidence,
+    forget_nodes_slurm_does_not_know,
     jobs_left_waiting_by_label,
     launch_evidence,
+    launch_record_log_lines,
+    narrowed_exclusions,
+    next_unpinned_runner_at,
+    node_retry_due_at,
+    nodes_a_new_runner_excludes,
+    nodes_out,
     phase_of_allocation,
     plan_submissions,
-    record_evidence,
+    record_refused_submission,
     registrations_to_delete,
+    retry_wait_s,
     runners_taking_a_job_by_label,
-    runners_to_submit_for_label,
+    size_usable_somewhere,
     submission_order,
     uncovered_jobs_waiting_past_b_by_label,
-    update_breakers,
     update_sightings,
 )
 
@@ -116,8 +120,35 @@ def demand(waiting_jobs=(), runner_names_on_jobs=()):
     return Demand(list(waiting_jobs), set(runner_names_on_jobs))
 
 
-def failure(slurm_job_id, submitted_at, recorded_at=NOW):
-    return LaunchFailure(slurm_job_id, submitted_at, recorded_at)
+def on(node, of, **changes):
+    """The allocation as squeue shows it once Slurm placed it on node."""
+    return replace(of, node=node, **changes)
+
+
+def usable_on(node, *size_labels):
+    """Records in which a runner of each size took a job on node an hour ago: usable somewhere, nothing out."""
+    took_a_job = NodeRecord(
+        newest_success_submitted_at=NOW - 3600, newest_success_slurm_job_id=1
+    )
+    return LaunchRecords({(node, label): took_a_job for label in size_labels}, {})
+
+
+def filed(records, *evidence, demand_read=NO_DEMAND, now=NOW):
+    """file_launch_evidence for (allocation, registration) pairs."""
+    allocations = [of for of, _ in evidence]
+    by_name = registrations(*(reg for _, reg in evidence if reg is not None))
+    return file_launch_evidence(
+        records, allocations, by_name, demand_read, {}, now, now
+    )
+
+
+def unpinned_counts(submissions):
+    """Unpinned runners per size label, as the breaker's plan counted them."""
+    counts = {}
+    for submission in submissions:
+        if submission.pinned_node is None:
+            counts[submission.size_label] = counts.get(submission.size_label, 0) + 1
+    return counts
 
 
 class PhaseOfAllocationTest(unittest.TestCase):
@@ -346,118 +377,9 @@ class LaunchEvidenceTest(unittest.TestCase):
         self.assertIsNone(self.evidence(unregistered, None))
 
 
-class RecordEvidenceTest(unittest.TestCase):
-    def test_a_success_proves_the_label_and_drops_older_failures(self):
-        breaker = LabelBreaker(None, (failure(1, NOW - 100), failure(2, NOW - 50)))
-        success = allocation(3, submitted_at=NOW - 50)
-        updated = record_evidence(breaker, success, Evidence.TOOK_A_JOB, NOW)
-        self.assertEqual(updated, LabelBreaker(NOW - 50, ()))
-        later_failure = LabelBreaker(None, (failure(4, NOW - 40),))
-        updated = record_evidence(later_failure, success, Evidence.TOOK_A_JOB, NOW)
-        self.assertEqual(updated, LabelBreaker(NOW - 50, (failure(4, NOW - 40),)))
-
-    def test_evidence_older_than_the_newest_success_changes_nothing(self):
-        breaker = LabelBreaker(NOW - 50, (failure(4, NOW - 40),))
-        for evidence in Evidence:
-            with self.subTest(evidence):
-                old = allocation(5, submitted_at=NOW - 60)
-                self.assertIs(record_evidence(breaker, old, evidence, NOW), breaker)
-                same_age = allocation(6, submitted_at=NOW - 50)
-                self.assertIs(
-                    record_evidence(breaker, same_age, evidence, NOW), breaker
-                )
-
-    def test_a_failure_is_recorded_once(self):
-        failed = ended(7, "FAILED")
-        once = record_evidence(UNPROVEN, failed, Evidence.FAILED_TO_LAUNCH, NOW)
-        self.assertEqual(
-            once.failures_since_success, (failure(7, failed.submitted_at, NOW),)
-        )
-        twice = record_evidence(once, failed, Evidence.FAILED_TO_LAUNCH, NOW + 60)
-        self.assertIs(twice, once)
-
-    def test_failures_are_kept_in_submit_order_and_capped(self):
-        breaker = UNPROVEN
-        for slurm_job_id in (3, 1, 2):
-            failed = allocation(slurm_job_id, submitted_at=NOW - 100 + slurm_job_id)
-            breaker = record_evidence(breaker, failed, Evidence.FAILED_TO_LAUNCH, NOW)
-        self.assertEqual(
-            [each.slurm_job_id for each in breaker.failures_since_success], [1, 2, 3]
-        )
-        for slurm_job_id in range(4, 4 + FAILURES_REMEMBERED):
-            failed = allocation(slurm_job_id, submitted_at=NOW - 100 + slurm_job_id)
-            breaker = record_evidence(breaker, failed, Evidence.FAILED_TO_LAUNCH, NOW)
-        self.assertEqual(len(breaker.failures_since_success), FAILURES_REMEMBERED)
-        # An older failure, seen late, would be dropped at once: it must not restart the wait
-        late = allocation(99, submitted_at=NOW - 1000)
-        self.assertIs(
-            record_evidence(breaker, late, Evidence.FAILED_TO_LAUNCH, NOW + 500),
-            breaker,
-        )
-
-
-class ProvenAndProbeWaitTest(unittest.TestCase):
-    def test_is_proven(self):
-        rows = [
-            (UNPROVEN, False),
-            (LabelBreaker(None, (failure(1, NOW),)), False),
-            (LabelBreaker(NOW - 60, ()), True),
-            (LabelBreaker(NOW - 60, (failure(1, NOW),)), True),  # one failure tolerated
-            (LabelBreaker(NOW - 60, (failure(1, NOW), failure(2, NOW))), False),
-        ]
-        for breaker, proven in rows:
-            with self.subTest(breaker=breaker):
-                self.assertEqual(is_proven(breaker), proven)
-
-    def test_the_first_breaker_that_is_not_proven_waits_exactly_the_first_wait(self):
-        count = TOLERATED_FAILURES_IN_A_ROW + 1
-        failures = tuple(failure(i, NOW, NOW - 100 + i) for i in range(count))
-        breaker = LabelBreaker(NOW - 3600, failures)
-        self.assertFalse(is_proven(breaker))
-        newest_recorded_at = NOW - 100 + count - 1
-        self.assertEqual(
-            earliest_next_probe_at(breaker), newest_recorded_at + FIRST_PROBE_WAIT_S
-        )
-        fewer = LabelBreaker(NOW - 3600, failures[:-1])
-        self.assertTrue(is_proven(fewer))
-        self.assertEqual(earliest_next_probe_at(fewer), 0.0)
-
-    def test_the_wait_doubles_from_the_second_failure_up_to_the_cap(self):
-        expected_waits = [0, 0, 60, 120, 240, 480, 600, 600]
-        self.assertEqual(expected_waits[2], FIRST_PROBE_WAIT_S)
-        self.assertEqual(expected_waits[-1], MAX_PROBE_WAIT_S)
-        for count, wait_s in enumerate(expected_waits):
-            with self.subTest(failures=count):
-                failures = tuple(failure(i, NOW, NOW - 100 + i) for i in range(count))
-                breaker = LabelBreaker(None, failures)
-                newest_recorded_at = NOW - 100 + count - 1
-                expected = 0.0 if count < 2 else newest_recorded_at + wait_s
-                self.assertEqual(earliest_next_probe_at(breaker), expected)
-
-
-class RunnersToSubmitForLabelTest(unittest.TestCase):
-    def test_by_table(self):
-        proven = LabelBreaker(NOW - 60, ())
-        waiting_for_probe = LabelBreaker(
-            None, (failure(1, NOW, NOW), failure(2, NOW, NOW))
-        )
-        rows = [
-            ("no shortfall", 0, 3, proven, NOW, 0),
-            ("proven: the whole shortfall", 9, 1, proven, NOW, 9),
-            ("unproven: one", 9, 0, UNPROVEN, NOW, 1),
-            ("unproven, a runner can still take a job", 9, 1, UNPROVEN, NOW, 0),
-            ("unproven, waiting for the probe", 9, 0, waiting_for_probe, NOW + 59, 0),
-            ("unproven, the wait is over", 9, 0, waiting_for_probe, NOW + 60, 1),
-        ]
-        for description, shortfall, can_take, breaker, now, expected in rows:
-            with self.subTest(description):
-                self.assertEqual(
-                    runners_to_submit_for_label(shortfall, can_take, breaker, now),
-                    expected,
-                )
-
-
 class PlanSubmissionsTest(unittest.TestCase):
+    """The count of unpinned runners, as v8 had it, for a size usable somewhere."""
+
     def test_waiting_jobs_minus_runners_that_can_take_one(self):
         pending = allocation(1, "PENDING")
         booting = allocation(2, age_s=10)
@@ -487,67 +409,70 @@ class PlanSubmissionsTest(unittest.TestCase):
             registration(held, False),
             registration(small_idle),
         )
-        proven = {MEDIUM: LabelBreaker(NOW - 60, ()), SMALL: LabelBreaker(NOW - 60, ())}
+        records = usable_on("thor-slurm1", MEDIUM, SMALL)
         jobs = demand(waiting(10) + waiting(1, SMALL), [named_on_a_job.runner_name])
+        submissions = plan_submissions(
+            allocations, by_name, jobs, records, {}, [], NOW, NOW
+        )
+        self.assertEqual(unpinned_counts(submissions), {MEDIUM: 10 - 3})
         self.assertEqual(
-            plan_submissions(allocations, by_name, jobs, proven, {}, {}, NOW),
-            {MEDIUM: 10 - 3, SMALL: 0},
+            set(submissions), {Submission(MEDIUM, frozenset())}, "no node is out"
         )
 
     def test_a_pending_runner_missing_from_the_list_still_counts(self):
         just_submitted = allocation(1, "PENDING")
-        proven = {MEDIUM: LabelBreaker(NOW - 60, ())}
+        records = usable_on("thor-slurm1", MEDIUM)
         jobs = demand(waiting(3))
         self.assertEqual(
-            plan_submissions([just_submitted], {}, jobs, proven, {}, {}, NOW),
+            unpinned_counts(
+                plan_submissions([just_submitted], {}, jobs, records, {}, [], NOW, NOW)
+            ),
             {MEDIUM: 2},
         )
 
     def test_a_runner_github_leaves_idle_while_a_job_waits_stops_counting(self):
         passed_over = allocation(1, age_s=2 * B + 1)
         by_name = registrations(registration(passed_over))
-        proven = {MEDIUM: LabelBreaker(NOW - 3600, ())}
+        records = usable_on("thor-slurm1", MEDIUM)
         waited_over_b = demand(waiting(1, waited_s=B + 1))
         self.assertEqual(
-            plan_submissions(
-                [passed_over], by_name, waited_over_b, proven, {}, {}, NOW
+            unpinned_counts(
+                plan_submissions(
+                    [passed_over], by_name, waited_over_b, records, {}, [], NOW, NOW
+                )
             ),
             {MEDIUM: 1},
         )
         just_waiting = demand(waiting(1, waited_s=B))
         self.assertEqual(
-            plan_submissions([passed_over], by_name, just_waiting, proven, {}, {}, NOW),
-            {MEDIUM: 0},
-        )
-
-    def test_an_unproven_label_gets_one_runner_when_none_can_take_a_job(self):
-        jobs = demand(waiting(10))
-        self.assertEqual(plan_submissions([], {}, jobs, {}, {}, {}, NOW), {MEDIUM: 1})
-        probe = allocation(1, "PENDING")
-        by_name = registrations(registration(probe, False))
-        self.assertEqual(
-            plan_submissions([probe], by_name, jobs, {}, {}, {}, NOW), {MEDIUM: 0}
+            plan_submissions(
+                [passed_over], by_name, just_waiting, records, {}, [], NOW, NOW
+            ),
+            [],
         )
 
     def test_runners_submitted_earlier_this_cycle_count_as_able_to_take_a_job(self):
         jobs = demand(waiting(10))
-        proven = {MEDIUM: LabelBreaker(NOW - 60, ())}
+        records = usable_on("thor-slurm1", MEDIUM)
+        earlier = [Submission(MEDIUM, frozenset())] * 4
         self.assertEqual(
-            plan_submissions([], {}, jobs, proven, {}, {MEDIUM: 4}, NOW), {MEDIUM: 6}
-        )
-        # An unproven label's one runner went out earlier this cycle: no second one
-        self.assertEqual(
-            plan_submissions([], {}, jobs, {}, {}, {MEDIUM: 1}, NOW), {MEDIUM: 0}
+            unpinned_counts(
+                plan_submissions([], {}, jobs, records, {}, earlier, NOW, NOW)
+            ),
+            {MEDIUM: 6},
         )
 
     def test_no_waiting_jobs_no_runners(self):
-        self.assertEqual(plan_submissions([], {}, demand(), {}, {}, {}, NOW), {})
+        records = usable_on("thor-slurm1", MEDIUM)
+        self.assertEqual(
+            plan_submissions([], {}, demand(), records, {}, [], NOW, NOW), []
+        )
 
 
 class BusyRunnerCoversItsJobTest(unittest.TestCase):
     """GitHub marks a runner busy at the offer, before the job stops saying queued and names it."""
 
-    proven = {MEDIUM: LabelBreaker(NOW - 3600, ()), SMALL: LabelBreaker(NOW - 3600, ())}
+    records = usable_on("thor-slurm1", MEDIUM, SMALL)
 
     def taking(self, slurm_job_id=1, state="RUNNING", size_label=MEDIUM):
         """One of our runners, busy with a job that may still say queued."""
@@ -558,8 +483,10 @@ class BusyRunnerCoversItsJobTest(unittest.TestCase):
         taking = runners_taking_a_job_by_label(
             allocations, by_name, sightings, jobs, now
         )
-        return plan_submissions(
-            allocations, by_name, jobs, self.proven, taking, {}, now
+        return unpinned_counts(
+            plan_submissions(
+                allocations, by_name, jobs, self.records, taking, [], now, now
+            )
         )
 
     def test_inside_the_gap_nothing_extra_is_submitted(self):
@@ -568,7 +495,7 @@ class BusyRunnerCoversItsJobTest(unittest.TestCase):
         sightings = update_sightings(NO_SIGHTINGS, [of], by_name, NO_DEMAND, NOW - 10)
         # Its own job, still queued and naming no runner
         jobs = demand(waiting(1))
-        self.assertEqual(self.plan([of], by_name, jobs, sightings), {MEDIUM: 0})
+        self.assertEqual(self.plan([of], by_name, jobs, sightings), {})
         self.assertEqual(
             self.plan([of], by_name, demand(waiting(3)), sightings), {MEDIUM: 2}
         )
@@ -578,9 +505,7 @@ class BusyRunnerCoversItsJobTest(unittest.TestCase):
         by_name = registrations(reg)
         sightings = update_sightings(NO_SIGHTINGS, [of], by_name, NO_DEMAND, NOW)
         jobs = demand(waiting(1))
-        self.assertEqual(
-            self.plan([of], by_name, jobs, sightings, NOW + T - 1), {MEDIUM: 0}
-        )
+        self.assertEqual(self.plan([of], by_name, jobs, sightings, NOW + T - 1), {})
         self.assertEqual(
             self.plan([of], by_name, jobs, sightings, NOW + T), {MEDIUM: 1}
         )
@@ -618,24 +543,22 @@ class BusyRunnerCoversItsJobTest(unittest.TestCase):
         jobs = demand(waiting(1))
         self.assertEqual(self.plan([of], by_name, jobs, NO_SIGHTINGS), {MEDIUM: 1})
         sightings = update_sightings(NO_SIGHTINGS, [of], by_name, NO_DEMAND, NOW)
-        self.assertEqual(self.plan([of], by_name, jobs, sightings), {MEDIUM: 0})
+        self.assertEqual(self.plan([of], by_name, jobs, sightings), {})
 
     def test_it_covers_only_jobs_of_its_size_and_never_below_zero(self):
         three = [self.taking(i)[0] for i in (1, 2, 3)]
         by_name = registrations(*(registration(each, is_busy=True) for each in three))
         sightings = update_sightings(NO_SIGHTINGS, three, by_name, NO_DEMAND, NOW)
         jobs = demand(waiting(1) + waiting(2, SMALL))
-        self.assertEqual(
-            self.plan(three, by_name, jobs, sightings), {MEDIUM: 0, SMALL: 2}
-        )
+        self.assertEqual(self.plan(three, by_name, jobs, sightings), {SMALL: 2})
         self.assertEqual(
             jobs_left_waiting_by_label(jobs, {MEDIUM: 3}), {MEDIUM: 0, SMALL: 2}
         )
 
     def test_an_idle_runner_beside_a_covered_job_is_not_a_failed_launch(self):
         # R took the job K is waiting for; I1 and I2, submitted after R, are online and idle
-        r = allocation(1, age_s=3 * B)
-        idle = [allocation(i, age_s=2 * B + 10) for i in (2, 3)]
+        r = on("thor-slurm1", allocation(1, age_s=3 * B))
+        idle = [on("thor-slurm1", allocation(i, age_s=2 * B + 10)) for i in (2, 3)]
         by_name = registrations(
             registration(r, is_busy=True), *(registration(each) for each in idle)
         )
@@ -646,14 +569,17 @@ class BusyRunnerCoversItsJobTest(unittest.TestCase):
         k = demand(waiting(1, waited_s=B + 5))
         taking = runners_taking_a_job_by_label(allocations, by_name, sightings, k, NOW)
         self.assertEqual(taking, {MEDIUM: 1})
-        breakers = update_breakers(self.proven, allocations, by_name, k, taking, NOW)
-        self.assertEqual(breakers[MEDIUM], LabelBreaker(r.submitted_at, ()))
+        records = file_launch_evidence(
+            NO_LAUNCH_RECORDS, allocations, by_name, k, taking, NOW, NOW
+        )
+        self.assertEqual(nodes_out(records, MEDIUM), set())
+        self.assertTrue(size_usable_somewhere(records, MEDIUM))
         # A second job past B is not covered: then GitHub is passing over the idle runners
         k_and_another = demand(waiting(2, waited_s=B + 5))
-        breakers = update_breakers(
-            self.proven, allocations, by_name, k_and_another, taking, NOW
+        records = file_launch_evidence(
+            NO_LAUNCH_RECORDS, allocations, by_name, k_and_another, taking, NOW, NOW
         )
-        self.assertFalse(is_proven(breakers[MEDIUM]))
+        self.assertEqual(nodes_out(records, MEDIUM), {"thor-slurm1"})
 
     def test_sightings_keep_only_runners_squeue_still_shows(self):
         of, reg = self.taking()
@@ -675,48 +601,6 @@ class BusyRunnerCoversItsJobTest(unittest.TestCase):
                 frozenset({of.runner_name}),
                 frozenset({of.runner_name}),
             ),
-        )
-
-
-class NarrowedExclusionsTest(unittest.TestCase):
-    def test_only_waiting_unpinned_runners_and_never_a_node_added(self):
-        def pending(slurm_job_id, excluded, **changes):
-            return replace(
-                allocation(slurm_job_id, "PENDING"),
-                excluded_nodes=None if excluded is None else frozenset(excluded),
-                **changes,
-            )
-
-        trpro = {"trpro-slurm1", "trpro-slurm2"}
-        allowed_back = pending(1, trpro)
-        also_allowed_back = pending(2, {"trpro-slurm2"})
-        unchanged = pending(3, {"trpro-slurm1"})
-        small = pending(4, trpro, size_label=SMALL)
-        pinned = pending(5, set(), pinned_node="trpro-slurm1")
-        held = pending(6, trpro, is_held=True)
-        running = replace(allocation(7), excluded_nodes=frozenset(trpro))
-        unreadable = pending(8, None)
-        groups = narrowed_exclusions(
-            [
-                allowed_back,
-                also_allowed_back,
-                unchanged,
-                small,
-                pinned,
-                held,
-                running,
-                unreadable,
-            ],
-            # A new medium runner would exclude trpro-slurm1 and thor-slurm1; a small one nothing
-            {MEDIUM: frozenset({"trpro-slurm1", "thor-slurm1"})},
-        )
-        # Grouped by new exclusion: one scontrol call each
-        self.assertEqual(
-            groups,
-            {
-                frozenset({"trpro-slurm1"}): [allowed_back],
-                frozenset(): [also_allowed_back, small],
-            },
         )
 
 
@@ -760,7 +644,7 @@ class RegistrationsToDeleteTest(unittest.TestCase):
         self.assertEqual(registrations_to_delete([of], {}, NO_SIGHTINGS), [])
 
     def test_a_deleted_registration_changes_nothing_else_about_an_ended_runner(self):
-        # The breaker reads Slurm's end state, the phase is ENDED, and an ended runner covers nothing
+        # Evidence reads Slurm's end state, the phase is ENDED, and an ended runner covers nothing
         for state in sorted(FINISHED_STATES):
             with self.subTest(state):
                 of = ended(1, state)
@@ -771,197 +655,713 @@ class RegistrationsToDeleteTest(unittest.TestCase):
                     launch_evidence(of, None, set(), 1, NOW),
                 )
                 self.assertEqual(
-                    update_breakers({}, [of], listed, NO_DEMAND, {}, NOW),
-                    update_breakers({}, [of], deleted, NO_DEMAND, {}, NOW),
+                    file_launch_evidence(
+                        NO_LAUNCH_RECORDS, [of], listed, NO_DEMAND, {}, NOW, NOW
+                    ),
+                    file_launch_evidence(
+                        NO_LAUNCH_RECORDS, [of], deleted, NO_DEMAND, {}, NOW, NOW
+                    ),
                 )
                 self.assertIs(phase_of_allocation(of, reg, NOW), Phase.ENDED)
                 self.assertIs(phase_of_allocation(of, None, NOW), Phase.ENDED)
                 jobs = demand(waiting(1))
                 self.assertEqual(
-                    plan_submissions([of], listed, jobs, {}, {}, {}, NOW),
-                    plan_submissions([of], deleted, jobs, {}, {}, {}, NOW),
+                    plan_submissions(
+                        [of], listed, jobs, NO_LAUNCH_RECORDS, {}, [], NOW, NOW
+                    ),
+                    plan_submissions(
+                        [of], deleted, jobs, NO_LAUNCH_RECORDS, {}, [], NOW, NOW
+                    ),
                 )
 
 
-class SubmissionOrderTest(unittest.TestCase):
-    def test_labels_take_turns(self):
-        self.assertEqual(
-            submission_order({"a": 3, "b": 1, "c": 2, "d": 0}),
-            ["a", "b", "c", "a", "c", "a"],
+def out_on(records, node, size_label, seen_at=NOW, failed_retries=0, slurm_job_id=99):
+    """records with node out for the size since seen_at, the failure that put it out seen then."""
+    record = NodeRecord(
+        newest_failure_submitted_at=seen_at - 30,
+        newest_failure_slurm_job_id=slurm_job_id,
+        newest_failure_seen_at=seen_at,
+        out_since=seen_at,
+        failed_retries=failed_retries,
+    )
+    return replace(
+        records,
+        by_node_and_size={**records.by_node_and_size, (node, size_label): record},
+    )
+
+
+def pinned_to(node, of, **changes):
+    """A runner submitted with --nodes=1 --nodelist=node."""
+    return replace(of, pinned_node=node, **changes)
+
+
+class SeenAtTest(unittest.TestCase):
+    """What squeue and the runners list showed is judged at the time they were read, not at the later time a
+    run is planned: a runner offline at the read and younger than B is booting, however long the cycle."""
+
+    def test_a_runner_booting_when_the_list_was_read_is_still_booting_later_in_the_cycle(
+        self,
+    ):
+        booting = on("thor-slurm1", allocation(1, age_s=B - 20))
+        offline = registration(booting, False)
+        records = usable_on("thor-slurm1", MEDIUM)
+        later = NOW + 40  # it would be B + 20 old now
+        filed_later = file_launch_evidence(
+            records,
+            [booting],
+            registrations(offline),
+            demand(waiting(1)),
+            {},
+            cycle_started_at=NOW,
+            seen_at=later,
         )
-        self.assertEqual(submission_order({}), [])
-
-
-class BreakerLogLinesTest(unittest.TestCase):
-    def test_one_line_per_label_that_changed(self):
-        before = {MEDIUM: LabelBreaker(NOW - 60, ()), SMALL: UNPROVEN}
-        after = {
-            MEDIUM: LabelBreaker(
-                NOW - 60, (failure(11, NOW - 30, NOW - 5), failure(12, NOW - 20, NOW))
-            ),
-            SMALL: UNPROVEN,
-            "slurm-runner-large": LabelBreaker(NOW - 10, ()),
-        }
+        self.assertEqual(filed_later, records)
         self.assertEqual(
-            breaker_log_lines(before, after),
+            plan_submissions(
+                [booting],
+                registrations(offline),
+                demand(waiting(1)),
+                records,
+                {},
+                [],
+                planned_at=later,
+                cycle_started_at=NOW,
+            ),
+            [],
+        )
+        # Judged at the later time it would be a failed launch, and the size usable nowhere
+        judged_later = file_launch_evidence(
+            records,
+            [booting],
+            registrations(offline),
+            demand(waiting(1)),
+            {},
+            later,
+            later,
+        )
+        self.assertEqual(nodes_out(judged_later, MEDIUM), {"thor-slurm1"})
+
+    def test_a_job_created_after_the_list_was_read_shows_no_runner_was_passed_over(
+        self,
+    ):
+        idle = on("thor-slurm1", allocation(1, age_s=2 * B + 10))
+        records = usable_on("thor-slurm1", MEDIUM)
+        # Waited past B by the time its run is read, but it did not exist when the runner was seen idle
+        newer = demand([WaitingJob(1, MEDIUM, NOW + 5)])
+        filed_later = file_launch_evidence(
+            records,
+            [idle],
+            registrations(registration(idle)),
+            newer,
+            {},
+            cycle_started_at=NOW,
+            seen_at=NOW + B + 10,
+        )
+        self.assertEqual(filed_later, records)
+
+
+class RuleOneNewestRunnerDecidesTest(unittest.TestCase):
+    """1. A size is not sent to a node where its newest runner failed to launch. It is used there again as
+    soon as a runner of that size takes a job there."""
+
+    def test_a_failure_puts_the_node_out_and_a_newer_success_brings_it_back(self):
+        first = on("trpro-slurm1", ended(1, "FAILED", submitted_at=NOW - 100))
+        records = filed(NO_LAUNCH_RECORDS, (first, None))
+        self.assertEqual(nodes_out(records, MEDIUM), {"trpro-slurm1"})
+        newer = on("trpro-slurm1", allocation(2, submitted_at=NOW - 50))
+        busy = registration(newer, is_busy=True)
+        records = filed(records, (first, None), (newer, busy), now=NOW + 5)
+        self.assertEqual(nodes_out(records, MEDIUM), set())
+        self.assertTrue(size_usable_somewhere(records, MEDIUM))
+
+    def test_a_runner_counted_as_failed_that_later_takes_a_job_clears_its_own_node(
+        self,
+    ):
+        slow = on("trpro-slurm2", allocation(1, age_s=B + 5))
+        records = filed(NO_LAUNCH_RECORDS, (slow, registration(slow, False)))
+        self.assertEqual(nodes_out(records, MEDIUM), {"trpro-slurm2"})
+        records = filed(records, (slow, registration(slow, is_busy=True)), now=NOW + 60)
+        self.assertEqual(nodes_out(records, MEDIUM), set())
+
+    def test_evidence_from_an_older_runner_changes_nothing(self):
+        older = on("trpro-slurm1", allocation(1, submitted_at=NOW - 200))
+        newer = on("trpro-slurm1", ended(2, "FAILED", submitted_at=NOW - 100))
+        records = filed(NO_LAUNCH_RECORDS, (newer, None))
+        # Took a job, but submitted before the newest failure there
+        records = filed(records, (older, registration(older, is_busy=True)))
+        self.assertEqual(nodes_out(records, MEDIUM), {"trpro-slurm1"})
+        # And a failure older than the newest success leaves a usable node usable
+        usable = filed(NO_LAUNCH_RECORDS, (newer, None), (older, None))
+        later = on("trpro-slurm1", allocation(3, submitted_at=NOW - 10))
+        usable = filed(usable, (later, registration(later, is_busy=True)))
+        self.assertEqual(filed(usable, (newer, None)), usable)
+
+    def test_a_failure_older_than_the_newest_success_seen_late_changes_nothing(self):
+        first = on("trpro-slurm1", ended(1, "FAILED", submitted_at=NOW - 300))
+        records = filed(NO_LAUNCH_RECORDS, (first, None), now=NOW - 280)
+        third = on("trpro-slurm1", allocation(3, submitted_at=NOW - 100))
+        records = filed(
+            records, (third, registration(third, is_busy=True)), now=NOW - 90
+        )
+        # Submitted between the two, its hang at B is seen only now
+        second = on("trpro-slurm1", allocation(2, submitted_at=NOW - 200, age_s=B + 5))
+        late = filed(records, (second, registration(second, False)))
+        self.assertEqual(late, records)
+        self.assertEqual(nodes_out(late, MEDIUM), set())
+
+    def test_the_same_failure_seen_on_many_cycles_is_one_event(self):
+        failed = on("trpro-slurm1", ended(1, "FAILED"))
+        once = filed(NO_LAUNCH_RECORDS, (failed, None))
+        self.assertEqual(filed(once, (failed, None), now=NOW + 200), once)
+
+    def test_sizes_are_kept_apart(self):
+        failed = on("trpro-slurm1", ended(1, "FAILED"))
+        records = filed(usable_on("trpro-slurm1", MEDIUM, SMALL), (failed, None))
+        self.assertEqual(nodes_out(records, MEDIUM), {"trpro-slurm1"})
+        self.assertEqual(nodes_out(records, SMALL), set())
+
+    def test_unpinned_runners_exclude_every_node_out_for_the_size(self):
+        records = usable_on("thor-slurm1", MEDIUM, SMALL)
+        records = out_on(records, "trpro-slurm1", MEDIUM, seen_at=NOW - 10)
+        # Its wait has passed: still excluded, its retry is a pinned runner
+        records = out_on(records, "trpro-slurm2", MEDIUM, seen_at=NOW - 600)
+        jobs = demand(waiting(2) + waiting(1, SMALL))
+        submissions = plan_submissions([], {}, jobs, records, {}, [], NOW, NOW)
+        trpro = frozenset({"trpro-slurm1", "trpro-slurm2"})
+        self.assertEqual(
+            submissions,
             [
-                "slurm-runner-large: proven, 0 failures in a row",
-                f"{MEDIUM}: unproven, 2 failures in a row (newest: Slurm job 12);"
-                " one runner at a time, the next 60 s after the newest failure",
+                # trpro-slurm2's retry takes medium's first turn
+                Submission(MEDIUM, frozenset(), "trpro-slurm2"),
+                Submission(SMALL, frozenset()),
+                Submission(MEDIUM, trpro),
+                Submission(MEDIUM, trpro),
             ],
         )
-        self.assertEqual(breaker_log_lines(after, after), [])
 
-    def test_a_failure_past_the_remembered_count_still_logs(self):
-        full = tuple(
-            failure(i, NOW - 100 + i, NOW - 100 + i) for i in range(FAILURES_REMEMBERED)
-        )
-        before = {MEDIUM: LabelBreaker(NOW - 3600, full)}
-        after = {MEDIUM: LabelBreaker(NOW - 3600, full[1:] + (failure(99, NOW),))}
-        [line] = breaker_log_lines(before, after)
-        self.assertIn(f"{FAILURES_REMEMBERED} or more failures in a row", line)
-        self.assertIn("Slurm job 99", line)
 
-    def test_a_proven_label_whose_newest_success_advances_logs_nothing(self):
-        before = {MEDIUM: LabelBreaker(NOW - 60, ())}
-        after = {MEDIUM: LabelBreaker(NOW - 5, ())}
-        self.assertEqual(breaker_log_lines(before, after), [])
-        one_failure = {MEDIUM: LabelBreaker(NOW - 5, (failure(3, NOW - 1),))}
+class RuleTwoPinnedRetryTest(unittest.TestCase):
+    """2. Such a node is tried again with one extra runner pinned to it, 1 minute after the failure, then 2,
+    4, 8 and at most 10 minutes after each further failure there, while a job of that size waits."""
+
+    def test_the_wait_doubles_per_failed_retry_up_to_ten_minutes(self):
         self.assertEqual(
-            breaker_log_lines(after, one_failure),
-            [f"{MEDIUM}: proven, 1 failure in a row (newest: Slurm job 3)"],
+            [retry_wait_s(retries) for retries in range(6)],
+            [60, 120, 240, 480, 600, 600],
         )
+        self.assertEqual((FIRST_RETRY_WAIT_S, MAX_RETRY_WAIT_S), (60, 600))
 
+    def test_runners_in_flight_when_it_went_out_restart_the_wait_but_never_double(self):
+        first = on("trpro-slurm1", ended(1, "FAILED", submitted_at=NOW - 100))
+        in_flight = on("trpro-slurm1", ended(2, "FAILED", submitted_at=NOW - 90))
+        records = filed(NO_LAUNCH_RECORDS, (first, None))
+        records = filed(records, (first, None), (in_flight, None), now=NOW + 30)
+        record = records.by_node_and_size[("trpro-slurm1", MEDIUM)]
+        self.assertEqual((record.out_since, record.failed_retries), (NOW, 0))
+        self.assertEqual(node_retry_due_at(record), NOW + 30 + 60)
 
-class BreakerLifeTest(unittest.TestCase):
-    """One size label through its whole life, a cycle at a time, as main.run_cycle drives it."""
-
-    def setUp(self):
-        self.breakers = {}
-        self.next_slurm_job_id = 1
-
-    def cycle(self, now, allocations, by_name, jobs):
-        self.breakers = update_breakers(
-            self.breakers, allocations, by_name, jobs, {}, now
+    def test_a_runner_submitted_before_the_failure_was_seen_is_in_flight_not_a_retry(
+        self,
+    ):
+        # The cycle started at NOW; a runner went out at NOW + 5, and the failure was filed at NOW + 20
+        first = on("trpro-slurm1", ended(1, "FAILED", submitted_at=NOW - 100))
+        records = filed(NO_LAUNCH_RECORDS, (first, None), now=NOW + 20)
+        same_cycle = on(
+            "trpro-slurm1", ended(2, "FAILED", submitted_at=NOW + 5, now=NOW + 50)
         )
-        return plan_submissions(allocations, by_name, jobs, self.breakers, {}, {}, now)[
-            MEDIUM
-        ]
-
-    def submit(self, now):
-        slurm_job_id = self.next_slurm_job_id
-        self.next_slurm_job_id += 1
-        return Allocation(
-            slurm_job_id,
-            f"gha-test-{slurm_job_id}",
-            MEDIUM,
-            "PENDING",
-            False,
-            now,
-            None,
-            None,
-        )
-
-    def test_unproven_proven_tolerant_open_doubling_and_cleared(self):
-        t = NOW
-        wave = demand(waiting(10, waited_s=5))
-        # A restart or a first start: unproven, so one runner, and none while it can take a job
-        self.assertEqual(self.cycle(t, [], {}, wave), 1)
-        probe = self.submit(t)
+        records = filed(records, (same_cycle, None), now=NOW + 50)
         self.assertEqual(
-            self.cycle(t + 5, [probe], registrations(registration(probe, False)), wave),
-            0,
+            records.by_node_and_size[("trpro-slurm1", MEDIUM)].failed_retries, 0
         )
 
-        # The probe takes a job: proven, and the rest of the wave goes out at once
-        t += 30
-        probe = Allocation(
-            probe.slurm_job_id,
-            probe.runner_name,
-            MEDIUM,
-            "RUNNING",
-            False,
-            probe.submitted_at,
-            t - 20,
-            None,
+    def test_a_failed_retry_doubles_the_wait_and_a_success_resets_it(self):
+        first = on("trpro-slurm1", ended(1, "FAILED", submitted_at=NOW - 100))
+        records = filed(NO_LAUNCH_RECORDS, (first, None))
+        retry = on(
+            "trpro-slurm1", ended(2, "FAILED", submitted_at=NOW + 60, now=NOW + 90)
         )
-        nine = demand(waiting(9, waited_s=35), [probe.runner_name])
+        records = filed(records, (retry, None), now=NOW + 90)
+        record = records.by_node_and_size[("trpro-slurm1", MEDIUM)]
+        self.assertEqual(record.failed_retries, 1)
+        self.assertEqual(node_retry_due_at(record), NOW + 90 + 120)
+        took = on("trpro-slurm1", allocation(3, submitted_at=NOW + 210))
+        records = filed(
+            records, (took, registration(took, is_busy=True)), now=NOW + 230
+        )
+        record = records.by_node_and_size[("trpro-slurm1", MEDIUM)]
+        self.assertEqual((record.out_since, record.failed_retries), (None, 0))
+
+    def test_one_pinned_runner_per_node_due_while_a_job_waits(self):
+        records = usable_on("thor-slurm1", MEDIUM)
+        records = out_on(records, "trpro-slurm1", MEDIUM, seen_at=NOW - 60)
+        records = out_on(records, "trpro-slurm2", MEDIUM, seen_at=NOW - 59)
+        submissions = plan_submissions(
+            [], {}, demand(waiting(2)), records, {}, [], NOW, NOW
+        )
+        excluded = frozenset({"trpro-slurm1", "trpro-slurm2"})
+        # Pinned first, and extra: the two waiting jobs still get two unpinned runners
         self.assertEqual(
-            self.cycle(
-                t, [probe], registrations(registration(probe, True, True)), nine
+            submissions,
+            [
+                Submission(MEDIUM, frozenset(), "trpro-slurm1"),
+                Submission(MEDIUM, excluded),
+                Submission(MEDIUM, excluded),
+            ],
+        )
+        self.assertEqual(
+            plan_submissions([], {}, demand(), records, {}, [], NOW, NOW), []
+        )
+
+    def test_no_second_pinned_runner_while_one_can_still_take_a_job(self):
+        records = usable_on("thor-slurm1", MEDIUM)
+        records = out_on(records, "trpro-slurm1", MEDIUM, seen_at=NOW - 600)
+        excluded = frozenset({"trpro-slurm1"})
+        jobs = demand(waiting(1))
+        # Pending on that node (it may be drained): in flight, and never supply
+        waiting_pin = pinned_to("trpro-slurm1", allocation(1, "PENDING"))
+        by_name = registrations(registration(waiting_pin, False))
+        self.assertEqual(
+            plan_submissions([waiting_pin], by_name, jobs, records, {}, [], NOW, NOW),
+            [Submission(MEDIUM, excluded)],
+        )
+        # Sent earlier this cycle
+        sent = [Submission(MEDIUM, frozenset(), "trpro-slurm1")]
+        self.assertEqual(
+            plan_submissions([], {}, jobs, records, {}, sent, NOW, NOW),
+            [Submission(MEDIUM, excluded)],
+        )
+        # A pinned runner of another size is no retry of this one
+        small_pin = pinned_to(
+            "trpro-slurm1", allocation(3, "PENDING", size_label=SMALL)
+        )
+        by_name = registrations(registration(small_pin, False))
+        self.assertIn(
+            Submission(MEDIUM, frozenset(), "trpro-slurm1"),
+            plan_submissions([small_pin], by_name, jobs, records, {}, [], NOW, NOW),
+        )
+        # One that failed is a failed retry, not in flight
+        hung = pinned_to("trpro-slurm1", allocation(2, age_s=B + 1))
+        by_name = registrations(registration(hung, False))
+        self.assertIn(
+            Submission(MEDIUM, frozenset(), "trpro-slurm1"),
+            plan_submissions([hung], by_name, jobs, records, {}, [], NOW, NOW),
+        )
+
+
+class RuleThreeUsableNowhereTest(unittest.TestCase):
+    """3. A size with no node where it is known to work (after a restart, or when it fails everywhere) gets
+    one runner at a time."""
+
+    def test_after_a_restart_one_unpinned_runner_at_a_time(self):
+        jobs = demand(waiting(10))
+        self.assertEqual(
+            plan_submissions([], {}, jobs, NO_LAUNCH_RECORDS, {}, [], NOW, NOW),
+            [Submission(MEDIUM, frozenset())],
+        )
+        first = allocation(1, "PENDING")
+        by_name = registrations(registration(first, False))
+        self.assertEqual(
+            plan_submissions(
+                [first], by_name, jobs, NO_LAUNCH_RECORDS, {}, [], NOW, NOW
             ),
-            9,
+            [],
         )
-        self.assertTrue(is_proven(self.breakers[MEDIUM]))
+        sent = [Submission(MEDIUM, frozenset())]
+        self.assertEqual(
+            plan_submissions([], {}, jobs, NO_LAUNCH_RECORDS, {}, sent, NOW, NOW), []
+        )
 
-        # One failure is tolerated: one slow node does not hold back the wave
-        t += 30
-        first = ended(101, "FAILED", submitted_at=t - 40, now=t)
-        self.assertEqual(self.cycle(t, [first], {}, nine), 9)
-        self.assertTrue(is_proven(self.breakers[MEDIUM]))
+    def test_a_pinned_runner_does_not_hold_back_the_one_runner(self):
+        # Left from when the size was usable somewhere, pending on a drained node for up to a day
+        stuck = pinned_to("trpro-slurm1", allocation(1, "PENDING"))
+        records = out_on(NO_LAUNCH_RECORDS, "trpro-slurm1", MEDIUM, seen_at=NOW - 30)
+        by_name = registrations(registration(stuck, False))
+        self.assertEqual(
+            plan_submissions(
+                [stuck], by_name, demand(waiting(3)), records, {}, [], NOW, NOW
+            ),
+            [Submission(MEDIUM, frozenset({"trpro-slurm1"}))],
+        )
 
-        # A second in a row opens the breaker: one runner at a time, after 60 s
-        t += 30
-        second = ended(102, "FAILED", submitted_at=t - 40, now=t)
-        self.assertEqual(self.cycle(t, [first, second], {}, nine), 0)
-        self.assertFalse(is_proven(self.breakers[MEDIUM]))
-        self.assertEqual(self.cycle(t + 59, [first, second], {}, nine), 0)
-        self.assertEqual(self.cycle(t + 60, [first, second], {}, nine), 1)
+    def test_failing_everywhere_its_one_runner_is_the_retry_of_a_node_due(self):
+        records = out_on(NO_LAUNCH_RECORDS, "trpro-slurm1", MEDIUM, seen_at=NOW - 30)
+        records = out_on(records, "thor-slurm1", MEDIUM, seen_at=NOW - 60)
+        self.assertFalse(size_usable_somewhere(records, MEDIUM))
+        # thor-slurm1's wait has passed: allowed, and no pinned runner to it
+        self.assertEqual(
+            plan_submissions([], {}, demand(waiting(5)), records, {}, [], NOW, NOW),
+            [Submission(MEDIUM, frozenset({"trpro-slurm1"}))],
+        )
 
-        # Each further failure doubles the wait, up to the cap
-        for slurm_job_id, wait_s in (
-            (103, 120),
-            (104, 240),
-            (105, 480),
-            (106, 600),
-            (107, 600),
-        ):
-            t += 1000
-            failed = ended(slurm_job_id, "FAILED", submitted_at=t - 40, now=t)
-            self.assertEqual(self.cycle(t, [failed], {}, nine), 0)
-            self.assertEqual(self.cycle(t + wait_s - 1, [failed], {}, nine), 0)
-            self.assertEqual(self.cycle(t + wait_s, [failed], {}, nine), 1)
+    def test_the_first_squeue_after_a_restart_restores_what_it_can(self):
+        busy = on("thor-slurm1", allocation(1))
+        failed = on("trpro-slurm1", ended(2, "FAILED"))
+        records = filed(
+            NO_LAUNCH_RECORDS, (busy, registration(busy, is_busy=True)), (failed, None)
+        )
+        self.assertTrue(size_usable_somewhere(records, MEDIUM))
+        self.assertEqual(nodes_out(records, MEDIUM), {"trpro-slurm1"})
+        self.assertFalse(size_usable_somewhere(records, SMALL))
 
-        # An old runner taking a job says nothing about now: evidence is ordered by submit time
-        t += 30
-        old = Allocation(
-            50, "gha-test-50", MEDIUM, "RUNNING", False, NOW - 100, NOW - 90, None
+
+class RuleFourNarrowedExclusionsTest(unittest.TestCase):
+    """4. A runner still waiting in Slurm's queue is never left excluding a node that a new runner of its
+    size would now be allowed on."""
+
+    def pending(self, slurm_job_id, excluded, **changes):
+        return replace(
+            allocation(slurm_job_id, "PENDING"),
+            excluded_nodes=frozenset(excluded),
+            **changes,
+        )
+
+    def test_only_waiting_unpinned_runners_and_never_a_node_added(self):
+        trpro = {"trpro-slurm1", "trpro-slurm2"}
+        allowed_back = self.pending(1, trpro)
+        unchanged = self.pending(2, {"trpro-slurm1"})
+        small = self.pending(3, trpro, size_label=SMALL)
+        pinned = self.pending(4, trpro, pinned_node="tr-slurm2")
+        held = self.pending(5, trpro, is_held=True)
+        running = replace(allocation(6), excluded_nodes=frozenset(trpro))
+        none_yet = self.pending(7, set())
+        # A new medium runner would exclude trpro-slurm1 and thor-slurm1; a small one nothing
+        records = usable_on("delta-slurm1", MEDIUM, SMALL)
+        records = out_on(records, "trpro-slurm1", MEDIUM)
+        records = out_on(records, "thor-slurm1", MEDIUM)
+        unreadable = self.pending(8, set())
+        unreadable = replace(unreadable, excluded_nodes=None)
+        # Grouped by new exclusion: one scontrol call each
+        self.assertEqual(
+            narrowed_exclusions(
+                [
+                    allowed_back,
+                    unchanged,
+                    small,
+                    pinned,
+                    held,
+                    running,
+                    none_yet,
+                    unreadable,
+                ],
+                records,
+                NOW,
+            ),
+            {frozenset({"trpro-slurm1"}): [allowed_back], frozenset(): [small]},
+        )
+
+    def test_a_size_usable_nowhere_releases_its_runner_as_waits_pass(self):
+        # After a fault on every node its one waiting runner excluded them all; it would never start
+        everything = {"delta-slurm1", "thor-slurm1", "trpro-slurm1"}
+        stuck = self.pending(1, everything)
+        records = NO_LAUNCH_RECORDS
+        for node, seen_at in (("delta-slurm1", NOW - 60), ("thor-slurm1", NOW - 10)):
+            records = out_on(records, node, MEDIUM, seen_at=seen_at)
+        self.assertEqual(
+            narrowed_exclusions([stuck], records, NOW),
+            {frozenset({"thor-slurm1"}): [stuck]},
+        )
+
+
+class RuleFiveNodelessFailuresTest(unittest.TestCase):
+    """5. A failure that belongs to no node (Slurm refused the submission, or the failed job shows no node)
+    counts against the size: its next runner waits 1, 2, 4, 8, at most 10 minutes."""
+
+    def nodeless(self, slurm_job_id, submitted_at):
+        """Ran and failed, and squeue shows no node (not seen yet under --no-requeue)."""
+        return ended(slurm_job_id, "FAILED", submitted_at=submitted_at)
+
+    def test_a_failed_job_with_no_node_makes_its_size_wait(self):
+        records = usable_on("thor-slurm1", MEDIUM)
+        records = filed(records, (self.nodeless(1, NOW - 100), None))
+        self.assertFalse(size_usable_somewhere(records, MEDIUM))
+        self.assertEqual(nodes_out(records, MEDIUM), set())
+        jobs = demand(waiting(4))
+        self.assertEqual(
+            plan_submissions([], {}, jobs, records, {}, [], NOW + 59, NOW + 59), []
         )
         self.assertEqual(
-            self.cycle(t, [old], registrations(registration(old, True, True)), nine), 0
+            plan_submissions([], {}, jobs, records, {}, [], NOW + 60, NOW + 60),
+            [Submission(MEDIUM, frozenset())],
         )
-        self.assertFalse(is_proven(self.breakers[MEDIUM]))
 
-        # A runner submitted after the failures takes a job: the breaker closes
-        t += 30
-        newer = Allocation(
-            200, "gha-test-200", MEDIUM, "RUNNING", False, t - 20, t - 15, None
+    def test_the_wait_doubles_only_for_a_runner_submitted_after_the_last_was_seen(self):
+        records = filed(NO_LAUNCH_RECORDS, (self.nodeless(1, NOW - 100), None))
+        in_flight = self.nodeless(2, NOW - 90)
+        records = filed(records, (in_flight, None), now=NOW + 10)
+        self.assertEqual(records.by_size[MEDIUM].nodeless_retries, 0)
+        self.assertEqual(next_unpinned_runner_at(records, MEDIUM), NOW + 70)
+        next_one = self.nodeless(3, NOW + 70)
+        records = filed(records, (next_one, None), now=NOW + 100)
+        self.assertEqual(next_unpinned_runner_at(records, MEDIUM), NOW + 220)
+
+    def test_the_same_failure_seen_on_a_second_pass_does_not_restart_the_wait(self):
+        failed = self.nodeless(1, NOW - 100)
+        records = filed(NO_LAUNCH_RECORDS, (failed, None))
+        self.assertEqual(filed(records, (failed, None), now=NOW + 30), records)
+        self.assertEqual(next_unpinned_runner_at(records, MEDIUM), NOW + 60)
+
+    def test_one_older_than_a_runner_of_its_size_taking_a_job_says_nothing(self):
+        # After a restart: a refusal's FAILED record from before it, and a newer runner busy
+        refused_before = Allocation(
+            1, "gha-test-1", MEDIUM, "FAILED", False, NOW - 90, NOW - 90, NOW - 90
         )
-        eight = demand(waiting(8, waited_s=5), [newer.runner_name])
-        self.assertEqual(self.cycle(t, [newer], {}, eight), 8)
-        self.assertEqual(self.breakers[MEDIUM], LabelBreaker(t - 20, ()))
+        busy = on("thor-slurm1", allocation(2, submitted_at=NOW - 60))
+        records = filed(
+            NO_LAUNCH_RECORDS,
+            (refused_before, None),
+            (busy, registration(busy, is_busy=True)),
+        )
+        self.assertTrue(size_usable_somewhere(records, MEDIUM))
 
-    def test_a_runner_github_leaves_idle_while_a_job_waits_counts_as_a_failure(self):
-        self.breakers = {MEDIUM: LabelBreaker(NOW - 3600, ())}
-        deaf = [
-            allocation(i, age_s=2 * B + 10, submitted_at=NOW - 2 * B - 20 + i)
-            for i in (1, 2)
-        ]
-        by_name = registrations(*(registration(each) for each in deaf))
-        jobs = demand(waiting(5, waited_s=B + 5))
-        # One is tolerated, and no longer counts as a runner on its way: all five jobs get one
-        self.assertEqual(self.cycle(NOW, deaf[:1], by_name, jobs), 5)
-        self.assertTrue(is_proven(self.breakers[MEDIUM]))
-        # Two in a row open the breaker
-        self.breakers = {MEDIUM: LabelBreaker(NOW - 3600, ())}
-        self.assertEqual(self.cycle(NOW, deaf, by_name, jobs), 0)
-        self.assertFalse(is_proven(self.breakers[MEDIUM]))
-        self.assertEqual(len(self.breakers[MEDIUM].failures_since_success), 2)
-        self.assertEqual(self.cycle(NOW + FIRST_PROBE_WAIT_S, deaf, by_name, jobs), 1)
-        # With no job waiting longer than B, idle runners are surplus and say nothing
-        self.breakers = {MEDIUM: LabelBreaker(NOW - 3600, ())}
-        self.cycle(NOW, deaf, by_name, demand(waiting(5, waited_s=B)))
-        self.assertTrue(is_proven(self.breakers[MEDIUM]))
+    def test_a_runner_submitted_after_it_was_seen_taking_a_job_clears_it(self):
+        records = filed(
+            usable_on("thor-slurm1", MEDIUM), (self.nodeless(1, NOW - 100), None)
+        )
+        before = on("thor-slurm1", allocation(2, submitted_at=NOW - 1))
+        took = filed(records, (before, registration(before, is_busy=True)))
+        self.assertFalse(size_usable_somewhere(took, MEDIUM))
+        after = on("thor-slurm1", allocation(3, submitted_at=NOW + 1))
+        took = filed(records, (after, registration(after, is_busy=True)), now=NOW + 20)
+        self.assertTrue(size_usable_somewhere(took, MEDIUM))
+        # The old failure, still in squeue, is not counted again
+        self.assertEqual(
+            filed(took, (self.nodeless(1, NOW - 100), None), now=NOW + 30), took
+        )
+
+    def test_the_failed_record_of_a_refused_submission_is_not_counted_again(self):
+        # As job 753319: sbatch refused it, and squeue lists it FAILED with no node for MinJobAge. sbatch
+        # ran 5 s into the pass, so its record is newer than anything the refusal stamped
+        refused = Allocation(
+            1, "gha-test-1", MEDIUM, "FAILED", False, NOW + 5, NOW + 5, NOW + 5
+        )
+        records = record_refused_submission(
+            usable_on("thor-slurm1", MEDIUM),
+            Submission(MEDIUM, frozenset({"trpro-slurm1"})),
+            refused.runner_name,
+            refused_at=NOW,
+        )
+        self.assertEqual(filed(records, (refused, None), now=NOW + 30), records)
+        # Its name is dropped once squeue has purged the record
+        later = NOW + REFUSED_NAMES_KEPT_S
+        self.assertEqual(
+            filed(records, now=later).by_size[MEDIUM].refused_runner_names, {}
+        )
+
+
+class RefusedSubmissionTest(unittest.TestCase):
+    """sbatch failed and squeue shows nothing that could run by the runner's name. Any refusal holds the
+    size usable nowhere until a runner of it submitted after the refusal takes a job."""
+
+    def refuse(self, records, submission, now=NOW):
+        return record_refused_submission(records, submission, "gha-test-x", now)
+
+    def test_with_nothing_excluded_it_is_a_rule_5_failure(self):
+        records = self.refuse(
+            usable_on("thor-slurm1", MEDIUM), Submission(MEDIUM, frozenset())
+        )
+        self.assertFalse(size_usable_somewhere(records, MEDIUM))
+        self.assertEqual(next_unpinned_runner_at(records, MEDIUM), NOW + 60)
+        records = self.refuse(records, Submission(MEDIUM, frozenset()), now=NOW + 60)
+        self.assertEqual(next_unpinned_runner_at(records, MEDIUM), NOW + 180)
+
+    def test_with_nodes_excluded_it_doubles_nothing_and_waits_for_the_earliest(self):
+        records = out_on(NO_LAUNCH_RECORDS, "trpro-slurm1", MEDIUM, seen_at=NOW - 30)
+        records = out_on(records, "thor-slurm1", MEDIUM, seen_at=NOW - 10)
+        submission = Submission(MEDIUM, frozenset({"trpro-slurm1", "thor-slurm1"}))
+        records = self.refuse(records, submission)
+        self.assertEqual(records.by_size[MEDIUM].nodeless_retries, 0)
+        self.assertEqual(next_unpinned_runner_at(records, MEDIUM), NOW + 30)
+        jobs = demand(waiting(1))
+        self.assertEqual(
+            plan_submissions([], {}, jobs, records, {}, [], NOW + 29, NOW + 29), []
+        )
+        # Then it excludes only the node not yet due: a different submission
+        self.assertEqual(
+            plan_submissions([], {}, jobs, records, {}, [], NOW + 30, NOW + 30),
+            [Submission(MEDIUM, frozenset({"thor-slurm1"}))],
+        )
+
+    def test_a_runner_accepted_before_the_refusal_does_not_clear_it(self):
+        # The cycle started at NOW: U1 was accepted at NOW + 5, U2 refused at NOW + 6
+        records = usable_on("thor-slurm1", MEDIUM)
+        records = out_on(records, "trpro-slurm1", MEDIUM, seen_at=NOW - 30)
+        u2 = Submission(MEDIUM, frozenset({"trpro-slurm1"}))
+        records = self.refuse(records, u2, now=NOW + 6)
+        u1 = on("thor-slurm1", allocation(11, submitted_at=NOW + 5))
+        records = filed(records, (u1, registration(u1, is_busy=True)), now=NOW + 30)
+        self.assertFalse(size_usable_somewhere(records, MEDIUM))
+        self.assertEqual(
+            plan_submissions(
+                [], {}, demand(waiting(4)), records, {}, [], NOW + 30, NOW + 30
+            ),
+            [Submission(MEDIUM, frozenset())],
+        )
+
+    def test_a_refused_node_that_is_usable_again_ends_the_wait(self):
+        records = usable_on("tr-slurm2", MEDIUM)
+        records = out_on(records, "trpro-slurm1", MEDIUM, seen_at=NOW - 10)
+        records = out_on(records, "trpro-slurm2", MEDIUM, seen_at=NOW)
+        trpro = frozenset({"trpro-slurm1", "trpro-slurm2"})
+        records = self.refuse(records, Submission(MEDIUM, trpro))
+        self.assertEqual(next_unpinned_runner_at(records, MEDIUM), NOW + 50)
+        # A runner pinned there before the refusal took a job
+        pinned = pinned_to(
+            "trpro-slurm1", on("trpro-slurm1", allocation(1, submitted_at=NOW - 5))
+        )
+        records = filed(records, (pinned, registration(pinned, is_busy=True)))
+        self.assertEqual(next_unpinned_runner_at(records, MEDIUM), 0)
+
+    def test_the_cycle_of_a_refusal_sends_nothing_more_of_the_size(self):
+        records = self.refuse(
+            usable_on("thor-slurm1", MEDIUM), Submission(MEDIUM, frozenset())
+        )
+        records = replace(
+            records,
+            by_size={
+                MEDIUM: replace(records.by_size[MEDIUM], nodeless_failure_seen_at=None)
+            },
+        )
+        self.assertEqual(next_unpinned_runner_at(records, MEDIUM), 0)
+        jobs = demand(waiting(1))
+        # A later run of the same cycle, planned 40 s after the refusal
+        self.assertEqual(
+            plan_submissions(
+                [], {}, jobs, records, {}, [], NOW + 40, cycle_started_at=NOW - 1
+            ),
+            [],
+        )
+        # The next cycle
+        self.assertEqual(
+            len(
+                plan_submissions(
+                    [], {}, jobs, records, {}, [], NOW + 40, cycle_started_at=NOW + 2
+                )
+            ),
+            1,
+        )
+
+    def test_a_refused_pinned_runner_forgets_its_node_and_is_not_rule_5(self):
+        records = usable_on("thor-slurm1", MEDIUM)
+        records = out_on(records, "trpro-slurm1", MEDIUM, seen_at=NOW - 600)
+        pinned = Submission(MEDIUM, frozenset(), "trpro-slurm1")
+        records = self.refuse(records, pinned)
+        self.assertEqual(nodes_out(records, MEDIUM), set())
+        self.assertFalse(size_usable_somewhere(records, MEDIUM))
+        self.assertIsNone(records.by_size[MEDIUM].nodeless_failure_seen_at)
+        self.assertEqual(next_unpinned_runner_at(records, MEDIUM), 0)
+        # A runner submitted after the refusal that takes a job makes it usable again
+        took = on("thor-slurm1", allocation(1, submitted_at=NOW + 5))
+        records = filed(records, (took, registration(took, is_busy=True)), now=NOW + 30)
+        self.assertTrue(size_usable_somewhere(records, MEDIUM))
+        self.assertEqual(
+            records.by_size[MEDIUM].refused_runner_names, {"gha-test-x": NOW}
+        )
+
+
+class ForgetNodesSlurmDoesNotKnowTest(unittest.TestCase):
+    """sbatch failed, squeue shows nothing by the runner's name, and sinfo does not list a node it named."""
+
+    def test_their_records_are_forgotten_for_every_size_and_nothing_else(self):
+        records = usable_on("thor-slurm1", MEDIUM, SMALL)
+        records = out_on(records, "wato3-slurm1", MEDIUM, seen_at=NOW - 30)
+        records = out_on(records, "wato3-slurm1", SMALL, seen_at=NOW - 30)
+        records = out_on(records, "trpro-slurm1", MEDIUM, seen_at=NOW - 30)
+        forgot = forget_nodes_slurm_does_not_know(records, {"wato3-slurm1"}, NOW)
+        self.assertEqual(nodes_out(forgot, MEDIUM), {"trpro-slurm1"})
+        self.assertEqual(nodes_out(forgot, SMALL), set())
+        # So no submission names it any more
+        self.assertEqual(
+            nodes_a_new_runner_excludes(forgot, MEDIUM, NOW), {"trpro-slurm1"}
+        )
+        # Nothing is counted against either size
+        self.assertEqual(forgot.by_size, records.by_size)
+        self.assertTrue(size_usable_somewhere(forgot, MEDIUM))
+        # Its old failure, still in squeue, is not filed again
+        old = on("wato3-slurm1", ended(1, "FAILED", submitted_at=NOW - 100))
+        self.assertEqual(filed(forgot, (old, None), now=NOW + 2), forgot)
+
+    def test_a_forgotten_node_is_untried_not_usable(self):
+        # A refused pinned runner forgot N; a runner on M then cleared the hold, and M's newest runner failed
+        records = usable_on("thor-slurm1", MEDIUM)
+        records = out_on(records, "trpro-slurm1", MEDIUM, seen_at=NOW - 600)
+        records = record_refused_submission(
+            records, Submission(MEDIUM, frozenset(), "trpro-slurm1"), "gha-x", NOW
+        )
+        took = on("thor-slurm1", allocation(1, submitted_at=NOW + 5))
+        records = filed(records, (took, registration(took, is_busy=True)), now=NOW + 20)
+        self.assertTrue(size_usable_somewhere(records, MEDIUM))
+        failed = on(
+            "thor-slurm1", ended(2, "FAILED", submitted_at=NOW + 30, now=NOW + 60)
+        )
+        records = filed(records, (failed, None), now=NOW + 60)
+        self.assertFalse(size_usable_somewhere(records, MEDIUM))
+        self.assertEqual(
+            plan_submissions(
+                [], {}, demand(waiting(5)), records, {}, [], NOW + 60, NOW + 60
+            ),
+            [Submission(MEDIUM, frozenset({"thor-slurm1"}))],
+        )
+
+
+class SubmissionOrderTest(unittest.TestCase):
+    def test_labels_take_turns_each_with_its_pinned_runners_first(self):
+        a, b = Submission("a", frozenset()), Submission("b", frozenset())
+        a_pinned = Submission("a", frozenset(), "trpro-slurm1")
+        self.assertEqual(submission_order([a, a, b, a_pinned]), [a_pinned, b, a, a])
+        self.assertEqual(submission_order([]), [])
+
+
+class LaunchRecordLogLinesTest(unittest.TestCase):
+    def test_one_line_per_change(self):
+        before = usable_on("thor-slurm1", MEDIUM)
+        failed = on("trpro-slurm1", ended(812345, "FAILED"))
+        after = filed(before, (failed, None))
+        self.assertEqual(
+            launch_record_log_lines(before, after, NOW),
+            [
+                f"{MEDIUM}: out on trpro-slurm1 (Slurm job 812345 failed to launch);"
+                " retry there in 60 s"
+            ],
+        )
+        self.assertEqual(launch_record_log_lines(after, after, NOW), [])
+        retry = on(
+            "trpro-slurm1",
+            ended(812350, "FAILED", submitted_at=NOW + 70, now=NOW + 100),
+        )
+        doubled = filed(after, (retry, None), now=NOW + 100)
+        self.assertEqual(
+            launch_record_log_lines(after, doubled, NOW + 100),
+            [
+                f"{MEDIUM}: out on trpro-slurm1 (Slurm job 812350 failed to launch,"
+                " retry 1); retry there in 120 s"
+            ],
+        )
+        took = on("trpro-slurm1", allocation(812360, submitted_at=NOW + 230))
+        back = filed(doubled, (took, registration(took, is_busy=True)), now=NOW + 240)
+        self.assertEqual(
+            launch_record_log_lines(doubled, back, NOW + 240),
+            [f"{MEDIUM}: usable again on trpro-slurm1 (Slurm job 812360 took a job)"],
+        )
+
+    def test_a_size_usable_nowhere_and_a_failure_with_no_node(self):
+        before = usable_on("thor-slurm1", MEDIUM)
+        failed = on("thor-slurm1", ended(7, "FAILED", submitted_at=NOW - 30))
+        after = filed(before, (failed, None))
+        self.assertEqual(
+            launch_record_log_lines(before, after, NOW)[-1],
+            f"{MEDIUM}: usable on no node; one runner at a time",
+        )
+        nodeless = ended(8, "FAILED", submitted_at=NOW - 20)
+        later = filed(after, (nodeless, None), now=NOW + 30)
+        self.assertEqual(
+            launch_record_log_lines(after, later, NOW + 30),
+            [f"{MEDIUM}: a runner failed with no node; next runner in 60 s"],
+        )
+        # A refusal is logged where it happens, with sbatch's message
+        refused = record_refused_submission(
+            after, Submission(MEDIUM, frozenset()), "gha-test-x", NOW + 30
+        )
+        self.assertEqual(launch_record_log_lines(after, refused, NOW + 30), [])
 
 
 if __name__ == "__main__":

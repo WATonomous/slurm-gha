@@ -12,6 +12,7 @@ import os
 import sys
 import time
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 from dotenv import load_dotenv
@@ -20,6 +21,7 @@ from config import (
     BOOT_ALLOWANCE_S,
     HISTORY_PAGE_INTERVAL_S,
     IDLE_ALLOWANCE_S,
+    NO_JOB_SBATCH_FAILURES_TO_STOP_A_CYCLE,
     OUTAGE_REMINDER_INTERVAL_S,
     REPOS_TO_MONITOR,
     Repository,
@@ -35,27 +37,35 @@ from github_client import GitHubClient, GitHubUnavailable
 from KubernetesLogFormatter import KubernetesLogFormatter
 from plan import (
     NO_DEMAND,
-    Allocation,
+    NO_LAUNCH_RECORDS,
     NO_SIGHTINGS,
-    LabelBreaker,
+    Allocation,
+    LaunchRecords,
     RunnerSightings,
+    Submission,
     allocations_to_cancel,
-    breaker_log_lines,
+    file_launch_evidence,
+    forget_nodes_slurm_does_not_know,
+    launch_record_log_lines,
     narrowed_exclusions,
+    next_unpinned_runner_at,
     plan_submissions,
+    record_refused_submission,
     registrations_to_delete,
     runners_taking_a_job_by_label,
-    submission_order,
-    update_breakers,
     update_sightings,
 )
 from supply import (
+    SlurmTimedOut,
     SlurmUnavailable,
+    SbatchLeftNoJob,
+    SubmissionRefused,
     cancel_pending_allocation,
     delete_registration,
+    narrow_pending_exclusions,
+    nodes_slurm_knows,
     read_our_allocations,
     read_our_registrations,
-    narrow_pending_exclusions,
     submit_runner,
 )
 
@@ -65,14 +75,14 @@ logger = logging.getLogger()
 @dataclass(frozen=True)
 class RepositoryMemory:
     """The daemon's caches for one repository. A restart starts empty: runs are found again, and every
-    size label is unproven until one of its runners takes a job."""
+    size is usable nowhere until squeue and the runners list show where it works."""
 
     # Losing it costs until the runs are found again (status lists, history sweep)
     watched_run_ids: set[int]
     next_history_page: int
     next_history_page_at: float  # epoch seconds
-    # Size label -> breaker; losing it costs one runner's boot per size label
-    breakers: dict[str, LabelBreaker]
+    # Where each size can launch (the node rule); losing it costs one runner's boot per size
+    launch_records: LaunchRecords
     # Losing it lets a busy runner cover a waiting job for up to BUSY_COVER_S longer
     runner_sightings: RunnerSightings
 
@@ -83,7 +93,7 @@ def empty_memory() -> RepositoryMemory:
         watched_run_ids=set(),
         next_history_page=1,
         next_history_page_at=0.0,
-        breakers={},
+        launch_records=NO_LAUNCH_RECORDS,
         runner_sightings=NO_SIGHTINGS,
     )
 
@@ -158,7 +168,10 @@ def main() -> None:
             error = None
             try:
                 memory_by_repo[repo.name] = run_cycle(
-                    github, repo, memory_by_repo[repo.name], now=time.time()
+                    github,
+                    repo,
+                    memory_by_repo[repo.name],
+                    cycle_started_at=time.time(),
                 )
             except (SlurmUnavailable, GitHubUnavailable) as caught:
                 # Supply unknown, never empty: nothing was cancelled or submitted (#40)
@@ -174,11 +187,19 @@ def main() -> None:
 
 
 def run_cycle(
-    github: GitHubClient, repo: Repository, memory: RepositoryMemory, now: float
+    github: GitHubClient,
+    repo: Repository,
+    memory: RepositoryMemory,
+    cycle_started_at: float,
+    clock: Callable[[], float] = time.time,
 ) -> RepositoryMemory:
     """One repository's cycle: read supply, cancel what cannot start and delete ended runners'
     registrations, then read demand run by run, weighing launch evidence and submitting after each. Only
-    the two supply reads raise, and they come before anything is changed."""
+    the two supply reads raise, and they come before anything is changed. What squeue and the runners list
+    showed is judged at cycle_started_at, when they were read. Each run is planned at clock() when it is
+    read, and what is recorded is stamped with clock(): a cycle that submits 150 runners lasts about 3
+    minutes, nodes come due during it, and runners submitted earlier in it must count as submitted before
+    what is recorded later."""
     # Supply
     allocations = read_our_allocations(repo.runner_name_prefix)
     registrations_by_name = read_our_registrations(
@@ -186,11 +207,17 @@ def run_cycle(
     )
     # From the first cycle a runner is seen busy, it may cover a job that still says queued
     sightings = update_sightings(
-        memory.runner_sightings, allocations, registrations_by_name, NO_DEMAND, now
+        memory.runner_sightings,
+        allocations,
+        registrations_by_name,
+        NO_DEMAND,
+        cycle_started_at,
     )
 
     # Only pending jobs, which hold no job: the daemon never ends a started runner
-    for allocation in allocations_to_cancel(allocations, registrations_by_name, now):
+    for allocation in allocations_to_cancel(
+        allocations, registrations_by_name, cycle_started_at
+    ):
         cancel_pending_allocation(allocation)
     # Runners Slurm shows ended: GitHub would keep offering their sessions jobs for about 75 s
     for registration in registrations_to_delete(
@@ -210,56 +237,70 @@ def run_cycle(
     watched_run_ids = watch_new_runs(github, repo.api_base_url, memory.watched_run_ids)
     next_history_page = memory.next_history_page
     next_history_page_at = memory.next_history_page_at
-    if now >= next_history_page_at:
+    if cycle_started_at >= next_history_page_at:
         watched_run_ids, next_history_page = watch_runs_from_history_page(
-            github, repo.api_base_url, watched_run_ids, next_history_page, now
+            github,
+            repo.api_base_url,
+            watched_run_ids,
+            next_history_page,
+            cycle_started_at,
         )
-        next_history_page_at = now + HISTORY_PAGE_INTERVAL_S
+        next_history_page_at = cycle_started_at + HISTORY_PAGE_INTERVAL_S
 
     # Newest run first, submitting after each: demand read so far is a lower bound, so a new wave need not
     # wait for older runs to be read. Runners are counted, never matched to jobs (#38).
     # Launch evidence from supply alone first, so a cycle with no run to read still weighs failures (#37).
-    breakers = update_breakers(
-        memory.breakers,
+    records = file_launch_evidence(
+        memory.launch_records,
         allocations,
         registrations_by_name,
         NO_DEMAND,
         runners_taking_a_job={},
-        now=now,
+        cycle_started_at=cycle_started_at,
+        seen_at=cycle_started_at,
     )
-    # Once per pass and before demand is read, so a released runner can start meanwhile. No runner is
-    # submitted with an exclusion yet
-    narrow_waiting_runners(repo, allocations, nodes_a_new_runner_excludes={})
+    # Rule 4, once per cycle and before demand is read, so a released runner can start meanwhile
+    narrow_waiting_runners(repo, allocations, records, cycle_started_at)
     jobs_by_run = {}
-    runners_submitted_this_cycle = Counter()
+    submitted_this_cycle = []
+    # sbatch failures this cycle that left no job and named no node Slurm does not know
+    sbatch_left_no_job = 0
     for run_id in sorted(watched_run_ids, reverse=True):
         jobs_by_run |= read_latest_jobs(github, repo.api_base_url, {run_id})
+        run_read_at = clock()
         demand = demand_from_jobs(jobs_by_run)
         # Busy runners whose jobs may still say queued: those jobs count neither as waiting nor as evidence
         runners_taking_a_job = runners_taking_a_job_by_label(
-            allocations, registrations_by_name, sightings, demand, now
+            allocations, registrations_by_name, sightings, demand, run_read_at
         )
-        breakers = update_breakers(
-            breakers,
+        records = file_launch_evidence(
+            records,
             allocations,
             registrations_by_name,
             demand,
             runners_taking_a_job,
-            now,
+            cycle_started_at=cycle_started_at,
+            seen_at=run_read_at,
         )
-        runners_to_submit = plan_submissions(
+        if sbatch_left_no_job >= NO_JOB_SBATCH_FAILURES_TO_STOP_A_CYCLE:
+            # Slurm is not answering. The rest of the runs are still read: their jobs give evidence, and
+            # finished runs stop being watched
+            continue
+        submissions = plan_submissions(
             allocations,
             registrations_by_name,
             demand,
-            breakers,
+            records,
             runners_taking_a_job,
-            runners_submitted_this_cycle,
-            now,
+            submitted_this_cycle,
+            planned_at=run_read_at,
+            cycle_started_at=cycle_started_at,
         )
-        runners_submitted_this_cycle.update(
-            submit_runners(github, repo, submission_order(runners_to_submit))
+        submitted, records, sbatch_left_no_job = submit_runners(
+            github, repo, submissions, records, clock, sbatch_left_no_job
         )
-    for line in breaker_log_lines(memory.breakers, breakers):
+        submitted_this_cycle += submitted
+    for line in launch_record_log_lines(memory.launch_records, records, clock()):
         logger.info(f"{repo.name}: {line}")
 
     sightings = update_sightings(
@@ -267,25 +308,23 @@ def run_cycle(
         allocations,
         registrations_by_name,
         demand_from_jobs(jobs_by_run),
-        now,
+        cycle_started_at,
     )
     watched_run_ids = stop_watching_finished_runs(
         github, repo.api_base_url, watched_run_ids, jobs_by_run
     )
     return RepositoryMemory(
-        watched_run_ids, next_history_page, next_history_page_at, breakers, sightings
+        watched_run_ids, next_history_page, next_history_page_at, records, sightings
     )
 
 
 def narrow_waiting_runners(
-    repo: Repository,
-    allocations: list[Allocation],
-    nodes_a_new_runner_excludes: dict[str, frozenset[str]],
+    repo: Repository, allocations: list[Allocation], records: LaunchRecords, now: float
 ) -> None:
     """narrow_pending_exclusions for each group of narrowed_exclusions, and one log line per size and
     change."""
     narrowed = Counter()
-    groups = narrowed_exclusions(allocations, nodes_a_new_runner_excludes)
+    groups = narrowed_exclusions(allocations, records, now)
     for excluded_nodes, waiting in sorted(
         groups.items(), key=lambda item: sorted(item[0])
     ):
@@ -303,24 +342,117 @@ def narrow_waiting_runners(
 
 
 def submit_runners(
-    github: GitHubClient, repo: Repository, size_labels_in_order: list[str]
-) -> list[str]:
-    """submit_runner for each entry; the size labels of those submitted. A failure is logged and the next
-    entry tried; the next cycle counts the gap again. While GitHub asks the client to stop, the rest fail
-    at once without a request."""
+    github: GitHubClient,
+    repo: Repository,
+    submissions_in_order: list[Submission],
+    records: LaunchRecords,
+    clock: Callable[[], float],
+    sbatch_left_no_job: int,
+) -> tuple[list[Submission], LaunchRecords, int]:
+    """submit_runner for each entry; those submitted, the records, and how many sbatch calls this cycle,
+    sbatch_left_no_job of them before this call, left no job and named no node Slurm does not know. What
+    the cycle records is stamped clock() when it happens.
+    - Refused (the FAILED record): record_refused_submission; the size submits nothing more this cycle.
+    - sbatch left no job and named nodes Slurm does not know: those nodes are forgotten for every size, and
+      the entries naming them are skipped. Otherwise (nothing named, all named nodes known, or Slurm could
+      not be asked) nothing is recorded: the first such failure in a cycle skips its own entry, since the
+      squeue that classified it answered; at NO_JOB_SBATCH_FAILURES_TO_STOP_A_CYCLE Slurm is taken as not
+      answering and nothing more is submitted this cycle.
+    - Timed out: its job may exist, so it counts as submitted.
+    Any other failure is logged and the next entry tried; the next cycle counts the gap again. While GitHub
+    asks the client to stop, the rest fail at once without a request."""
     submitted = []
-    for size_label in size_labels_in_order:
+    refused_sizes = set()
+    unknown_nodes = frozenset()
+    for submission in submissions_in_order:
+        size_label = submission.size_label
+        if size_label in refused_sizes or named_nodes(submission) & unknown_nodes:
+            continue
         try:
             submit_runner(
-                github, repo.api_base_url, repo.runner_name_prefix, size_label
+                github, repo.api_base_url, repo.runner_name_prefix, submission
+            )
+        except SubmissionRefused as refused:
+            refused_at = clock()
+            records = record_refused_submission(
+                records, submission, refused.runner_name, refused_at
+            )
+            refused_sizes.add(size_label)
+            line = refusal_log_line(submission, refused, records, refused_at)
+            logger.warning(f"{repo.name}: {line}")
+            continue
+        except SbatchLeftNoJob as left:
+            unknown = nodes_slurm_does_not_know(named_nodes(submission))
+            if not unknown:
+                sbatch_left_no_job += 1
+                if sbatch_left_no_job < NO_JOB_SBATCH_FAILURES_TO_STOP_A_CYCLE:
+                    logger.warning(
+                        f"{repo.name}: {size_label}: sbatch failed and squeue shows no"
+                        f" {left.runner_name} ({left.message}); not counted"
+                    )
+                    continue
+                logger.warning(
+                    f"{repo.name}: {size_label}: sbatch failed and squeue shows no"
+                    f" {left.runner_name} ({left.message}); not counted, and Slurm is"
+                    f" taken as not answering: no more submissions this cycle"
+                )
+                return submitted, records, sbatch_left_no_job
+            records = forget_nodes_slurm_does_not_know(records, unknown, clock())
+            unknown_nodes |= unknown
+            logger.warning(
+                f"{repo.name}: {size_label}: sbatch failed for {left.runner_name};"
+                f" Slurm does not know {','.join(sorted(unknown))}, forgotten for every size"
+            )
+            continue
+        except SlurmTimedOut as error:
+            logger.warning(
+                f"{repo.name}: a runner for {size_label} may have been submitted: {error}"
             )
         except (GitHubUnavailable, SlurmUnavailable) as error:
             logger.warning(
                 f"{repo.name}: could not submit a runner for {size_label}: {error}"
             )
             continue
-        submitted.append(size_label)
-    return submitted
+        submitted.append(submission)
+    return submitted, records, sbatch_left_no_job
+
+
+def named_nodes(submission: Submission) -> frozenset[str]:
+    """Pure: the nodes a submission names, excluded or pinned."""
+    if submission.pinned_node is None:
+        return submission.excluded_nodes
+    return frozenset({submission.pinned_node})
+
+
+def nodes_slurm_does_not_know(nodes: frozenset[str]) -> frozenset[str]:
+    """Those of nodes that sinfo does not list; none when nodes is empty or Slurm cannot be asked, which
+    is never taken to mean a node is unknown."""
+    if not nodes:
+        return frozenset()
+    try:
+        return nodes - nodes_slurm_knows()
+    except SlurmUnavailable as error:
+        logger.warning(f"Could not ask Slurm which nodes it knows: {error}")
+        return frozenset()
+
+
+def refusal_log_line(
+    submission: Submission,
+    refused: SubmissionRefused,
+    records: LaunchRecords,
+    refused_at: float,
+) -> str:
+    """Pure: e.g. "slurm-runner-medium: Slurm refused gha-runner-1a2b3c (<sbatch's message>), excluding
+    trpro-slurm1; next runner in 40 s at the earliest"."""
+    line = f"{submission.size_label}: Slurm refused {refused.runner_name} ({refused.message})"
+    if submission.pinned_node is not None:
+        return f"{line}, pinned to {submission.pinned_node}; forgot {submission.pinned_node}"
+    if submission.excluded_nodes:
+        line += f", excluding {','.join(sorted(submission.excluded_nodes))}"
+    wait_s = max(
+        0.0, next_unpinned_runner_at(records, submission.size_label) - refused_at
+    )
+    return f"{line}; next runner in {wait_s:.0f} s at the earliest"
 
 
 def unsafe_settings(

@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import uuid
+from enum import Enum
 
 from config import (
     ALLOCATE_RUNNER_SCRIPT_PATH,
@@ -21,7 +22,7 @@ from config import (
     SLURM_OUTPUT_PATH,
 )
 from github_client import GitHubClient, GitHubUnavailable
-from plan import FINISHED_STATES, Allocation, RunnerRegistration
+from plan import FINISHED_STATES, Allocation, RunnerRegistration, Submission
 from runner_size_config import (
     RunnerResources,
     get_runner_resources,
@@ -48,9 +49,45 @@ unreadable_exclusions_logged: set[int] = set()
 class SlurmUnavailable(Exception):
     """A Slurm command failed or timed out: what it would have reported is unknown, never empty."""
 
+    def __init__(self, message: str, stderr: str = ""):
+        super().__init__(message)
+        # What the command printed on stderr, when it ran and failed
+        self.stderr = stderr
+
 
 class SlurmTimedOut(SlurmUnavailable):
     """A Slurm command was killed at SLURM_COMMAND_TIMEOUT: whether its request took effect is unknown."""
+
+
+class SubmissionRefused(SlurmUnavailable):
+    """sbatch failed and squeue shows only the FAILED record, with no node, that Slurm leaves for a
+    submission it refused for its constraints; the registration made for it has been deleted."""
+
+    def __init__(self, runner_name: str, message: str):
+        super().__init__(message)
+        self.runner_name = runner_name
+        self.message = message  # sbatch's stderr, for the log
+
+
+class SbatchLeftNoJob(SlurmUnavailable):
+    """sbatch failed and squeue shows nothing by the runner's name; the registration made for it has been
+    deleted. Not a refusal: slurmctld may not have answered, or a node the submission named may be unknown
+    to it, which only nodes_slurm_knows can tell."""
+
+    def __init__(self, runner_name: str, message: str):
+        super().__init__(message)
+        self.runner_name = runner_name
+        self.message = message  # sbatch's stderr, for the log
+
+
+class AfterFailedSbatch(Enum):
+    """What squeue shows by a runner's name after its sbatch exited non-zero."""
+
+    LIVE_JOB = "a job not ended, or ended with a node: Slurm accepted it after all"
+    # With our flags, because every node that can hold it is excluded, or the pinned one cannot hold it
+    REFUSED_RECORD = "only records that ended with no node (FAILED, BadConstraints)"
+    # A node it named is unknown to Slurm, or slurmctld was not reached
+    NOTHING = "no job by the runner's name"
 
 
 def read_our_allocations(runner_name_prefix: str) -> list[Allocation]:
@@ -202,21 +239,28 @@ def new_runner_name(runner_name_prefix: str) -> str:
 
 
 def sbatch_command(
-    runner_name: str, size_label: str, resources: RunnerResources
+    runner_name: str, submission: Submission, resources: RunnerResources
 ) -> list[str]:
-    """Pure: sbatch argv for one runner: its size, --no-requeue (else a failed launch is held forever, #37),
-    --time J + W + D, and W for its batch script. The JIT config goes in the environment, never here."""
+    """Pure: sbatch argv for one runner: its size, where it may go (--exclude, or --nodes=1 --nodelist for
+    a pinned one), --no-requeue (else a failed launch is held forever, #37), --time J + W + D, and W for its
+    batch script. The JIT config goes in the environment, never here."""
+    placement = []
+    if submission.pinned_node is not None:
+        placement = ["--nodes=1", f"--nodelist={submission.pinned_node}"]
+    elif submission.excluded_nodes:
+        placement = [f"--exclude={','.join(sorted(submission.excluded_nodes))}"]
     return [
         "sbatch",
         f"--output={SLURM_OUTPUT_PATH}",
         f"--job-name={runner_name}",
-        f"--comment={size_label}",
+        f"--comment={submission.size_label}",
         f"--cpus-per-task={resources.cpus}",
         f"--mem-per-cpu={resources.mem_per_cpu}",
         f"--gres=tmpdisk:{resources.tmpdisk_mib}",
         f"--time={slurm_time_limit_minutes(resources.job_budget_minutes)}",
         # Else JobRequeue=1 turns a failed launch into a held job that never ends
         "--no-requeue",
+        *placement,
         ALLOCATE_RUNNER_SCRIPT_PATH,
         str(IDLE_ALLOWANCE_S),
     ]
@@ -226,12 +270,16 @@ def submit_runner(
     github: GitHubClient,
     repo_api_base_url: str,
     runner_name_prefix: str,
-    size_label: str,
-) -> None:
-    """POST generate-jitconfig for a new runner of size_label, then sbatch with the config in the
-    environment. Raises GitHubUnavailable or SlurmUnavailable, and ValueError for a label that is not a
-    size, which demand never reports. When sbatch fails and squeue shows no job by the runner's name, the
-    registration just created is deleted; a failed delete is only logged."""
+    submission: Submission,
+) -> str:
+    """POST generate-jitconfig for a new runner of the submission's size, then sbatch with the config in the
+    environment; the runner's name. Raises GitHubUnavailable or SlurmUnavailable, and ValueError for a label
+    that is not a size, which demand never reports. When sbatch exits non-zero, squeue decides: a live job
+    is a submitted runner after all; otherwise the registration is deleted (a failed delete is only
+    logged) and SubmissionRefused raised for a FAILED record with no node, SbatchLeftNoJob for nothing. If
+    squeue cannot be read, or sbatch timed out and its request may still be queued in slurmctld, the
+    registration is left and SlurmUnavailable raised."""
+    size_label = submission.size_label
     resources = get_runner_resources(size_label)
     if resources is None:
         raise ValueError(f"{size_label!r} is not a size label")
@@ -254,16 +302,22 @@ def submit_runner(
         )
     try:
         sbatch_output = run_slurm_command(
-            sbatch_command(runner_name, size_label, resources),
+            sbatch_command(runner_name, submission, resources),
             {JIT_CONFIG_VARIABLE: jit_config},
         )
     except SlurmTimedOut:
         # The request may still be queued in slurmctld, after the squeue that would check for it
         raise
-    except SlurmUnavailable:
+    except SlurmUnavailable as error:
+        after = what_squeue_shows_after_failed_sbatch(runner_name)
+        if after is None:
+            raise
+        if after is AfterFailedSbatch.LIVE_JOB:
+            logger.info(f"Submitted {runner_name} for {size_label} although {error}")
+            return runner_name
         # Otherwise the registration waits a day for a runner that will never start
         runner_id = (jit_response.get("runner") or {}).get("id")
-        if isinstance(runner_id, int) and squeue_shows_no_job_named(runner_name):
+        if isinstance(runner_id, int):
             delete_registration(
                 github,
                 repo_api_base_url,
@@ -271,15 +325,28 @@ def submit_runner(
                 runner_name,
                 why="sbatch created no job",
             )
-        raise
-    logger.info(f"Submitted {runner_name} for {size_label}: {sbatch_output.strip()}")
+        message = error.stderr or str(error)
+        if after is AfterFailedSbatch.NOTHING:
+            raise SbatchLeftNoJob(runner_name, message) from None
+        raise SubmissionRefused(runner_name, message) from None
+    placement = ""
+    if submission.pinned_node is not None:
+        placement = f", pinned to {submission.pinned_node}"
+    elif submission.excluded_nodes:
+        placement = f", excluding {','.join(sorted(submission.excluded_nodes))}"
+    logger.info(
+        f"Submitted {runner_name} for {size_label}{placement}: {sbatch_output.strip()}"
+    )
+    return runner_name
 
 
-def squeue_shows_no_job_named(job_name: str) -> bool:
-    """True only when squeue answers and lists no job of ours by that name, in any state, except records
-    that ended without a node; False when it lists one or cannot be read. sbatch can fail after slurmctld
-    created its job, whose runner needs the registration. A refused submission (every eligible node
-    excluded) leaves a record that can never run: FAILED, reason BadConstraints, no node."""
+def what_squeue_shows_after_failed_sbatch(
+    runner_name: str,
+) -> AfterFailedSbatch | None:
+    """squeue --me --states=all --name=<runner_name>; None when squeue cannot be read. sbatch can fail after
+    slurmctld created its job, whose runner needs the registration. A submission refused because every
+    eligible node is excluded still leaves a record under the name for MinJobAge, which can never run:
+    FAILED, reason BadConstraints, no node (job 753319)."""
     try:
         output = run_slurm_command(
             [
@@ -287,17 +354,33 @@ def squeue_shows_no_job_named(job_name: str) -> bool:
                 "--me",
                 "--states=all",
                 "--noheader",
-                f"--name={job_name}",
+                f"--name={runner_name}",
                 "--format=%T|%N",
             ]
         )
     except SlurmUnavailable:
-        return False
-    for line in output.splitlines():
-        state, _, node = line.partition("|")
-        if state not in FINISHED_STATES or node.strip():
-            return False
-    return True
+        return None
+    records = [line.partition("|") for line in output.splitlines()]
+    if any(state not in FINISHED_STATES or node for state, _, node in records):
+        return AfterFailedSbatch.LIVE_JOB
+    if records:
+        return AfterFailedSbatch.REFUSED_RECORD
+    return AfterFailedSbatch.NOTHING
+
+
+def nodes_slurm_knows() -> frozenset[str]:
+    """sinfo --all --noheader --Node --format=%N: every node of every partition, hidden ones included, one
+    per line and once per partition, never compressed; drained nodes are listed. Asked only after an
+    SbatchLeftNoJob that named nodes. Raises SlurmUnavailable when slurmctld cannot be asked (exit 1,
+    "Unable to contact slurm controller", after about 9 s) or lists no node; never read as "unknown"."""
+    output = run_slurm_command(
+        ["sinfo", "--all", "--noheader", "--Node", "--format=%N"]
+    )
+    nodes = frozenset(line.strip() for line in output.splitlines() if line.strip())
+    if not nodes:
+        # Read as the full list, it would make every node named unknown
+        raise SlurmUnavailable("sinfo listed no node")
+    return nodes
 
 
 def narrow_pending_exclusions(
@@ -401,6 +484,7 @@ def run_slurm_command(
         raise SlurmUnavailable(f"{' '.join(command)}: {error}") from None
     if result.returncode != 0:
         raise SlurmUnavailable(
-            f"{' '.join(command)}: exit status {result.returncode}: {result.stderr.strip()}"
+            f"{' '.join(command)}: exit status {result.returncode}: {result.stderr.strip()}",
+            stderr=result.stderr.strip(),
         )
     return result.stdout
