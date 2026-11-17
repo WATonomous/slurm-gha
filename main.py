@@ -35,16 +35,10 @@ from demand import (
 )
 from github_client import GitHubClient, GitHubUnavailable
 from KubernetesLogFormatter import KubernetesLogFormatter
-from plan import (
-    NO_DEMAND,
+from node_rule import (
     NO_LAUNCH_RECORDS,
-    NO_SIGHTINGS,
-    Allocation,
     LaunchRecords,
-    RunnerRegistration,
-    RunnerSightings,
     Submission,
-    allocations_to_cancel,
     file_launch_evidence,
     forget_nodes_slurm_does_not_know,
     launch_record_log_lines,
@@ -52,6 +46,14 @@ from plan import (
     next_unpinned_runner_at,
     plan_submissions,
     record_refused_submission,
+)
+from plan import (
+    NO_DEMAND,
+    NO_SIGHTINGS,
+    Allocation,
+    RunnerRegistration,
+    RunnerSightings,
+    allocations_to_cancel,
     registrations_to_delete,
     runners_covering_a_job_by_size_label,
     update_sightings,

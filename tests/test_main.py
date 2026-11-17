@@ -23,13 +23,8 @@ from main import (
     run_cycle,
     unsafe_settings,
 )
-from plan import (
-    FINISHED_STATES,
-    NO_LAUNCH_RECORDS,
-    NO_SIGHTINGS,
-    nodes_out,
-    size_usable_somewhere,
-)
+from node_rule import NO_LAUNCH_RECORDS, nodes_out, size_usable_somewhere
+from plan import FINISHED_STATES, NO_SIGHTINGS
 from supply import JIT_CONFIG_VARIABLE, SlurmUnavailable
 from test_demand import (
     IN_PROGRESS_RUNS,

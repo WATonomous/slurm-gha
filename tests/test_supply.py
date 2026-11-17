@@ -19,12 +19,12 @@ from config import (
     UNUSED_REGISTRATION_LIFETIME_S,
 )
 from github_client import GitHubClient, GitHubUnavailable
+from node_rule import Submission
 from plan import (
     FINISHED_STATES,
     Allocation,
     Phase,
     RunnerRegistration,
-    Submission,
     phase_of_allocation,
 )
 from runner_size_config import RunnerResources

@@ -22,7 +22,8 @@ from config import (
     SLURM_OUTPUT_PATH,
 )
 from github_client import GitHubClient, GitHubUnavailable
-from plan import FINISHED_STATES, Allocation, RunnerRegistration, Submission
+from node_rule import Submission
+from plan import FINISHED_STATES, Allocation, RunnerRegistration
 from runner_size_config import (
     RunnerResources,
     get_runner_resources,
