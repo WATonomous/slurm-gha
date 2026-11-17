@@ -30,7 +30,7 @@ from plan import (
     allocations_to_cancel,
     file_launch_evidence,
     forget_nodes_slurm_does_not_know,
-    jobs_left_waiting_by_label,
+    jobs_left_waiting_by_size_label,
     launch_evidence,
     launch_record_log_lines,
     pending_runners_by_narrowed_exclusion,
@@ -43,10 +43,10 @@ from plan import (
     record_refused_submission,
     registrations_to_delete,
     retry_wait_s,
-    runners_taking_a_job_by_label,
+    runners_taking_a_job_by_size_label,
     size_usable_somewhere,
     submission_order,
-    uncovered_jobs_waiting_past_b_by_label,
+    uncovered_jobs_waiting_past_b_by_size_label,
     update_sightings,
 )
 
@@ -130,7 +130,9 @@ def usable_on(node, *size_labels):
     took_a_job = NodeRecord(
         newest_success_submitted_at=NOW - 3600, newest_success_slurm_job_id=1
     )
-    return LaunchRecords({(node, label): took_a_job for label in size_labels}, {})
+    return LaunchRecords(
+        {(node, size_label): took_a_job for size_label in size_labels}, {}
+    )
 
 
 def filed(records, *evidence, demand_read=NO_DEMAND, now=NOW):
@@ -361,10 +363,11 @@ class LaunchEvidenceTest(unittest.TestCase):
             + waiting(1, SMALL, waited_s=B + 1)
         )
         self.assertEqual(
-            uncovered_jobs_waiting_past_b_by_label(jobs, {}, NOW), {MEDIUM: 2, SMALL: 1}
+            uncovered_jobs_waiting_past_b_by_size_label(jobs, {}, NOW),
+            {MEDIUM: 2, SMALL: 1},
         )
         self.assertEqual(
-            uncovered_jobs_waiting_past_b_by_label(jobs, {MEDIUM: 3}, NOW),
+            uncovered_jobs_waiting_past_b_by_size_label(jobs, {MEDIUM: 3}, NOW),
             {MEDIUM: 0, SMALL: 1},
         )
 
@@ -480,7 +483,7 @@ class BusyRunnerCoversItsJobTest(unittest.TestCase):
         return of, registration(of, is_busy=True)
 
     def plan(self, allocations, by_name, jobs, sightings, now=NOW):
-        taking = runners_taking_a_job_by_label(
+        taking = runners_taking_a_job_by_size_label(
             allocations, by_name, sightings, jobs, now
         )
         return unpinned_counts(
@@ -552,7 +555,7 @@ class BusyRunnerCoversItsJobTest(unittest.TestCase):
         jobs = demand(waiting(1) + waiting(2, SMALL))
         self.assertEqual(self.plan(three, by_name, jobs, sightings), {SMALL: 2})
         self.assertEqual(
-            jobs_left_waiting_by_label(jobs, {MEDIUM: 3}), {MEDIUM: 0, SMALL: 2}
+            jobs_left_waiting_by_size_label(jobs, {MEDIUM: 3}), {MEDIUM: 0, SMALL: 2}
         )
 
     def test_an_idle_runner_beside_a_covered_job_is_not_a_failed_launch(self):
@@ -567,7 +570,9 @@ class BusyRunnerCoversItsJobTest(unittest.TestCase):
             NO_SIGHTINGS, allocations, by_name, NO_DEMAND, NOW - 10
         )
         k = demand(waiting(1, waited_s=B + 5))
-        taking = runners_taking_a_job_by_label(allocations, by_name, sightings, k, NOW)
+        taking = runners_taking_a_job_by_size_label(
+            allocations, by_name, sightings, k, NOW
+        )
         self.assertEqual(taking, {MEDIUM: 1})
         records = file_launch_evidence(
             NO_LAUNCH_RECORDS, allocations, by_name, k, taking, NOW, NOW

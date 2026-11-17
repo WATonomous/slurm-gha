@@ -326,7 +326,7 @@ def launch_evidence(
     return None
 
 
-def uncovered_jobs_waiting_past_b_by_label(
+def uncovered_jobs_waiting_past_b_by_size_label(
     demand: Demand, runners_taking_a_job: dict[str, int], now: float
 ) -> dict[str, int]:
     """Pure: per size label, its jobs that had waited longer than B at now, when the runners list was
@@ -337,8 +337,8 @@ def uncovered_jobs_waiting_past_b_by_label(
         if now - job.created_at > BOOT_ALLOWANCE_S:
             waiting_past_b[job.size_label] = waiting_past_b.get(job.size_label, 0) + 1
     return {
-        label: max(0, count - runners_taking_a_job.get(label, 0))
-        for label, count in waiting_past_b.items()
+        size_label: max(0, count - runners_taking_a_job.get(size_label, 0))
+        for size_label, count in waiting_past_b.items()
     }
 
 
@@ -381,7 +381,7 @@ def file_launch_evidence(
     job clears what is outstanding for its size if it was submitted after outstanding_since. Refused names
     older than REFUSED_NAMES_KEPT_S are dropped. What squeue and the runners list showed is judged at
     cycle_started_at, when they were read; what is recorded is stamped seen_at, when this is filed."""
-    uncovered = uncovered_jobs_waiting_past_b_by_label(
+    uncovered = uncovered_jobs_waiting_past_b_by_size_label(
         demand, runners_taking_a_job, cycle_started_at
     )
     by_node_and_size = dict(records.by_node_and_size)
@@ -498,12 +498,21 @@ def node_is_out(record: NodeRecord | None) -> bool:
     return record is not None and record.out_since is not None
 
 
+def node_records_of(records: LaunchRecords, size_label: str) -> dict[str, NodeRecord]:
+    """Pure: the size's records, by node."""
+    return {
+        node: record
+        for (node, record_size_label), record in records.by_node_and_size.items()
+        if record_size_label == size_label
+    }
+
+
 def nodes_out(records: LaunchRecords, size_label: str) -> frozenset[str]:
     """Pure: the nodes out for the size."""
     return frozenset(
         node
-        for (node, size), record in records.by_node_and_size.items()
-        if size == size_label and node_is_out(record)
+        for node, record in node_records_of(records, size_label).items()
+        if node_is_out(record)
     )
 
 
@@ -549,10 +558,8 @@ def size_usable_somewhere(records: LaunchRecords, size_label: str) -> bool:
     if size_record is not None and size_record.outstanding_since is not None:
         return False
     return any(
-        size == size_label
-        and not node_is_out(record)
-        and record.newest_success_submitted_at is not None
-        for (_, size), record in records.by_node_and_size.items()
+        not node_is_out(record) and record.newest_success_submitted_at is not None
+        for record in node_records_of(records, size_label).values()
     )
 
 
@@ -731,8 +738,10 @@ def plan_submissions(
     Pinned runners never count as able to take a job, so one pending on a drained node never holds a size
     back. What squeue and the runners list showed is judged at cycle_started_at, when they were read;
     which nodes are due, at planned_at."""
-    waiting_jobs_by_label = jobs_left_waiting_by_label(demand, runners_taking_a_job)
-    uncovered = uncovered_jobs_waiting_past_b_by_label(
+    waiting_jobs_by_size_label = jobs_left_waiting_by_size_label(
+        demand, runners_taking_a_job
+    )
+    uncovered = uncovered_jobs_waiting_past_b_by_size_label(
         demand, runners_taking_a_job, cycle_started_at
     )
     unpinned_in_flight = Counter(
@@ -760,41 +769,45 @@ def plan_submissions(
             pinned_in_flight.add((allocation.pinned_node, allocation.size_label))
 
     submissions = []
-    for label, waiting_jobs in sorted(waiting_jobs_by_label.items()):
+    for size_label, waiting_jobs in sorted(waiting_jobs_by_size_label.items()):
         if waiting_jobs == 0:
             continue
-        nodes_in_flight = {node for node, size in pinned_in_flight if size == label}
+        nodes_in_flight = {
+            node
+            for node, pinned_size_label in pinned_in_flight
+            if pinned_size_label == size_label
+        }
         for node in nodes_due_a_pinned_runner(
-            records, label, nodes_in_flight, planned_at
+            records, size_label, nodes_in_flight, planned_at
         ):
-            submissions.append(Submission(label, frozenset(), pinned_node=node))
-        excluded = nodes_a_new_runner_excludes(records, label, planned_at)
-        shortfall = waiting_jobs - unpinned_in_flight[label]
-        size_record = records.by_size.get(label, SizeRecord())
-        if size_usable_somewhere(records, label):
-            submissions += [Submission(label, excluded)] * max(0, shortfall)
+            submissions.append(Submission(size_label, frozenset(), pinned_node=node))
+        excluded = nodes_a_new_runner_excludes(records, size_label, planned_at)
+        shortfall = waiting_jobs - unpinned_in_flight[size_label]
+        size_record = records.by_size.get(size_label, SizeRecord())
+        if size_usable_somewhere(records, size_label):
+            submissions += [Submission(size_label, excluded)] * max(0, shortfall)
         elif (
             shortfall > 0
-            and unpinned_in_flight[label] == 0
-            and planned_at >= next_unpinned_runner_at(records, label)
+            and unpinned_in_flight[size_label] == 0
+            and planned_at >= next_unpinned_runner_at(records, size_label)
             # A refusal, or a failure with no node, recorded this cycle ends its submissions for the cycle
             and (size_record.outstanding_since or 0.0) < cycle_started_at
         ):
-            submissions.append(Submission(label, excluded))
+            submissions.append(Submission(size_label, excluded))
     return submission_order(submissions)
 
 
 def submission_order(submissions: list[Submission]) -> list[Submission]:
     """Pure: size labels taken in turn, each label's pinned runners first, so a large wave cannot hold up
     another label's single job."""
-    by_label = {}
+    by_size_label = {}
     for submission in sorted(submissions, key=lambda each: each.pinned_node is None):
-        by_label.setdefault(submission.size_label, []).append(submission)
+        by_size_label.setdefault(submission.size_label, []).append(submission)
     ordered = []
-    for round_index in range(max(map(len, by_label.values()), default=0)):
-        for label in sorted(by_label):
-            if round_index < len(by_label[label]):
-                ordered.append(by_label[label][round_index])
+    for round_index in range(max(map(len, by_size_label.values()), default=0)):
+        for size_label in sorted(by_size_label):
+            if round_index < len(by_size_label[size_label]):
+                ordered.append(by_size_label[size_label][round_index])
     return ordered
 
 
@@ -825,7 +838,7 @@ def update_sightings(
     return RunnerSightings(first_seen_busy_at, seen_on_a_job, deletes_answered)
 
 
-def runners_taking_a_job_by_label(
+def runners_taking_a_job_by_size_label(
     allocations: list[Allocation],
     registrations_by_name: dict[str, RunnerRegistration],
     sightings: RunnerSightings,
@@ -849,12 +862,12 @@ def runners_taking_a_job_by_label(
             and first_seen_busy_at is not None
             and now - first_seen_busy_at < BUSY_COVER_S
         ):
-            label = allocation.size_label
-            taking[label] = taking.get(label, 0) + 1
+            size_label = allocation.size_label
+            taking[size_label] = taking.get(size_label, 0) + 1
     return taking
 
 
-def jobs_left_waiting_by_label(
+def jobs_left_waiting_by_size_label(
     demand: Demand, runners_taking_a_job: dict[str, int]
 ) -> dict[str, int]:
     """Pure: per size label with a waiting job, how many no runner taking a job of that size covers; never
@@ -863,8 +876,8 @@ def jobs_left_waiting_by_label(
     for job in demand.waiting_jobs:
         waiting[job.size_label] = waiting.get(job.size_label, 0) + 1
     return {
-        label: max(0, count - runners_taking_a_job.get(label, 0))
-        for label, count in waiting.items()
+        size_label: max(0, count - runners_taking_a_job.get(size_label, 0))
+        for size_label, count in waiting.items()
     }
 
 
@@ -875,37 +888,41 @@ def launch_record_log_lines(
     usable nowhere or somewhere again, a failure with no node. A refusal, and what it made the daemon
     forget, is logged where it happens, with sbatch's message."""
     lines = []
-    for (node, label), new in sorted(after.by_node_and_size.items()):
-        old = before.by_node_and_size.get((node, label))
+    for (node, size_label), new in sorted(after.by_node_and_size.items()):
+        old = before.by_node_and_size.get((node, size_label))
         if node_is_out(new) and (
             not node_is_out(old) or new.failed_retries != old.failed_retries
         ):
             retry = f", retry {new.failed_retries}" if new.failed_retries else ""
             lines.append(
-                f"{label}: out on {node} (Slurm job {new.newest_failure_slurm_job_id} failed to"
+                f"{size_label}: out on {node} (Slurm job {new.newest_failure_slurm_job_id} failed to"
                 f" launch{retry}); retry there in {node_retry_due_at(new) - now:.0f} s"
             )
         elif node_is_out(old) and not node_is_out(new) and new.forgotten_at is None:
             lines.append(
-                f"{label}: usable again on {node} (Slurm job {new.newest_success_slurm_job_id}"
+                f"{size_label}: usable again on {node} (Slurm job {new.newest_success_slurm_job_id}"
                 " took a job)"
             )
-    labels = {label for _, label in before.by_node_and_size} | set(before.by_size)
-    labels |= {label for _, label in after.by_node_and_size} | set(after.by_size)
-    for label in sorted(labels):
-        new = after.by_size.get(label, SizeRecord())
-        old = before.by_size.get(label, SizeRecord())
+    size_labels = {size_label for _, size_label in before.by_node_and_size} | set(
+        before.by_size
+    )
+    size_labels |= {size_label for _, size_label in after.by_node_and_size} | set(
+        after.by_size
+    )
+    for size_label in sorted(size_labels):
+        new = after.by_size.get(size_label, SizeRecord())
+        old = before.by_size.get(size_label, SizeRecord())
         refused = new.refused_runner_names.keys() - old.refused_runner_names.keys()
         if new.nodeless_failure_seen_at not in (None, old.nodeless_failure_seen_at):
             # A refusal is logged where it happens, with sbatch's message
             if not refused:
-                wait_s = next_unpinned_runner_at(after, label) - now
+                wait_s = next_unpinned_runner_at(after, size_label) - now
                 lines.append(
-                    f"{label}: a runner failed with no node; next runner in {wait_s:.0f} s"
+                    f"{size_label}: a runner failed with no node; next runner in {wait_s:.0f} s"
                 )
-        was_usable = size_usable_somewhere(before, label)
-        if was_usable and not size_usable_somewhere(after, label):
-            lines.append(f"{label}: usable on no node; one runner at a time")
-        elif not was_usable and size_usable_somewhere(after, label):
-            lines.append(f"{label}: usable again; served in full")
+        was_usable = size_usable_somewhere(before, size_label)
+        if was_usable and not size_usable_somewhere(after, size_label):
+            lines.append(f"{size_label}: usable on no node; one runner at a time")
+        elif not was_usable and size_usable_somewhere(after, size_label):
+            lines.append(f"{size_label}: usable again; served in full")
     return lines

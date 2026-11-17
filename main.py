@@ -52,7 +52,7 @@ from plan import (
     plan_submissions,
     record_refused_submission,
     registrations_to_delete,
-    runners_taking_a_job_by_label,
+    runners_taking_a_job_by_size_label,
     update_sightings,
 )
 from supply import (
@@ -270,7 +270,7 @@ def run_cycle(
         run_read_at = clock()
         demand = demand_from_jobs(jobs_by_run)
         # Busy runners whose jobs may still say queued: those jobs count neither as waiting nor as evidence
-        runners_taking_a_job = runners_taking_a_job_by_label(
+        runners_taking_a_job = runners_taking_a_job_by_size_label(
             allocations, registrations_by_name, sightings, demand, run_read_at
         )
         records = file_launch_evidence(
@@ -362,11 +362,11 @@ def submit_runners(
     Any other failure is logged and the next entry tried; the next cycle counts the gap again. While GitHub
     asks the client to stop, the rest fail at once without a request."""
     submitted = []
-    refused_sizes = set()
+    refused_size_labels = set()
     unknown_nodes = frozenset()
     for submission in submissions_in_order:
         size_label = submission.size_label
-        if size_label in refused_sizes or named_nodes(submission) & unknown_nodes:
+        if size_label in refused_size_labels or named_nodes(submission) & unknown_nodes:
             continue
         try:
             submit_runner(
@@ -377,7 +377,7 @@ def submit_runners(
             records = record_refused_submission(
                 records, submission, refused.runner_name, refused_at
             )
-            refused_sizes.add(size_label)
+            refused_size_labels.add(size_label)
             line = refusal_log_line(submission, refused, records, refused_at)
             logger.warning(f"{repo.name}: {line}")
             continue
