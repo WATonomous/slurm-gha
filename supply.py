@@ -331,7 +331,7 @@ def submit_runner(
         raise SubmissionRefused(runner_name, message) from None
     placement = ""
     if submission.pinned_node is not None:
-        placement = f", pinned to {submission.pinned_node}"
+        placement = f", pinned to {submission.pinned_node}, retry {submission.retry}"
     elif submission.excluded_nodes:
         placement = f", excluding {','.join(sorted(submission.excluded_nodes))}"
     logger.info(

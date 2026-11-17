@@ -1,5 +1,6 @@
 """plan without Slurm or GitHub: every pure function by table, and each rule of the node rule."""
 
+import logging
 import unittest
 from dataclasses import replace
 
@@ -38,6 +39,7 @@ from plan import (
     node_retry_due_at,
     nodes_a_new_runner_excludes,
     nodes_out,
+    ordinal,
     phase_of_allocation,
     plan_submissions,
     record_refused_submission,
@@ -294,7 +296,7 @@ class LaunchEvidenceTest(unittest.TestCase):
         for state in ("FAILED", "CANCELLED", "NODE_FAIL", "BOOT_FAIL"):
             with self.subTest(state):
                 self.assertEqual(
-                    self.evidence(ended(1, state), None), Evidence.FAILED_TO_LAUNCH
+                    self.evidence(ended(1, state), None), Evidence.ENDED_WITHOUT_A_JOB
                 )
 
     def test_a_failure_within_its_first_second_still_counts(self):
@@ -304,12 +306,14 @@ class LaunchEvidenceTest(unittest.TestCase):
                 at_once = ended(1, state, ran_s=0)
                 self.assertEqual(at_once.started_at, at_once.ended_at)
                 self.assertEqual(
-                    self.evidence(at_once, None), Evidence.FAILED_TO_LAUNCH
+                    self.evidence(at_once, None), Evidence.ENDED_WITHOUT_A_JOB
                 )
         never_started = Allocation(
             2, "gha-test-2", MEDIUM, "FAILED", False, NOW - 60, None, NOW - 10
         )
-        self.assertEqual(self.evidence(never_started, None), Evidence.FAILED_TO_LAUNCH)
+        self.assertEqual(
+            self.evidence(never_started, None), Evidence.ENDED_WITHOUT_A_JOB
+        )
 
     def test_ends_that_say_nothing(self):
         cancelled_while_pending = Allocation(
@@ -332,8 +336,8 @@ class LaunchEvidenceTest(unittest.TestCase):
     def test_a_runner_offline_between_b_and_w(self):
         rows = [
             (B - 1, None),
-            (B, Evidence.FAILED_TO_LAUNCH),
-            (W - 1, Evidence.FAILED_TO_LAUNCH),
+            (B, Evidence.STILL_OFFLINE_AT_B),
+            (W - 1, Evidence.STILL_OFFLINE_AT_B),
             (W, None),
         ]
         for age_s, evidence in rows:
@@ -343,7 +347,7 @@ class LaunchEvidenceTest(unittest.TestCase):
 
     def test_a_runner_github_leaves_idle_while_a_job_of_its_size_waits(self):
         rows = [
-            (2 * B + 1, 1, Evidence.FAILED_TO_LAUNCH),
+            (2 * B + 1, 1, Evidence.LEFT_IDLE_WHILE_A_JOB_WAITED),
             (2 * B, 1, None),  # not yet idle for long enough
             # No job of its size has waited over B, or a runner covers each: surplus
             (2 * B + 1, 0, None),
@@ -836,8 +840,8 @@ class RuleOneNewestRunnerDecidesTest(unittest.TestCase):
         self.assertEqual(
             submissions,
             [
-                # trpro-slurm2's retry takes medium's first turn
-                Submission(MEDIUM, frozenset(), "trpro-slurm2"),
+                # trpro-slurm2's first retry takes medium's first turn
+                Submission(MEDIUM, frozenset(), "trpro-slurm2", retry=1),
                 Submission(SMALL, frozenset()),
                 Submission(MEDIUM, trpro),
                 Submission(MEDIUM, trpro),
@@ -908,7 +912,7 @@ class RuleTwoPinnedRetryTest(unittest.TestCase):
         self.assertEqual(
             submissions,
             [
-                Submission(MEDIUM, frozenset(), "trpro-slurm1"),
+                Submission(MEDIUM, frozenset(), "trpro-slurm1", retry=1),
                 Submission(MEDIUM, excluded),
                 Submission(MEDIUM, excluded),
             ],
@@ -941,14 +945,14 @@ class RuleTwoPinnedRetryTest(unittest.TestCase):
         )
         by_name = registrations(registration(small_pin, False))
         self.assertIn(
-            Submission(MEDIUM, frozenset(), "trpro-slurm1"),
+            Submission(MEDIUM, frozenset(), "trpro-slurm1", retry=1),
             plan_submissions([small_pin], by_name, jobs, records, {}, [], NOW, NOW),
         )
         # One that failed is a failed retry, not in flight
         hung = pinned_to("trpro-slurm1", allocation(2, age_s=B + 1))
         by_name = registrations(registration(hung, False))
         self.assertIn(
-            Submission(MEDIUM, frozenset(), "trpro-slurm1"),
+            Submission(MEDIUM, frozenset(), "trpro-slurm1", retry=1),
             plan_submissions([hung], by_name, jobs, records, {}, [], NOW, NOW),
         )
 
@@ -1317,56 +1321,114 @@ class SubmissionOrderTest(unittest.TestCase):
 
 
 class LaunchRecordLogLinesTest(unittest.TestCase):
-    def test_one_line_per_change(self):
+    def test_one_line_per_change_with_what_failed_and_where_to_look(self):
         before = usable_on("thor-slurm1", MEDIUM)
         failed = on("trpro-slurm1", ended(812345, "FAILED"))
         after = filed(before, (failed, None))
         self.assertEqual(
             launch_record_log_lines(before, after, NOW),
             [
-                f"{MEDIUM}: out on trpro-slurm1 (Slurm job 812345 failed to launch);"
-                " retry there in 60 s"
+                (
+                    logging.WARNING,
+                    f"{MEDIUM}: out on trpro-slurm1: Slurm job 812345 ended without taking a job"
+                    " (its log: /var/log/slurm-ci/slurm-ci-812345.out on trpro-slurm1); next"
+                    " pinned runner there in 60 s",
+                )
             ],
         )
         self.assertEqual(launch_record_log_lines(after, after, NOW), [])
-        retry = on(
-            "trpro-slurm1",
-            ended(812350, "FAILED", submitted_at=NOW + 70, now=NOW + 100),
-        )
-        doubled = filed(after, (retry, None), now=NOW + 100)
+        retry = on("trpro-slurm1", allocation(812350, submitted_at=NOW + 70, age_s=B))
+        doubled = filed(after, (retry, registration(retry, False)), now=NOW + 100)
         self.assertEqual(
             launch_record_log_lines(after, doubled, NOW + 100),
             [
-                f"{MEDIUM}: out on trpro-slurm1 (Slurm job 812350 failed to launch,"
-                " retry 1); retry there in 120 s"
+                (
+                    logging.WARNING,
+                    f"{MEDIUM}: still out on trpro-slurm1: Slurm job 812350 was still offline"
+                    f" {B} s after it started (its log: /var/log/slurm-ci/slurm-ci-812350.out on"
+                    " trpro-slurm1); 1st failed retry; next pinned runner there in 120 s",
+                )
             ],
         )
         took = on("trpro-slurm1", allocation(812360, submitted_at=NOW + 230))
         back = filed(doubled, (took, registration(took, is_busy=True)), now=NOW + 240)
         self.assertEqual(
             launch_record_log_lines(doubled, back, NOW + 240),
-            [f"{MEDIUM}: usable again on trpro-slurm1 (Slurm job 812360 took a job)"],
+            [
+                (
+                    logging.INFO,
+                    f"{MEDIUM}: usable again on trpro-slurm1 (Slurm job 812360 took a job)",
+                )
+            ],
         )
 
-    def test_a_size_usable_nowhere_and_a_failure_with_no_node(self):
+    def test_a_size_usable_nowhere_says_why(self):
         before = usable_on("thor-slurm1", MEDIUM)
         failed = on("thor-slurm1", ended(7, "FAILED", submitted_at=NOW - 30))
         after = filed(before, (failed, None))
         self.assertEqual(
             launch_record_log_lines(before, after, NOW)[-1],
-            f"{MEDIUM}: usable on no node; one runner at a time",
+            (
+                logging.WARNING,
+                f"{MEDIUM}: one runner at a time: no node is known to work for it",
+            ),
         )
         nodeless = ended(8, "FAILED", submitted_at=NOW - 20)
-        later = filed(after, (nodeless, None), now=NOW + 30)
+        later = filed(before, (nodeless, None), now=NOW + 30)
         self.assertEqual(
-            launch_record_log_lines(after, later, NOW + 30),
-            [f"{MEDIUM}: a runner failed with no node; next runner in 60 s"],
+            launch_record_log_lines(before, later, NOW + 30),
+            [
+                (
+                    logging.WARNING,
+                    f"{MEDIUM}: a runner failed with no node; next runner in 60 s",
+                ),
+                (
+                    logging.WARNING,
+                    f"{MEDIUM}: one runner at a time: a runner failed with no node",
+                ),
+            ],
         )
-        # A refusal is logged where it happens, with sbatch's message
+        # A refusal itself is logged where it happens, with sbatch's message
         refused = record_refused_submission(
-            after, Submission(MEDIUM, frozenset()), "gha-test-x", NOW + 30
+            before, Submission(MEDIUM, frozenset()), "gha-test-x", NOW + 30
         )
-        self.assertEqual(launch_record_log_lines(after, refused, NOW + 30), [])
+        self.assertEqual(
+            launch_record_log_lines(before, refused, NOW + 30),
+            [
+                (
+                    logging.WARNING,
+                    f"{MEDIUM}: one runner at a time: Slurm refused a submission (see above)",
+                )
+            ],
+        )
+        took = on("thor-slurm1", allocation(9, submitted_at=NOW + 40))
+        back = filed(refused, (took, registration(took, is_busy=True)), now=NOW + 60)
+        self.assertEqual(
+            launch_record_log_lines(refused, back, NOW + 60),
+            [
+                (
+                    logging.INFO,
+                    f"{MEDIUM}: works on some node again; every waiting job gets a runner",
+                )
+            ],
+        )
+
+    def test_ordinals(self):
+        self.assertEqual(
+            [ordinal(n) for n in (1, 2, 3, 4, 11, 12, 13, 21, 22, 101)],
+            [
+                "1st",
+                "2nd",
+                "3rd",
+                "4th",
+                "11th",
+                "12th",
+                "13th",
+                "21st",
+                "22nd",
+                "101st",
+            ],
+        )
 
 
 if __name__ == "__main__":

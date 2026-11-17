@@ -22,6 +22,7 @@ import this module alone; supply.py and demand.py fill them in.
 
 from __future__ import annotations
 
+import logging
 from collections import Counter
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -33,6 +34,7 @@ from config import (
     IDLE_ALLOWANCE_S,
     MAX_RETRY_WAIT_S,
     REFUSED_NAMES_KEPT_S,
+    SLURM_OUTPUT_PATH,
     UNUSED_REGISTRATION_LIFETIME_S,
 )
 
@@ -119,10 +121,20 @@ class Phase(Enum):
 
 
 class Evidence(Enum):
-    """What one allocation says, this cycle, about whether its size label can launch runners on its node."""
+    """What one allocation says, this cycle, about whether its size label can launch runners on its node:
+    it took a job, or it failed to launch in one of three ways, which point at different faults."""
 
     TOOK_A_JOB = "took a job"
-    FAILED_TO_LAUNCH = "failed to launch"
+    # The image, Docker, the runner itself, or Slurm's launch: its log says which
+    ENDED_WITHOUT_A_JOB = "ended without taking a job"
+    # A slow boot, CVMFS, or a hang
+    STILL_OFFLINE_AT_B = "was still offline B after it started"
+    # GitHub is not giving jobs to our runners
+    LEFT_IDLE_WHILE_A_JOB_WAITED = "stayed idle while a job of its size waited"
+
+    @property
+    def failed_to_launch(self) -> bool:
+        return self is not Evidence.TOOK_A_JOB
 
 
 @dataclass(frozen=True)
@@ -136,6 +148,7 @@ class NodeRecord:
     # The newest that failed to launch there; the node is out when this is newer (a tie is usable)
     newest_failure_submitted_at: float | None = None
     newest_failure_slurm_job_id: int | None = None
+    newest_failure_kind: Evidence | None = None  # for the log: how it failed
     # When that failure was first seen: the retry wait counts from here
     newest_failure_seen_at: float | None = None
     # When the failure that put the node out was seen; None while usable
@@ -189,6 +202,7 @@ class Submission:
     excluded_nodes: frozenset[str]  # sbatch --exclude; empty for a pinned runner
     # sbatch --nodes=1 --nodelist: the retry of a node that is out for the size (rule 2)
     pinned_node: str | None = None
+    retry: int = 0  # for the log: which retry of that node this is, from 1
 
 
 @dataclass(frozen=True)
@@ -292,10 +306,11 @@ def launch_evidence(
     uncovered_jobs_waiting_past_b: int,
     now: float,
 ) -> Evidence | None:
-    """TOOK_A_JOB if busy or named on a job read this cycle. FAILED_TO_LAUNCH if it ended FAILED, NODE_FAIL
-    or BOOT_FAIL, or ran and ended CANCELLED; or is RUNNING, registered and offline between B and W old; or
-    is online and idle past 2B while a job of its size has waited over B that no runner covers
-    (uncovered_jobs_waiting_past_b > 0). Otherwise None."""
+    """TOOK_A_JOB if busy or named on a job read this cycle. Failed to launch: ENDED_WITHOUT_A_JOB if it
+    ended FAILED, NODE_FAIL or BOOT_FAIL, or ran and ended CANCELLED; STILL_OFFLINE_AT_B if it is RUNNING,
+    registered and offline between B and W old; LEFT_IDLE_WHILE_A_JOB_WAITED if it is online and idle past
+    2B while a job of its size has waited over B that no runner covers (uncovered_jobs_waiting_past_b > 0).
+    Otherwise None."""
     if allocation.runner_name in runner_names_on_jobs or (
         registration is not None and registration.is_busy
     ):
@@ -305,7 +320,7 @@ def launch_evidence(
         # Slurm stamps a job cancelled while pending with a start equal to its end
         ran = started_at is not None and ended_at is not None and started_at < ended_at
         if allocation.state != "CANCELLED" or ran:
-            return Evidence.FAILED_TO_LAUNCH
+            return Evidence.ENDED_WITHOUT_A_JOB
         return None
     if (
         allocation.state != "RUNNING"
@@ -318,11 +333,11 @@ def launch_evidence(
         return None  # its batch script stops it at W; what it showed before W is already recorded
     if not registration.is_online:
         if age_s >= BOOT_ALLOWANCE_S:
-            return Evidence.FAILED_TO_LAUNCH
+            return Evidence.STILL_OFFLINE_AT_B
         return None
     # GitHub gives a waiting job to an online idle runner, so this one is not being given jobs
     if age_s > 2 * BOOT_ALLOWANCE_S and uncovered_jobs_waiting_past_b > 0:
-        return Evidence.FAILED_TO_LAUNCH
+        return Evidence.LEFT_IDLE_WHILE_A_JOB_WAITED
     return None
 
 
@@ -431,7 +446,7 @@ def file_launch_evidence(
                 by_node_and_size.get(key), allocation, evidence, seen_at
             )
         elif (
-            evidence is Evidence.FAILED_TO_LAUNCH
+            evidence.failed_to_launch
             and allocation.submitted_at > newest_success_by_size.get(size_label, 0.0)
             and (
                 size_record is None
@@ -484,6 +499,7 @@ def record_node_evidence(
         record,
         newest_failure_submitted_at=submitted_at,
         newest_failure_slurm_job_id=allocation.slurm_job_id,
+        newest_failure_kind=evidence,
         newest_failure_seen_at=seen_at,
     )
     if record.out_since is None:
@@ -780,7 +796,8 @@ def plan_submissions(
         for node in nodes_due_a_pinned_runner(
             records, size_label, nodes_in_flight, planned_at
         ):
-            submissions.append(Submission(size_label, frozenset(), pinned_node=node))
+            retry = records.by_node_and_size[(node, size_label)].failed_retries + 1
+            submissions.append(Submission(size_label, frozenset(), node, retry))
         excluded = nodes_a_new_runner_excludes(records, size_label, planned_at)
         shortfall = waiting_jobs - unpinned_in_flight[size_label]
         size_record = records.by_size.get(size_label, SizeRecord())
@@ -883,33 +900,41 @@ def jobs_left_waiting_by_size_label(
 
 def launch_record_log_lines(
     before: LaunchRecords, after: LaunchRecords, now: float
-) -> list[str]:
-    """Pure: one line per change: a node out for a size (or its retry failed) or usable again, a size
-    usable nowhere or somewhere again, a failure with no node. A refusal, and what it made the daemon
-    forget, is logged where it happens, with sbatch's message."""
+) -> list[tuple[int, str]]:
+    """Pure: (logging level, line) per change. WARNING: a node out for a size, its retry failed, a size
+    usable nowhere, a failure with no node. INFO: a node or a size usable again. A refusal, and what it made
+    the daemon forget, is logged where it happens, with sbatch's message."""
     lines = []
     for (node, size_label), new in sorted(after.by_node_and_size.items()):
         old = before.by_node_and_size.get((node, size_label))
-        if node_is_out(new) and (
-            not node_is_out(old) or new.failed_retries != old.failed_retries
-        ):
-            retry = f", retry {new.failed_retries}" if new.failed_retries else ""
+        if node_is_out(new) and not node_is_out(old):
             lines.append(
-                f"{size_label}: out on {node} (Slurm job {new.newest_failure_slurm_job_id} failed to"
-                f" launch{retry}); retry there in {node_retry_due_at(new) - now:.0f} s"
+                (
+                    logging.WARNING,
+                    f"{size_label}: out on {node}: {failure_on_node(new, node)}; next pinned"
+                    f" runner there in {node_retry_due_at(new) - now:.0f} s",
+                )
+            )
+        elif node_is_out(new) and new.failed_retries != old.failed_retries:
+            lines.append(
+                (
+                    logging.WARNING,
+                    f"{size_label}: still out on {node}: {failure_on_node(new, node)};"
+                    f" {ordinal(new.failed_retries)} failed retry; next pinned runner there in"
+                    f" {node_retry_due_at(new) - now:.0f} s",
+                )
             )
         elif node_is_out(old) and not node_is_out(new) and new.forgotten_at is None:
             lines.append(
-                f"{size_label}: usable again on {node} (Slurm job {new.newest_success_slurm_job_id}"
-                " took a job)"
+                (
+                    logging.INFO,
+                    f"{size_label}: usable again on {node} (Slurm job"
+                    f" {new.newest_success_slurm_job_id} took a job)",
+                )
             )
-    size_labels = {size_label for _, size_label in before.by_node_and_size} | set(
-        before.by_size
-    )
-    size_labels |= {size_label for _, size_label in after.by_node_and_size} | set(
-        after.by_size
-    )
-    for size_label in sorted(size_labels):
+    size_labels = {size_label for _, size_label in after.by_node_and_size}
+    size_labels |= {size_label for _, size_label in before.by_node_and_size}
+    for size_label in sorted(size_labels | set(before.by_size) | set(after.by_size)):
         new = after.by_size.get(size_label, SizeRecord())
         old = before.by_size.get(size_label, SizeRecord())
         refused = new.refused_runner_names.keys() - old.refused_runner_names.keys()
@@ -918,11 +943,55 @@ def launch_record_log_lines(
             if not refused:
                 wait_s = next_unpinned_runner_at(after, size_label) - now
                 lines.append(
-                    f"{size_label}: a runner failed with no node; next runner in {wait_s:.0f} s"
+                    (
+                        logging.WARNING,
+                        f"{size_label}: a runner failed with no node; next runner in"
+                        f" {wait_s:.0f} s",
+                    )
                 )
         was_usable = size_usable_somewhere(before, size_label)
         if was_usable and not size_usable_somewhere(after, size_label):
-            lines.append(f"{size_label}: usable on no node; one runner at a time")
+            lines.append(
+                (
+                    logging.WARNING,
+                    f"{size_label}: one runner at a time: {why_usable_nowhere(after, size_label)}",
+                )
+            )
         elif not was_usable and size_usable_somewhere(after, size_label):
-            lines.append(f"{size_label}: usable again; served in full")
+            lines.append(
+                (
+                    logging.INFO,
+                    f"{size_label}: works on some node again; every waiting job gets a runner",
+                )
+            )
     return lines
+
+
+def failure_on_node(record: NodeRecord, node: str) -> str:
+    """Pure: the newest failure on the node, and where its runner's log is."""
+    slurm_job_id = record.newest_failure_slurm_job_id
+    how = {
+        Evidence.STILL_OFFLINE_AT_B: f"was still offline {BOOT_ALLOWANCE_S} s after it started",
+        Evidence.LEFT_IDLE_WHILE_A_JOB_WAITED: (
+            "stayed idle while a job of its size waited, and GitHub did not give it the job"
+        ),
+    }.get(record.newest_failure_kind, "ended without taking a job")
+    log_path = SLURM_OUTPUT_PATH.replace("%j", str(slurm_job_id))
+    return f"Slurm job {slurm_job_id} {how} (its log: {log_path} on {node})"
+
+
+def why_usable_nowhere(records: LaunchRecords, size_label: str) -> str:
+    """Pure: what holds the size to one runner at a time."""
+    size_record = records.by_size.get(size_label, SizeRecord())
+    if size_record.outstanding_since is None:
+        return "no node is known to work for it"
+    if size_record.outstanding_since in size_record.refused_runner_names.values():
+        return "Slurm refused a submission (see above)"
+    return "a runner failed with no node"
+
+
+def ordinal(number: int) -> str:
+    """Pure: 1st, 2nd, 3rd, 4th ... 11th, 12th, 13th ... 21st."""
+    if 10 <= number % 100 <= 20:
+        return f"{number}th"
+    return f"{number}{ {1: 'st', 2: 'nd', 3: 'rd'}.get(number % 10, 'th') }"

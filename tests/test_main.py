@@ -487,6 +487,24 @@ class NodeRuleScenarioTest(CycleAgainstFakes):
         self.assertEqual(where[1], ["excluding:trpro-slurm2"] * 4)
         self.assertTrue(self.served())
 
+    def test_a_refused_pinned_runner_is_logged_with_what_it_forgot(self):
+        # trpro-slurm1 shrank: it can no longer hold a medium runner, so Slurm refuses its retry
+        self.slurm.nodes = {"trpro-slurm1": 1, "thor-slurm1": 8}
+        records = usable_on("thor-slurm1", MEDIUM)
+        records = out_on(records, "trpro-slurm1", MEDIUM, seen_at=NOW - 3600)
+        self.queue(1)
+        with self.assertLogs(level=logging.WARNING) as logs:
+            memory, sent = self.cycles(memory_with(records), 1)
+        self.assertEqual(self.placements(sent[0]), ["pinned:trpro-slurm1"])
+        (line,) = [each for each in logs.output if "Slurm refused gha-" in each]
+        self.assertTrue(line.startswith("WARNING:"))
+        self.assertIn(
+            "pinned to trpro-slurm1; trpro-slurm1 is untried for this size again", line
+        )
+        self.assertTrue(
+            any("one runner at a time: Slurm refused" in each for each in logs.output)
+        )
+
     def test_one_blip_in_a_wave_changes_no_record_and_the_wave_goes_on(self):
         # The third sbatch of the wave gets no answer from slurmctld and leaves no job
         records = usable_on("thor-slurm1", MEDIUM)

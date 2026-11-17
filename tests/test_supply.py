@@ -1096,6 +1096,17 @@ class GitHubSideTest(unittest.TestCase):
                 submit_runner(self.github, self.repo, PREFIX, ANYWHERE)
         self.assertEqual(self.deletes(), [])
 
+    def test_a_pinned_runners_line_says_which_retry_it_is(self):
+        self.jit_config_reply()
+        with self.assertLogs("supply", logging.INFO) as logs:
+            submit_runner(
+                self.github,
+                self.repo,
+                PREFIX,
+                Submission(MEDIUM, frozenset(), "trpro-slurm1", retry=2),
+            )
+        self.assertIn(", pinned to trpro-slurm1, retry 2: ", logs.output[-1])
+
     def test_a_failed_sbatch_that_squeue_cannot_check_keeps_the_registration(self):
         self.jit_config_reply()
         self.slurm.failing_commands.update({"sbatch", "squeue"})

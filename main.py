@@ -292,8 +292,8 @@ def run_cycle(
         submitted_this_cycle += submitted
 
     # 7. Log what the node rule now believes, where it changed
-    for line in launch_record_log_lines(memory.launch_records, records, clock()):
-        logger.info(f"{repo.name}: {line}")
+    for level, line in launch_record_log_lines(memory.launch_records, records, clock()):
+        logger.log(level, f"{repo.name}: {line}")
 
     # 8. Remember what this cycle saw
     sightings = update_sightings(
@@ -472,7 +472,10 @@ def refusal_log_line(
     trpro-slurm1; next runner in 40 s at the earliest"."""
     line = f"{submission.size_label}: Slurm refused {refused.runner_name} ({refused})"
     if submission.pinned_node is not None:
-        return f"{line}, pinned to {submission.pinned_node}; forgot {submission.pinned_node}"
+        return (
+            f"{line}, pinned to {submission.pinned_node}; {submission.pinned_node} is untried for"
+            " this size again"
+        )
     if submission.excluded_nodes:
         line += f", excluding {','.join(sorted(submission.excluded_nodes))}"
     wait_s = max(
