@@ -33,7 +33,7 @@ from plan import (
     jobs_left_waiting_by_label,
     launch_evidence,
     launch_record_log_lines,
-    narrowed_exclusions,
+    pending_runners_by_narrowed_exclusion,
     next_unpinned_runner_at,
     node_retry_due_at,
     nodes_a_new_runner_excludes,
@@ -158,14 +158,14 @@ class PhaseOfAllocationTest(unittest.TestCase):
                 "pending, registered",
                 allocation(1, "PENDING"),
                 "offline",
-                Phase.WAITING_FOR_NODE,
+                Phase.PENDING,
             ),
             (
                 # A list read can miss a fresh registration: still on its way
                 "pending, unregistered",
                 allocation(1, "PENDING"),
                 None,
-                Phase.WAITING_FOR_NODE,
+                Phase.PENDING,
             ),
             (
                 "pending, unregistered for a day",
@@ -245,7 +245,7 @@ class AllocationsToCancelTest(unittest.TestCase):
         unregistered = allocation(1, "PENDING", submitted_at=NOW - A_DAY)
         held = allocation(2, "PENDING", is_held=True)
         just_submitted = allocation(7, "PENDING")  # its registration not listed yet
-        waiting_for_node = allocation(3, "PENDING")
+        pending_registered = allocation(3, "PENDING")
         running_unregistered = allocation(4)
         running_busy = allocation(5)
         finished = ended(6, "FAILED")
@@ -253,14 +253,14 @@ class AllocationsToCancelTest(unittest.TestCase):
             unregistered,
             held,
             just_submitted,
-            waiting_for_node,
+            pending_registered,
             running_unregistered,
             running_busy,
             finished,
         ]
         by_name = registrations(
             registration(held, False),
-            registration(waiting_for_node, False),
+            registration(pending_registered, False),
             registration(running_busy, True, True),
         )
         to_cancel = allocations_to_cancel(allocations, by_name, NOW)
@@ -918,10 +918,10 @@ class RuleTwoPinnedRetryTest(unittest.TestCase):
         excluded = frozenset({"trpro-slurm1"})
         jobs = demand(waiting(1))
         # Pending on that node (it may be drained): in flight, and never supply
-        waiting_pin = pinned_to("trpro-slurm1", allocation(1, "PENDING"))
-        by_name = registrations(registration(waiting_pin, False))
+        pending_pin = pinned_to("trpro-slurm1", allocation(1, "PENDING"))
+        by_name = registrations(registration(pending_pin, False))
         self.assertEqual(
-            plan_submissions([waiting_pin], by_name, jobs, records, {}, [], NOW, NOW),
+            plan_submissions([pending_pin], by_name, jobs, records, {}, [], NOW, NOW),
             [Submission(MEDIUM, excluded)],
         )
         # Sent earlier this cycle
@@ -1005,7 +1005,7 @@ class RuleThreeUsableNowhereTest(unittest.TestCase):
 
 
 class RuleFourNarrowedExclusionsTest(unittest.TestCase):
-    """4. A runner still waiting in Slurm's queue is never left excluding a node that a new runner of its
+    """4. A runner still pending in Slurm's queue is never left excluding a node that a new runner of its
     size would now be allowed on."""
 
     def pending(self, slurm_job_id, excluded, **changes):
@@ -1015,7 +1015,7 @@ class RuleFourNarrowedExclusionsTest(unittest.TestCase):
             **changes,
         )
 
-    def test_only_waiting_unpinned_runners_and_never_a_node_added(self):
+    def test_only_pending_unpinned_runners_and_never_a_node_added(self):
         trpro = {"trpro-slurm1", "trpro-slurm2"}
         allowed_back = self.pending(1, trpro)
         unchanged = self.pending(2, {"trpro-slurm1"})
@@ -1032,7 +1032,7 @@ class RuleFourNarrowedExclusionsTest(unittest.TestCase):
         unreadable = replace(unreadable, excluded_nodes=None)
         # Grouped by new exclusion: one scontrol call each
         self.assertEqual(
-            narrowed_exclusions(
+            pending_runners_by_narrowed_exclusion(
                 [
                     allowed_back,
                     unchanged,
@@ -1049,15 +1049,15 @@ class RuleFourNarrowedExclusionsTest(unittest.TestCase):
             {frozenset({"trpro-slurm1"}): [allowed_back], frozenset(): [small]},
         )
 
-    def test_a_size_usable_nowhere_releases_its_runner_as_waits_pass(self):
-        # After a fault on every node its one waiting runner excluded them all; it would never start
+    def test_a_size_usable_nowhere_releases_its_pending_runner_as_waits_pass(self):
+        # After a fault on every node its one pending runner excluded them all; it would never start
         everything = {"delta-slurm1", "thor-slurm1", "trpro-slurm1"}
         stuck = self.pending(1, everything)
         records = NO_LAUNCH_RECORDS
         for node, seen_at in (("delta-slurm1", NOW - 60), ("thor-slurm1", NOW - 10)):
             records = out_on(records, node, MEDIUM, seen_at=seen_at)
         self.assertEqual(
-            narrowed_exclusions([stuck], records, NOW),
+            pending_runners_by_narrowed_exclusion([stuck], records, NOW),
             {frozenset({"thor-slurm1"}): [stuck]},
         )
 
@@ -1094,7 +1094,7 @@ class RuleFiveNodelessFailuresTest(unittest.TestCase):
         records = filed(records, (next_one, None), now=NOW + 100)
         self.assertEqual(next_unpinned_runner_at(records, MEDIUM), NOW + 220)
 
-    def test_the_same_failure_seen_on_a_second_pass_does_not_restart_the_wait(self):
+    def test_the_same_failure_seen_on_a_second_cycle_does_not_restart_the_wait(self):
         failed = self.nodeless(1, NOW - 100)
         records = filed(NO_LAUNCH_RECORDS, (failed, None))
         self.assertEqual(filed(records, (failed, None), now=NOW + 30), records)
@@ -1130,7 +1130,7 @@ class RuleFiveNodelessFailuresTest(unittest.TestCase):
 
     def test_the_failed_record_of_a_refused_submission_is_not_counted_again(self):
         # As job 753319: sbatch refused it, and squeue lists it FAILED with no node for MinJobAge. sbatch
-        # ran 5 s into the pass, so its record is newer than anything the refusal stamped
+        # ran 5 s into the cycle, so its record is newer than anything the refusal stamped
         refused = Allocation(
             1, "gha-test-1", MEDIUM, "FAILED", False, NOW + 5, NOW + 5, NOW + 5
         )

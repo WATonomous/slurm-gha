@@ -387,12 +387,12 @@ def narrow_pending_exclusions(
     allocations: list[Allocation], excluded_nodes: frozenset[str]
 ) -> set[int]:
     """scontrol update JobId=<id>,<id>,... ExcNodeList=<nodes> for these pending runners of ours, at most
-    SCONTROL_JOB_IDS_PER_CALL ids a call: the whole new list, empty to clear it. The ids Slurm refused.
+    SCONTROL_JOB_IDS_PER_CALL ids a call: the whole new list, empty to clear it. The ids Slurm did not update.
     slurmctld updates each listed job still pending, starts it at once if it can now run, and refuses the
     others (started, ended, gone) while still updating the rest; it then exits 1 with one "<reason> for job
     <id>" line each, logged at debug. A call that fails otherwise is logged at warning and all its ids are
-    returned. Either way the next pass reads %x again."""
-    refused = set()
+    returned. Either way the next cycle reads %x again."""
+    not_updated = set()
     ids = [allocation.slurm_job_id for allocation in allocations]
     for first in range(0, len(ids), SCONTROL_JOB_IDS_PER_CALL):
         chunk = ids[first : first + SCONTROL_JOB_IDS_PER_CALL]
@@ -407,12 +407,12 @@ def narrow_pending_exclusions(
         except SlurmUnavailable as error:
             named = {int(job_id) for job_id in re.findall(r"for job (\d+)", str(error))}
             if named:
-                logger.debug(f"Slurm left some waiting runners as they were: {error}")
-                refused |= named
+                logger.debug(f"Slurm left some pending runners as they were: {error}")
+                not_updated |= named
             else:
-                logger.warning(f"Could not narrow waiting runners' exclusions: {error}")
-                refused |= set(chunk)
-    return refused
+                logger.warning(f"Could not narrow pending runners' exclusions: {error}")
+                not_updated |= set(chunk)
+    return not_updated
 
 
 def cancel_pending_allocation(allocation: Allocation) -> None:
@@ -441,7 +441,7 @@ def delete_registration(
 ) -> bool:
     """DELETE the registration of a runner that will take no job (why says which, for the log: its Slurm
     job has ended, or sbatch created none). True once GitHub has answered: deleted (204), already gone
-    (404), or refused (422: it believes a job is on that runner, and that job then waits as it would
+    (404), or declined (422: it believes a job is on that runner, and that job then waits as it would
     without the delete). False after any other failure, logged; the next cycle tries again."""
     try:
         status = github.delete(f"{repo_api_base_url}/actions/runners/{runner_id}")
@@ -452,7 +452,7 @@ def delete_registration(
         return False
     if status == 422:
         logger.warning(
-            f"GitHub refused to delete the registration of {runner_name} ({why}):"
+            f"GitHub declined to delete the registration of {runner_name} ({why}):"
             " it believes a job is on that runner"
         )
     elif status == 404:

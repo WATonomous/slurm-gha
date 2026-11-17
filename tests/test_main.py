@@ -165,7 +165,7 @@ class RunCycleTest(CycleAgainstFakes):
     def test_a_restart_in_the_middle_of_a_wave(self):
         busy = [self.add_runner("RUNNING", busy=True) for _ in range(6)]
         for _ in range(2):
-            # Online and idle, and registered and waiting for a node: both can take a job
+            # Online and idle, and registered and pending: both can take a job
             self.add_runner("RUNNING")
             self.add_runner("PENDING", "offline")
         # Its registration is not listed yet: still on its way
@@ -300,9 +300,9 @@ class RunCycleTest(CycleAgainstFakes):
 
 
 class NodeRuleScenarioTest(CycleAgainstFakes):
-    """The node rule over many passes, against a fake Slurm with named nodes and first-fit placement. A
-    runner that starts on a node either dies there before the next pass, or takes a waiting job and
-    finishes it two passes later. 30 s between passes; submissions 1 s apart, as the daemon spaces them."""
+    """The node rule over many cycles, against a fake Slurm with named nodes and first-fit placement. A
+    runner that starts on a node either dies there before the next cycle, or takes a waiting job and
+    finishes it two cycles later. 30 s between cycles; submissions 1 s apart, as the daemon spaces them."""
 
     def setUp(self):
         super().setUp()
@@ -312,17 +312,17 @@ class NodeRuleScenarioTest(CycleAgainstFakes):
         self.slurm.submit_spacing_s = 1
         self.now = NOW
         self.github_jobs = []
-        self.took_a_job_in = {}  # Slurm job id -> the pass in which it took a job
-        self.pass_index = 0
+        self.took_a_job_in = {}  # Slurm job id -> the cycle in which it took a job
+        self.cycle_index = 0
 
     def queue(self, count):
         first = len(self.github_jobs)
         self.github_jobs += [job(first + i, "queued", [MEDIUM]) for i in range(count)]
 
-    def passes(self, memory, count, kills=frozenset(), kills_every_other=frozenset()):
-        """count passes; before each, the runners that started earlier act on their node. The memory, and
-        per pass the sbatch argv sent in it."""
-        sent_per_pass = []
+    def cycles(self, memory, count, kills=frozenset(), kills_every_other=frozenset()):
+        """count cycles; before each, the runners that started earlier act on their node. The memory, and
+        per cycle the sbatch argv sent in it."""
+        sent_per_cycle = []
         for _ in range(count):
             self.slurm.now = self.now
             self.act(kills, kills_every_other)
@@ -335,10 +335,10 @@ class NodeRuleScenarioTest(CycleAgainstFakes):
             self.jobs(*self.github_jobs)
             before = len(self.slurm.commands("sbatch"))
             memory = self.cycle(memory, self.now)
-            sent_per_pass.append(self.slurm.commands("sbatch")[before:])
+            sent_per_cycle.append(self.slurm.commands("sbatch")[before:])
             self.now += 30
-            self.pass_index += 1
-        return memory, sent_per_pass
+            self.cycle_index += 1
+        return memory, sent_per_cycle
 
     def act(self, kills, kills_every_other):
         for slurm_job_id, each in sorted(self.slurm.jobs.items()):
@@ -346,7 +346,7 @@ class NodeRuleScenarioTest(CycleAgainstFakes):
                 continue
             name, node = each["name"], each["node"]
             if slurm_job_id in self.took_a_job_in:
-                if self.pass_index - self.took_a_job_in[slurm_job_id] >= 2:
+                if self.cycle_index - self.took_a_job_in[slurm_job_id] >= 2:
                     self.end(slurm_job_id, "COMPLETED")
                     for github_job in self.github_jobs:
                         if github_job["runner_name"] == name:
@@ -361,7 +361,7 @@ class NodeRuleScenarioTest(CycleAgainstFakes):
                     entry.update(status="online", busy=bool(queued))
             if queued:
                 queued[0].update(status="in_progress", runner_name=name)
-                self.took_a_job_in[slurm_job_id] = self.pass_index
+                self.took_a_job_in[slurm_job_id] = self.cycle_index
 
     def end(self, slurm_job_id, state):
         name = self.slurm.jobs[slurm_job_id]["name"]
@@ -372,7 +372,7 @@ class NodeRuleScenarioTest(CycleAgainstFakes):
         return all(j["status"] != "queued" for j in self.github_jobs)
 
     def placements(self, sent):
-        """Where each sbatch of a pass asked to go: "pinned:<node>", "excluding:<nodes>" or "anywhere"."""
+        """Where each sbatch of a cycle asked to go: "pinned:<node>", "excluding:<nodes>" or "anywhere"."""
         where = []
         for argv in sent:
             options = dict(arg.split("=", 1) for arg in argv if "=" in arg)
@@ -393,7 +393,7 @@ class NodeRuleScenarioTest(CycleAgainstFakes):
 
     def test_restart_next_to_a_node_that_kills_every_runner(self):
         self.queue(12)
-        memory, sent = self.passes(empty_memory(), 8, kills={"trpro-slurm1"})
+        memory, sent = self.cycles(empty_memory(), 8, kills={"trpro-slurm1"})
         where = [self.placements(each) for each in sent]
         # Usable nowhere: one runner, which Slurm puts on trpro-slurm1, where it dies
         self.assertEqual(where[0], ["anywhere"])
@@ -412,7 +412,7 @@ class NodeRuleScenarioTest(CycleAgainstFakes):
         self.slurm.nodes = {"trpro-slurm1": 8, "thor-slurm1": 4}
         self.queue(16)
         with self.assertLogs(level=logging.INFO) as logs:
-            memory, sent = self.passes(memory, 20, kills_every_other={"trpro-slurm1"})
+            memory, sent = self.cycles(memory, 20, kills_every_other={"trpro-slurm1"})
         lines = "\n".join(logs.output)
         self.assertIn(f"{MEDIUM}: out on trpro-slurm1", lines)
         self.assertIn(f"{MEDIUM}: usable again on trpro-slurm1", lines)
@@ -428,7 +428,7 @@ class NodeRuleScenarioTest(CycleAgainstFakes):
     def test_a_size_that_fails_everywhere_gets_one_runner_at_a_time(self):
         self.queue(20)
         everywhere = set(self.slurm.nodes)
-        memory, sent = self.passes(empty_memory(), 40, kills=everywhere)
+        memory, sent = self.cycles(empty_memory(), 40, kills=everywhere)
         self.assertLessEqual(max(len(each) for each in sent), 1)
         where = [w for each in sent for w in self.placements(each)]
         self.assertFalse(any(w.startswith("pinned") for w in where))
@@ -438,7 +438,7 @@ class NodeRuleScenarioTest(CycleAgainstFakes):
         self.assertGreaterEqual(started, 3)
         self.assertLessEqual(started, 3 * 5)
 
-    def test_a_fault_on_every_node_then_recovery_releases_the_waiting_runners(self):
+    def test_a_fault_on_every_node_then_recovery_releases_the_pending_runners(self):
         # Every node went out for the size, and the runners submitted meanwhile exclude all of them
         records = NO_LAUNCH_RECORDS
         for node in self.slurm.nodes:
@@ -450,8 +450,8 @@ class NodeRuleScenarioTest(CycleAgainstFakes):
         ]
         self.queue(6)
         self.assertIn("|thor-slurm1,trpro-slurm[1-2]\n", self.slurm.squeue_output())
-        # The fault is gone. As each node's wait passes, the waiting runners are released onto it
-        memory, sent = self.passes(memory_with(records), 8)
+        # The fault is gone. As each node's wait passes, the pending runners are released onto it
+        memory, sent = self.cycles(memory_with(records), 8)
         self.assertTrue(
             all(self.slurm.jobs[each]["started_at"] != "N/A" for each in stuck)
         )
@@ -468,7 +468,7 @@ class NodeRuleScenarioTest(CycleAgainstFakes):
         records = out_on(records, "trpro-slurm2", MEDIUM, seen_at=NOW)
         self.queue(4)
         with self.assertLogs(level=logging.INFO) as logs:
-            memory, sent = self.passes(memory_with(records), 3)
+            memory, sent = self.cycles(memory_with(records), 3)
         where = [self.placements(each) for each in sent]
         # Its retry fails; sinfo does not list it, so it is forgotten, and the runners planned naming it
         # are not sent
@@ -495,7 +495,7 @@ class NodeRuleScenarioTest(CycleAgainstFakes):
         self.queue(6)
         memory = memory_with(records)
         with self.assertLogs(level=logging.WARNING) as logs:
-            memory, sent = self.passes(memory, 1)
+            memory, sent = self.cycles(memory, 1)
         self.assertEqual(self.placements(sent[0]), ["excluding:trpro-slurm1"] * 6)
         self.assertEqual(sum("not counted" in line for line in logs.output), 1)
         self.assertFalse(any("no more submissions" in line for line in logs.output))
@@ -504,7 +504,7 @@ class NodeRuleScenarioTest(CycleAgainstFakes):
         self.assertTrue(size_usable_somewhere(memory.launch_records, MEDIUM))
         self.assertEqual(len(self.slurm.commands("sinfo")), 1)
         # Next cycle the one job left without a runner gets one, still away from the sick node
-        memory, sent = self.passes(memory, 1)
+        memory, sent = self.cycles(memory, 1)
         self.assertEqual(self.placements(sent[0]), ["excluding:trpro-slurm1"])
 
     def test_the_count_of_blips_starts_again_each_cycle(self):
@@ -513,9 +513,9 @@ class NodeRuleScenarioTest(CycleAgainstFakes):
         self.slurm.sbatch_unreachable_calls = {1, 7}
         self.queue(6)
         with self.assertLogs(level=logging.WARNING) as logs:
-            memory, first = self.passes(memory_with(records), 1)
+            memory, first = self.cycles(memory_with(records), 1)
             self.queue(3)
-            memory, second = self.passes(memory, 1)
+            memory, second = self.cycles(memory, 1)
         self.assertEqual([len(first[0]), len(second[0])], [6, 4])
         self.assertFalse(any("no more submissions" in line for line in logs.output))
 
@@ -525,7 +525,7 @@ class NodeRuleScenarioTest(CycleAgainstFakes):
         self.slurm.failing_commands.add("sinfo")
         self.queue(2)
         with self.assertLogs(level=logging.WARNING) as logs:
-            memory, sent = self.passes(memory_with(records), 1)
+            memory, sent = self.cycles(memory_with(records), 1)
         # Both name the removed node; without sinfo each is a blip, and the second stops the cycle
         self.assertEqual(
             self.placements(sent[0]), ["pinned:wato3-slurm1", "excluding:wato3-slurm1"]
@@ -626,7 +626,7 @@ class SubmitAsRunsAreReadTest(CycleAgainstFakes):
         memory = self.cycle(memory_with(usable_on("delta-slurm1", MEDIUM)))
         self.assertEqual(nodes_out(memory.launch_records, MEDIUM), {"delta-slurm1"})
 
-    def test_waiting_runners_exclusions_are_narrowed_once_per_pass_not_per_run(self):
+    def test_pending_runners_exclusions_are_narrowed_once_per_cycle_not_per_run(self):
         self.jobs_of(2, job(20, "queued", [MEDIUM]))
         self.jobs_of(1, job(10, "queued", [MEDIUM]))
         first = self.slurm.add_job(f"{PREFIX}a", excluded="trpro-slurm1,trpro-slurm2")

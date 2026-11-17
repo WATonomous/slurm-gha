@@ -664,14 +664,14 @@ class PhaseFromSqueueAndRunnersTest(unittest.TestCase):
             (
                 line("PENDING", started=None),
                 runner(f"{PREFIX}a", "offline"),
-                Phase.WAITING_FOR_NODE,
+                Phase.PENDING,
             ),
             (
                 line("PENDING", 0, started=None),
                 runner(f"{PREFIX}a", "offline"),
                 Phase.CANNOT_START,
             ),
-            (line("PENDING", started=None), None, Phase.WAITING_FOR_NODE),
+            (line("PENDING", started=None), None, Phase.PENDING),
             (
                 line(
                     "PENDING", started=None, submitted=-UNUSED_REGISTRATION_LIFETIME_S

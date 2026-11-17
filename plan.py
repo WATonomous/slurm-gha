@@ -11,7 +11,7 @@ of that size on that node fared:
    and at most 10 minutes after each further failure there, while a job of that size waits.
 3. A size with no node where it is known to work (after a restart, or when it fails everywhere) gets one
    runner at a time.
-4. A runner still waiting in Slurm's queue is never left excluding a node that a new runner of its size
+4. A runner still pending in Slurm's queue is never left excluding a node that a new runner of its size
    would now be allowed on.
 5. A failure that belongs to no node (Slurm refused the submission, or the failed job shows no node)
    counts against the size: its next runner waits 1, 2, 4, 8, at most 10 minutes.
@@ -108,7 +108,7 @@ NO_DEMAND = Demand(waiting_jobs=[], runner_names_on_jobs=set())
 class Phase(Enum):
     """Where one of our allocations stands, from squeue and the runners list alone."""
 
-    WAITING_FOR_NODE = "pending, not held, registered or unregistered for under a day"
+    PENDING = "pending, not held, registered or unregistered for under a day"
     # Cancelled: it never started, so it holds no job
     CANNOT_START = "pending, and held or unregistered for a day"
     BOOTING = "running, runner not online yet, younger than B"
@@ -200,14 +200,13 @@ class RunnerSightings:
     first_seen_busy_at: dict[str, float]
     # Runner names any job read has carried
     seen_on_a_job: frozenset[str]
-    # Runner names whose registration delete GitHub answered (deleted, already gone, or refused); not sent again
+    # Runner names whose registration delete GitHub answered (deleted, already gone, or declined); not sent
+    # again
     deletes_answered: frozenset[str] = frozenset()
 
 
 NO_SIGHTINGS = RunnerSightings(first_seen_busy_at={}, seen_on_a_job=frozenset())
-PHASES_THAT_CAN_TAKE_A_JOB = frozenset(
-    {Phase.WAITING_FOR_NODE, Phase.BOOTING, Phase.IDLE}
-)
+PHASES_THAT_CAN_TAKE_A_JOB = frozenset({Phase.PENDING, Phase.BOOTING, Phase.IDLE})
 # The batch script exits non-zero only when its runner ended before the idle deadline with no job begun.
 # A launch failure as in #37 ends CANCELLED by slurmd, but so does a job we cancelled while pending.
 LAUNCH_FAILURE_STATES = frozenset({"FAILED", "CANCELLED", "NODE_FAIL", "BOOT_FAIL"})
@@ -231,7 +230,7 @@ def phase_of_allocation(
         )
         if unregistered_for_s >= UNUSED_REGISTRATION_LIFETIME_S:
             return Phase.CANNOT_START
-        return Phase.WAITING_FOR_NODE
+        return Phase.PENDING
     if (
         allocation.state == "COMPLETING"
         or allocation.started_at is None
@@ -572,17 +571,17 @@ def nodes_a_new_runner_excludes(
     )
 
 
-# Rule 4: a waiting runner never keeps excluding a node a new runner of its size may use
+# Rule 4: a pending runner never keeps excluding a node a new runner of its size may use
 
 
-def narrowed_exclusions(
+def pending_runners_by_narrowed_exclusion(
     allocations: list[Allocation], records: LaunchRecords, now: float
 ) -> dict[frozenset[str], list[Allocation]]:
-    """Pure: our unpinned runners waiting for a node whose exclusion names a node that a runner of their
-    size submitted now would be allowed on, grouped by their new exclusion (the old one less those nodes),
-    so that each group is one scontrol call. Never adds a node: a waiting runner left out of nodes that came
-    back would hold its job until they are full, and one that excluded every node would never start. A
-    runner whose exclusion could not be read is left alone."""
+    """Pure: our unpinned runners pending in Slurm's queue whose exclusion names a node that a runner of
+    their size submitted now would be allowed on, grouped by their new exclusion (the old one less those
+    nodes), so that each group is one scontrol call. Never adds a node: a pending runner left out of nodes
+    that came back would hold its job until they are full, and one that excluded every node would never
+    start. A runner whose exclusion could not be read is left alone."""
     groups = {}
     for allocation in allocations:
         if (

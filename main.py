@@ -47,7 +47,7 @@ from plan import (
     file_launch_evidence,
     forget_nodes_slurm_does_not_know,
     launch_record_log_lines,
-    narrowed_exclusions,
+    pending_runners_by_narrowed_exclusion,
     next_unpinned_runner_at,
     plan_submissions,
     record_refused_submission,
@@ -259,8 +259,8 @@ def run_cycle(
         cycle_started_at=cycle_started_at,
         seen_at=cycle_started_at,
     )
-    # Rule 4, once per cycle and before demand is read, so a released runner can start meanwhile
-    narrow_waiting_runners(repo, allocations, records, cycle_started_at)
+    # Rule 4, once per cycle and before demand is read, so a released pending runner can start meanwhile
+    narrow_pending_runners(repo, allocations, records, cycle_started_at)
     jobs_by_run = {}
     submitted_this_cycle = []
     # sbatch failures this cycle that left no job and named no node Slurm does not know
@@ -318,19 +318,19 @@ def run_cycle(
     )
 
 
-def narrow_waiting_runners(
+def narrow_pending_runners(
     repo: Repository, allocations: list[Allocation], records: LaunchRecords, now: float
 ) -> None:
-    """narrow_pending_exclusions for each group of narrowed_exclusions, and one log line per size and
-    change."""
+    """narrow_pending_exclusions for each group of pending_runners_by_narrowed_exclusion, and one log line
+    per size and change."""
     narrowed = Counter()
-    groups = narrowed_exclusions(allocations, records, now)
-    for excluded_nodes, waiting in sorted(
+    groups = pending_runners_by_narrowed_exclusion(allocations, records, now)
+    for excluded_nodes, pending in sorted(
         groups.items(), key=lambda item: sorted(item[0])
     ):
-        refused = narrow_pending_exclusions(waiting, excluded_nodes)
-        for allocation in waiting:
-            if allocation.slurm_job_id not in refused:
+        not_updated = narrow_pending_exclusions(pending, excluded_nodes)
+        for allocation in pending:
+            if allocation.slurm_job_id not in not_updated:
                 before = ",".join(sorted(allocation.excluded_nodes))
                 after = ",".join(sorted(excluded_nodes)) or "none"
                 narrowed[(allocation.size_label, before, after)] += 1
