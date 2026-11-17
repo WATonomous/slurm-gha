@@ -16,6 +16,19 @@ of that size on that node fared:
 5. A failure that belongs to no node (Slurm refused the submission, or the failed job shows no node)
    counts against the size: its next runner waits 1, 2, 4, 8, at most 10 minutes.
 
+Words, as the code uses them (for one size):
+- usable: the newest runner of the size on that node with evidence took a job there.
+- out: that runner failed to launch there.
+- untried: no record for the node, or a forgotten one; allowed like usable.
+- due: out, and its retry wait has passed.
+- usable somewhere: some node is usable, and nothing is outstanding.
+- outstanding: a refusal or a failure with no node that no newer runner taking a job has cleared.
+- nodeless failure: a failed launch whose squeue record shows no node.
+- in flight: can still take a job (pending, booting or idle, with no evidence), or submitted this cycle.
+- covering: busy, not yet named on a job, for less than BUSY_COVER_S; it covers one waiting job.
+- retry: a runner pinned to an out node after it went out, or a size's next runner after a nodeless
+  failure.
+
 No I/O. The records it decides on are defined here, so that the tests and a model of the daemon can
 import this module alone; supply.py and demand.py fill them in.
 """
