@@ -420,6 +420,37 @@ class NodeRuleScenarioTest(CycleAgainstFakes):
         )
         self.assertGreater(excluded, 0)
 
+    def test_a_failure_with_no_node_older_than_a_runner_that_took_a_job_holds_nothing(
+        self,
+    ):
+        # Runner A fails with no node; B, submitted a second after it, takes a job. A's FAILED record stays
+        # in squeue long after B's job and registration are gone
+        self.slurm.nodes = {"thor-slurm1": 8}
+        self.queue(2)
+        memory, _ = self.cycles(memory_with(usable_on("thor-slurm1", MEDIUM)), 2)
+        a, b = sorted(self.slurm.jobs)[:2]
+        self.end(a, "FAILED")
+        self.slurm.jobs[a]["node"] = ""  # squeue prints %N empty
+        with self.assertLogs(level=logging.INFO) as logs:
+            memory, _ = self.cycles(memory, 8)
+            self.assertNotIn(
+                b,
+                [
+                    j
+                    for j, each in self.slurm.jobs.items()
+                    if each["state"] == "RUNNING"
+                ],
+            )
+            self.assertEqual(self.slurm.jobs[a]["state"], "FAILED")
+            # A wave after B's registration is gone gets its runners in full, in one cycle
+            self.queue(5)
+            memory, sent = self.cycles(memory, 1)
+        self.assertEqual(len(sent[0]), 5)
+        self.assertTrue(size_usable_somewhere(memory.launch_records, MEDIUM))
+        lines = "\n".join(logs.output)
+        self.assertNotIn("failed with no node", lines)
+        self.assertNotIn("one runner at a time", lines)
+
     def test_a_size_that_fails_everywhere_gets_one_runner_at_a_time(self):
         self.queue(20)
         everywhere = set(self.slurm.nodes)

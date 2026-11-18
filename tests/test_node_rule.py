@@ -562,19 +562,100 @@ class RuleFiveNodelessFailuresTest(unittest.TestCase):
         )
         self.assertTrue(size_usable_somewhere(records, MEDIUM))
 
-    def test_a_runner_submitted_after_it_was_seen_taking_a_job_clears_it(self):
+    def test_a_runner_submitted_after_the_failed_one_clears_it_whenever_it_was_seen(
+        self,
+    ):
         records = filed(
             usable_on("thor-slurm1", MEDIUM), (self.nodeless(1, NOW - 100), None)
         )
-        before = on("thor-slurm1", allocation(2, submitted_at=NOW - 1))
-        took = filed(records, (before, registration(before, is_busy=True)))
+        older = on("thor-slurm1", allocation(2, submitted_at=NOW - 110))
+        took = filed(records, (older, registration(older, is_busy=True)), now=NOW + 20)
         self.assertFalse(size_usable_somewhere(took, MEDIUM))
-        after = on("thor-slurm1", allocation(3, submitted_at=NOW + 1))
-        took = filed(records, (after, registration(after, is_busy=True)), now=NOW + 20)
+        # Submitted after the failed runner, though before its failure was seen
+        newer = on("thor-slurm1", allocation(3, submitted_at=NOW - 90))
+        took = filed(records, (newer, registration(newer, is_busy=True)), now=NOW + 20)
         self.assertTrue(size_usable_somewhere(took, MEDIUM))
         # The old failure, still in squeue, is not counted again
         self.assertEqual(
             filed(took, (self.nodeless(1, NOW - 100), None), now=NOW + 30), took
+        )
+
+    def test_one_older_than_a_success_seen_in_an_earlier_cycle_says_nothing(self):
+        # A runner failed with no node; one submitted 2 s later took a job, which ended. The failed record
+        # stays in squeue for MinJobAge, long after the busy registration is gone
+        failed = self.nodeless(1, NOW)
+        busy = on("tr-slurm2", allocation(2, submitted_at=NOW + 2, age_s=-5))
+        done = replace(busy, state="COMPLETED", ended_at=NOW + 16)
+        records = usable_on("thor-slurm1", MEDIUM)
+        for now, evidence in (
+            (NOW + 8, ((failed, None), (busy, registration(busy, is_busy=True)))),
+            (NOW + 20, ((failed, None), (done, None))),
+            (NOW + 40, ((failed, None), (done, None))),
+            (NOW + 300, ((failed, None),)),
+        ):
+            records = filed(records, *evidence, now=now)
+            self.assertTrue(size_usable_somewhere(records, MEDIUM), now - NOW)
+            self.assertEqual(next_unpinned_runner_at(records, MEDIUM), 0)
+            self.assertEqual(
+                unpinned_counts(
+                    plan_submissions(
+                        [], {}, demand(waiting(3)), records, {}, [], now, now
+                    )
+                ),
+                {MEDIUM: 3},
+            )
+
+    def test_one_newer_than_every_success_holds_the_size(self):
+        took = on("thor-slurm1", allocation(1, submitted_at=NOW - 100))
+        records = filed(NO_LAUNCH_RECORDS, (took, registration(took, is_busy=True)))
+        self.assertTrue(size_usable_somewhere(records, MEDIUM))
+        records = filed(records, (self.nodeless(2, NOW - 50), None), now=NOW + 10)
+        self.assertFalse(size_usable_somewhere(records, MEDIUM))
+        self.assertEqual(next_unpinned_runner_at(records, MEDIUM), NOW + 70)
+
+    def test_a_tie_goes_to_the_success(self):
+        failed = self.nodeless(1, NOW - 50)
+        took = on("thor-slurm1", allocation(2, submitted_at=NOW - 50))
+        busy = registration(took, is_busy=True)
+        # Filed in one cycle, and failure first then success in two
+        self.assertTrue(
+            size_usable_somewhere(
+                filed(NO_LAUNCH_RECORDS, (failed, None), (took, busy)), MEDIUM
+            )
+        )
+        records = filed(usable_on("tr-slurm2", MEDIUM), (failed, None))
+        self.assertFalse(size_usable_somewhere(records, MEDIUM))
+        records = filed(records, (took, busy), now=NOW + 30)
+        self.assertTrue(size_usable_somewhere(records, MEDIUM))
+        # And success first, then the failure seen later
+        records = filed(NO_LAUNCH_RECORDS, (took, busy))
+        records = filed(records, (failed, None), now=NOW + 30)
+        self.assertTrue(size_usable_somewhere(records, MEDIUM))
+
+    def test_after_a_restart_a_failure_first_seen_is_ordered_by_submit_time(self):
+        # A refusal's FAILED record from before the restart: submit = start = end, no node, name unknown
+        def refused_before(submitted_at):
+            return Allocation(
+                1,
+                "gha-test-1",
+                MEDIUM,
+                "FAILED",
+                False,
+                submitted_at,
+                submitted_at,
+                submitted_at,
+            )
+
+        took = on("thor-slurm1", allocation(2, submitted_at=NOW - 60))
+        busy = registration(took, is_busy=True)
+        older = filed(NO_LAUNCH_RECORDS, (refused_before(NOW - 90), None), (took, busy))
+        self.assertTrue(size_usable_somewhere(older, MEDIUM))
+        newer = filed(NO_LAUNCH_RECORDS, (refused_before(NOW - 30), None), (took, busy))
+        self.assertFalse(size_usable_somewhere(newer, MEDIUM))
+        self.assertEqual(next_unpinned_runner_at(newer, MEDIUM), NOW + 60)
+        # The success, filed again in a later cycle, does not clear the newer failure
+        self.assertFalse(
+            size_usable_somewhere(filed(newer, (took, busy), now=NOW + 30), MEDIUM)
         )
 
     def test_the_failed_record_of_a_refused_submission_is_not_counted_again(self):
@@ -645,6 +726,17 @@ class RefusedSubmissionTest(unittest.TestCase):
             ),
             [Submission(MEDIUM, frozenset())],
         )
+
+    def test_a_runner_submitted_after_the_refusal_taking_a_job_clears_it(self):
+        records = self.refuse(
+            usable_on("thor-slurm1", MEDIUM), Submission(MEDIUM, frozenset())
+        )
+        after = on("thor-slurm1", allocation(11, submitted_at=NOW + 61))
+        records = filed(
+            records, (after, registration(after, is_busy=True)), now=NOW + 90
+        )
+        self.assertTrue(size_usable_somewhere(records, MEDIUM))
+        self.assertEqual(records.by_size[MEDIUM].nodeless_retries, 0)
 
     def test_a_refused_node_that_is_usable_again_ends_the_wait(self):
         records = usable_on("tr-slurm2", MEDIUM)

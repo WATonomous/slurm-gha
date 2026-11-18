@@ -20,7 +20,8 @@ Words, as the code uses them (for one size):
 - untried: no record for the node, or a forgotten one; allowed like usable.
 - due: out, and its retry wait has passed.
 - usable somewhere: some node is usable, and nothing is outstanding.
-- outstanding: a refusal or a failure with no node that no newer runner taking a job has cleared.
+- outstanding: a refusal or a failure with no node newer, by submit time, than the size's newest runner
+  that took a job.
 - nodeless failure: a failed launch whose squeue record shows no node.
 - in flight: can still take a job (pending, booting or idle, with no evidence), or submitted this cycle.
 - covering: busy, not yet named on a job, for less than BUSY_COVER_S; it covers one waiting job.
@@ -81,10 +82,15 @@ class NodeRecord:
 @dataclass(frozen=True)
 class SizeRecord:
     """What holds one size usable nowhere beyond its node records: refused submissions, and failures that
-    belong to no node (rule 5). Outstanding until a runner of the size submitted after outstanding_since
-    takes a job, on any node; then everything resets but the names and newest_evidence_submitted_at."""
+    belong to no node (rule 5). Ordered by submit time as rule 1 orders a node's evidence: outstanding while
+    the newest of them is newer than the size's newest runner that took a job, on any node, a success
+    winning a tie; when that ends, everything resets but the names and the two submit times."""
 
-    # The newest refusal or failure with no node; None: nothing outstanding
+    # The size's newest runner that took a job, on any node
+    newest_success_submitted_at: float | None = None
+    # The newest refusal (when refused) or failure with no node (its runner's submit time)
+    newest_failure_submitted_at: float | None = None
+    # When the outstanding refusal or failure with no node was seen; None: nothing outstanding
     outstanding_since: float | None = None
     # Rule 5: the next runner waits from here; None: no failure with no node outstanding
     nodeless_failure_seen_at: float | None = None
@@ -95,9 +101,6 @@ class SizeRecord:
     # Every refused runner's name -> when; kept REFUSED_NAMES_KEPT_S, so the FAILED record its refusal may
     # leave in squeue is never counted as a launch failure
     refused_runner_names: dict[str, float] = field(default_factory=dict)
-    # The newest runner of the size whose failure with no node was counted, or that took a job: a failure
-    # with no node of a runner submitted no later changes nothing (the same one seen again included)
-    newest_evidence_submitted_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -137,8 +140,9 @@ def file_launch_evidence(
 ) -> LaunchRecords:
     """Pure: launch_evidence for every allocation, oldest submission first, filed under (its node, its
     size) by record_node_evidence. A failure that shows no node is filed under its size by
-    record_nodeless_failure, unless it is the FAILED record a refused submission left. A runner that took a
-    job clears what is outstanding for its size if it was submitted after outstanding_since. Refused names
+    record_nodeless_failure, unless it is the FAILED record a refused submission left, and every runner that
+    took a job under its size by record_size_took_a_job; oldest first, so a failure older than a runner of
+    its size that took a job, filed in the same cycle or any later one, ends up saying nothing. Refused names
     older than REFUSED_NAMES_KEPT_S are dropped. What squeue and the runners list showed is judged at
     cycle_started_at, when they were read; what is recorded is stamped seen_at, when this is filed."""
     uncovered = uncovered_jobs_waiting_past_b_by_size_label(
@@ -169,19 +173,12 @@ def file_launch_evidence(
         )
         for allocation in sorted(allocations, key=lambda each: each.submitted_at)
     ]
-    # A failure with no node of a runner no newer than one of its size that took a job says nothing about
-    # now, also before the size has a record (after a restart)
-    newest_success_by_size = {
-        allocation.size_label: allocation.submitted_at
-        for allocation, evidence in evidence_by_allocation
-        if evidence is Evidence.TOOK_A_JOB
-    }
     for allocation, evidence in evidence_by_allocation:
         if evidence is None:
             continue
         size_label = allocation.size_label
         size_record = by_size.get(size_label)
-        if evidence is Evidence.TOOK_A_JOB and size_record is not None:
+        if evidence is Evidence.TOOK_A_JOB:
             by_size[size_label] = record_size_took_a_job(
                 size_record, allocation.submitted_at
             )
@@ -190,13 +187,9 @@ def file_launch_evidence(
             by_node_and_size[key] = record_node_evidence(
                 by_node_and_size.get(key), allocation, evidence, seen_at
             )
-        elif (
-            evidence.failed_to_launch
-            and allocation.submitted_at > newest_success_by_size.get(size_label, 0.0)
-            and (
-                size_record is None
-                or allocation.runner_name not in size_record.refused_runner_names
-            )
+        elif evidence.failed_to_launch and (
+            size_record is None
+            or allocation.runner_name not in size_record.refused_runner_names
         ):
             by_size[size_label] = record_nodeless_failure(
                 size_record, allocation.submitted_at, seen_at
@@ -373,11 +366,17 @@ def pending_runners_by_narrowed_exclusion(
 def record_nodeless_failure(
     record: SizeRecord | None, submitted_at: float, seen_at: float
 ) -> SizeRecord:
-    """Pure: a runner of the size failed with no node (a refused one counts as submitted when refused).
-    Outstanding from seen_at, and the next runner waits retry_wait_s(nodeless_retries) from then; the retries
+    """Pure: a runner of the size failed with no node (a refused one counts as submitted when refused). A
+    runner no newer than the size's newest that took a job, or than the newest such failure, changes nothing
+    (the same failure seen again included). Otherwise outstanding from seen_at, and the next runner waits
+    retry_wait_s(nodeless_retries) from then: when to try again counts from when it was seen. The retries
     grow only if this runner was submitted after the previous outstanding failure with no node was seen."""
     record = record or SizeRecord()
-    if submitted_at <= (record.newest_evidence_submitted_at or 0.0):
+    newest = max(
+        record.newest_success_submitted_at or 0.0,
+        record.newest_failure_submitted_at or 0.0,
+    )
+    if submitted_at <= newest:
         return record
     retries = 0
     if record.nodeless_failure_seen_at is not None:
@@ -389,16 +388,22 @@ def record_nodeless_failure(
         outstanding_since=seen_at,
         nodeless_failure_seen_at=seen_at,
         nodeless_retries=retries,
-        newest_evidence_submitted_at=submitted_at,
+        newest_failure_submitted_at=submitted_at,
     )
 
 
-def record_size_took_a_job(record: SizeRecord, submitted_at: float) -> SizeRecord:
-    """Pure: a runner of the size took a job, on any node. Submitted after outstanding_since, it clears
-    what was outstanding."""
-    newest = max(record.newest_evidence_submitted_at or 0.0, submitted_at)
-    record = replace(record, newest_evidence_submitted_at=newest)
-    if record.outstanding_since is None or submitted_at <= record.outstanding_since:
+def record_size_took_a_job(
+    record: SizeRecord | None, submitted_at: float
+) -> SizeRecord:
+    """Pure: a runner of the size took a job, on any node. At or after the newest refusal or failure with
+    no node, by submit time, it clears what was outstanding, whenever that was seen."""
+    record = record or SizeRecord()
+    if submitted_at <= (record.newest_success_submitted_at or 0.0):
+        return record
+    record = replace(record, newest_success_submitted_at=submitted_at)
+    if record.outstanding_since is None or submitted_at < (
+        record.newest_failure_submitted_at or 0.0
+    ):
         return record
     return replace(
         record,
@@ -437,9 +442,10 @@ def next_unpinned_runner_at(records: LaunchRecords, size_label: str) -> float:
 def record_refused_submission(
     records: LaunchRecords, submission: Submission, runner_name: str, refused_at: float
 ) -> LaunchRecords:
-    """Pure: Slurm refused a submission for its constraints, leaving a FAILED record with no node. It makes
-    the size usable nowhere until a runner of it submitted after refused_at takes a job, and keeps the
-    runner's name, so that record is not counted again. Then:
+    """Pure: Slurm refused a submission for its constraints, leaving a FAILED record with no node. It counts
+    as submitted at refused_at, newer than every runner already submitted, so it makes the size usable
+    nowhere until a runner of it submitted at or after refused_at takes a job; and it keeps the runner's
+    name, so that record is not counted again. Then:
     - unpinned with nothing excluded: a failure with no node (rule 5), whose wait doubles;
     - unpinned with nodes excluded: nothing doubles; the size's next runner waits for the earliest of those
       nodes to come due (next_unpinned_runner_at), when its own exclusion will be smaller;
@@ -461,6 +467,12 @@ def record_refused_submission(
         record = replace(record, refused_exclusion=submission.excluded_nodes)
     else:
         record = record_nodeless_failure(record, refused_at, refused_at)
+    record = replace(
+        record,
+        newest_failure_submitted_at=max(
+            record.newest_failure_submitted_at or 0.0, refused_at
+        ),
+    )
     return LaunchRecords(by_node_and_size, {**records.by_size, size_label: record})
 
 
