@@ -11,7 +11,9 @@ import logging
 import os
 import re
 import subprocess
+import time
 import uuid
+from collections.abc import Callable
 from enum import Enum
 
 from config import (
@@ -187,22 +189,26 @@ def epoch_seconds_or_none(squeue_time: str) -> float | None:
 
 
 def read_our_registrations(
-    github: GitHubClient, repo_api_base_url: str, runner_name_prefix: str
+    github: GitHubClient,
+    repo_api_base_url: str,
+    runner_name_prefix: str,
+    clock: Callable[[], float] = time.time,
 ) -> dict[str, RunnerRegistration]:
-    """Our runner registrations, by name, from every page of the runners list. Raises GitHubUnavailable,
-    also for one of ours without a runner id."""
+    """Our runner registrations, by name, from every page of the runners list, each stamped with clock()
+    after the last page: no later than that, it was as shown. Raises GitHubUnavailable, also for one of
+    ours without a runner id."""
+    runners = github.get_all_pages(f"{repo_api_base_url}/actions/runners", "runners")
+    listed_at = clock()
     registrations = {}
-    for runner in github.get_all_pages(
-        f"{repo_api_base_url}/actions/runners", "runners"
-    ):
-        registration = parse_registration(runner, runner_name_prefix)
+    for runner in runners:
+        registration = parse_registration(runner, runner_name_prefix, listed_at)
         if registration is not None:
             registrations[registration.runner_name] = registration
     return registrations
 
 
 def parse_registration(
-    runner: dict, runner_name_prefix: str
+    runner: dict, runner_name_prefix: str, listed_at: float
 ) -> RunnerRegistration | None:
     """Pure: one entry of the runners list; None unless its name has our prefix. GitHubUnavailable for one
     of ours without a runner id, which could not be deleted."""
@@ -217,6 +223,7 @@ def parse_registration(
         runner_name=runner_name,
         is_online=runner.get("status") == "online",
         is_busy=runner.get("busy") is True,
+        listed_at=listed_at,
     )
 
 

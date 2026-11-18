@@ -21,6 +21,7 @@ from config import (
     BOOT_ALLOWANCE_S,
     HISTORY_PAGE_INTERVAL_S,
     IDLE_ALLOWANCE_S,
+    IDLE_STOP_MARGIN_S,
     NO_JOB_SBATCH_FAILURES_TO_STOP_A_CYCLE,
     OUTAGE_REMINDER_INTERVAL_S,
     REPOS_TO_MONITOR,
@@ -147,7 +148,9 @@ def outage_after_cycle(
 
 def main() -> None:
     configure_logging()
-    problems = unsafe_settings(BOOT_ALLOWANCE_S, IDLE_ALLOWANCE_S, REPOS_TO_MONITOR)
+    problems = unsafe_settings(
+        BOOT_ALLOWANCE_S, IDLE_ALLOWANCE_S, IDLE_STOP_MARGIN_S, REPOS_TO_MONITOR
+    )
     for problem in problems:
         logger.error(f"Refusing to start: {problem}")
     if problems:
@@ -199,14 +202,15 @@ def run_cycle(
     """One repository's cycle: read supply, cancel what cannot start and delete ended runners'
     registrations, then read demand run by run, weighing launch evidence and submitting after each. Only
     the two supply reads raise, and they come before anything is changed. What squeue and the runners list
-    showed is judged at cycle_started_at, when they were read. Each run is planned at clock() when it is
+    showed is judged at cycle_started_at, when they were read, except whether a runner is online, which is
+    judged when the runners list was read. Each run is planned at clock() when it is
     read, and what is recorded is stamped with clock(): a cycle that submits 150 runners lasts about 3
     minutes, nodes come due during it, and runners submitted earlier in it must count as submitted before
     what is recorded later."""
-    # 1. Supply: squeue and the runners list, read now
+    # 1. Supply: squeue, read now, then the runners list, stamped when read
     allocations = read_our_allocations(repo.runner_name_prefix)
     registrations_by_name = read_our_registrations(
-        github, repo.api_base_url, repo.runner_name_prefix
+        github, repo.api_base_url, repo.runner_name_prefix, clock
     )
     # From the first cycle a runner is seen busy, it may cover a job that still says queued
     sightings = update_sightings(
@@ -487,14 +491,18 @@ def refusal_log_line(
 
 
 def unsafe_settings(
-    boot_allowance_s: float, idle_allowance_s: float, repos: list[Repository]
+    boot_allowance_s: float,
+    idle_allowance_s: float,
+    idle_stop_margin_s: float,
+    repos: list[Repository],
 ) -> list[str]:
     """Pure: why these settings would be unsafe; empty when the daemon may start."""
     problems = []
-    if not boot_allowance_s < idle_allowance_s:
+    if not boot_allowance_s < idle_allowance_s - idle_stop_margin_s:
         problems.append(
-            f"BOOT_ALLOWANCE_S ({boot_allowance_s}) must be below IDLE_ALLOWANCE_S"
-            f" ({idle_allowance_s}), or a runner that never comes online goes unnoticed"
+            f"BOOT_ALLOWANCE_S ({boot_allowance_s}) must be below IDLE_ALLOWANCE_S ({idle_allowance_s})"
+            f" less IDLE_STOP_MARGIN_S ({idle_stop_margin_s}), or a runner that never comes online"
+            " goes unnoticed"
         )
     for repo in repos:
         if not repo.runner_name_prefix:

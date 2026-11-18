@@ -44,8 +44,12 @@ SCRIPT_START_MARGIN_S = 2 * 60
 SLURM_PARTITION_MAX_TIME_MINUTES = 24 * 60
 # B: how long a started runner may take to come online before the daemon stops counting on it. 99% of
 # recorded boots took under 63 s and 31 of 4,704 over 2 min; it trades a duplicate runner against a job
-# waiting on a boot that may never finish. Must stay below W, or such a boot would go unnoticed
+# waiting on a boot that may never finish. Must stay below W less IDLE_STOP_MARGIN_S, or such a boot would go
+# unnoticed
 BOOT_ALLOWANCE_S = 2 * 60
+# Offline this close to W, when the runners list was read, is not a failed launch: the runner may have stopped
+# itself at its deadline, which the node's clock times, not the daemon's
+IDLE_STOP_MARGIN_S = 30
 # After a size failed to launch on a node, the wait before a runner pinned to it tries again; also before a
 # size's next runner after a failure with no node. It doubles per further failure
 FIRST_RETRY_WAIT_S = 60

@@ -17,6 +17,7 @@ from config import (
     BOOT_ALLOWANCE_S,
     BUSY_COVER_S,
     IDLE_ALLOWANCE_S,
+    IDLE_STOP_MARGIN_S,
     UNUSED_REGISTRATION_LIFETIME_S,
 )
 
@@ -66,6 +67,8 @@ class RunnerRegistration:
     runner_name: str
     is_online: bool
     is_busy: bool
+    # When the runners list that showed it was read, after squeue: whether it is online is judged then
+    listed_at: float
 
 
 @dataclass(frozen=True)
@@ -224,8 +227,10 @@ def launch_evidence(
 ) -> Evidence | None:
     """TOOK_A_JOB if busy or named on a job read this cycle. Failed to launch: ENDED_WITHOUT_A_JOB if it
     ended FAILED, NODE_FAIL or BOOT_FAIL, or ended CANCELLED on a node; STILL_OFFLINE_AT_B if it is RUNNING,
-    registered and offline between B and W old; LEFT_IDLE_WHILE_A_JOB_WAITED if it is online and idle past
-    2B while a job of its size has waited over B that no runner covers (uncovered_jobs_waiting_past_b > 0).
+    registered and offline at least B old at now and more than IDLE_STOP_MARGIN_S short of W when the
+    runners list was read (later than squeue: a runner that stops itself at W in between is not one);
+    LEFT_IDLE_WHILE_A_JOB_WAITED if it is online and idle past 2B while a job of its size has waited over B
+    that no runner covers (uncovered_jobs_waiting_past_b > 0).
     Otherwise None."""
     if allocation.runner_name in runner_names_on_jobs or (
         registration is not None and registration.is_busy
@@ -247,7 +252,11 @@ def launch_evidence(
     if age_s >= IDLE_ALLOWANCE_S:
         return None  # its batch script stops it at W; what it showed before W is already recorded
     if not registration.is_online:
-        if age_s >= BOOT_ALLOWANCE_S:
+        age_when_listed_s = registration.listed_at - allocation.started_at
+        if (
+            age_s >= BOOT_ALLOWANCE_S
+            and age_when_listed_s < IDLE_ALLOWANCE_S - IDLE_STOP_MARGIN_S
+        ):
             return Evidence.STILL_OFFLINE_AT_B
         return None
     # GitHub gives a waiting job to an online idle runner, so this one is not being given jobs

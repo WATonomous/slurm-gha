@@ -627,27 +627,30 @@ class NodeNamesInHostlistTest(unittest.TestCase):
 class ParseRegistrationTest(unittest.TestCase):
     def test_ours_and_not_ours(self):
         rows = [
-            (runner(f"{PREFIX}a"), RunnerRegistration(7, f"{PREFIX}a", True, False)),
+            (
+                runner(f"{PREFIX}a"),
+                RunnerRegistration(7, f"{PREFIX}a", True, False, 5.0),
+            ),
             (
                 runner(f"{PREFIX}a", "offline"),
-                RunnerRegistration(7, f"{PREFIX}a", False, False),
+                RunnerRegistration(7, f"{PREFIX}a", False, False, 5.0),
             ),
             (
                 runner(f"{PREFIX}a", busy=True),
-                RunnerRegistration(7, f"{PREFIX}a", True, True),
+                RunnerRegistration(7, f"{PREFIX}a", True, True, 5.0),
             ),
             (runner("slurm-trpro-slurm2-749139"), None),
             ({"id": 8}, None),
         ]
         for entry, registration in rows:
             with self.subTest(entry=entry):
-                self.assertEqual(parse_registration(entry, PREFIX), registration)
+                self.assertEqual(parse_registration(entry, PREFIX, 5.0), registration)
 
     def test_one_of_ours_without_a_runner_id_cannot_be_read(self):
         entry = runner(f"{PREFIX}a")
         del entry["id"]
         with self.assertRaises(GitHubUnavailable):
-            parse_registration(entry, PREFIX)
+            parse_registration(entry, PREFIX, 5.0)
 
 
 class PhaseFromSqueueAndRunnersTest(unittest.TestCase):
@@ -703,7 +706,7 @@ class PhaseFromSqueueAndRunnersTest(unittest.TestCase):
             with self.subTest(squeue_line=squeue_line, runner=entry):
                 allocation = parse_squeue_line(squeue_line, PREFIX)
                 registration = (
-                    None if entry is None else parse_registration(entry, PREFIX)
+                    None if entry is None else parse_registration(entry, PREFIX, now)
                 )
                 self.assertEqual(
                     phase_of_allocation(allocation, registration, now), phase
@@ -985,12 +988,20 @@ class GitHubSideTest(unittest.TestCase):
                 {"runners": [runner(f"{PREFIX}a"), runner("slurm-thor-slurm1-1")]},
             ),
         )
-        self.fake.script(
-            second, Reply(200, body={"runners": [runner(f"{PREFIX}b", busy=True)]})
+        now = [5.0]
+
+        def second_page(headers):
+            now[0] = 7.0  # the daemon's clock moves on while the pages are read
+            return Reply(200, body={"runners": [runner(f"{PREFIX}b", busy=True)]})
+
+        self.fake.script(second, second_page)
+        registrations = read_our_registrations(
+            self.github, self.repo, PREFIX, clock=lambda: now[0]
         )
-        registrations = read_our_registrations(self.github, self.repo, PREFIX)
         self.assertEqual(sorted(registrations), [f"{PREFIX}a", f"{PREFIX}b"])
         self.assertTrue(registrations[f"{PREFIX}b"].is_busy)
+        # Stamped once, after the last page
+        self.assertEqual({each.listed_at for each in registrations.values()}, {7.0})
 
     def test_a_runners_list_that_cannot_be_read_completely_raises(self):
         first = f"{REPO}/actions/runners?per_page=100"

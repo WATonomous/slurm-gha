@@ -580,6 +580,45 @@ class NodeRuleScenarioTest(CycleAgainstFakes):
         self.assertEqual(memory.launch_records, records)
 
 
+class IdleStopBetweenTheTwoReadsTest(CycleAgainstFakes):
+    """squeue is read first and the runners list after it, here 40 s later (pages, pacing, retries); a runner
+    can stop itself at its idle deadline in between."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake.script(RUNNERS, self.list_runners_slowly)
+
+    def list_runners_slowly(self, headers):
+        self.slurm.now += 40
+        return Reply(200, body={"runners": self.runners})
+
+    def offline_runner_started(self, age_s):
+        name = f"{PREFIX}idle"
+        self.slurm.add_job(
+            name, state="RUNNING", started_at=NOW - age_s, node="tr-slurm2", cpus=2
+        )
+        self.runners.append(runner(name, "offline"))
+
+    def test_a_runner_that_stopped_at_its_deadline_is_not_a_failed_launch(self):
+        # Short of W by more than the margin when squeue is read; stopped by the time the runners list is
+        self.offline_runner_started(W - 35)
+        self.jobs()
+        # A sentinel, so the check does not need assertNoLogs (Python 3.10)
+        with self.assertLogs(level=logging.WARNING) as logs:
+            memory = self.cycle(memory_with(usable_on("tr-slurm2", MEDIUM)))
+            logging.getLogger("sentinel").warning("end of cycle")
+        self.assertEqual(logs.output, ["WARNING:sentinel:end of cycle"])
+        self.assertEqual(nodes_out(memory.launch_records, MEDIUM), set())
+
+    def test_a_runner_offline_since_its_start_is_still_a_failed_launch(self):
+        self.offline_runner_started(B + 10)
+        self.jobs()
+        with self.assertLogs(level=logging.WARNING) as logs:
+            memory = self.cycle(memory_with(usable_on("tr-slurm2", MEDIUM)))
+        self.assertEqual(nodes_out(memory.launch_records, MEDIUM), {"tr-slurm2"})
+        self.assertIn(f"{MEDIUM}: out on tr-slurm2", "\n".join(logs.output))
+
+
 class DeleteEndedRunnersTest(CycleAgainstFakes):
     """A stopped runner never signs off, and GitHub offers its session jobs until its registration goes."""
 
@@ -872,18 +911,24 @@ class UnsafeSettingsTest(unittest.TestCase):
         ]
 
     def test_b_must_stay_below_w(self):
-        self.assertEqual(unsafe_settings(120, 600, self.repos("gha-a-")), [])
-        for boot_allowance_s in (600, 900):
+        self.assertEqual(unsafe_settings(120, 600, 30, self.repos("gha-a-")), [])
+        # A runner that never comes online must be seen offline between B and W less the margin
+        for boot_allowance_s in (570, 600, 900):
             with self.subTest(boot_allowance_s=boot_allowance_s):
                 self.assertEqual(
-                    len(unsafe_settings(boot_allowance_s, 600, self.repos("gha-a-"))), 1
+                    len(
+                        unsafe_settings(boot_allowance_s, 600, 30, self.repos("gha-a-"))
+                    ),
+                    1,
                 )
 
     def test_no_repository_may_call_another_ones_runners_its_own(self):
-        self.assertEqual(unsafe_settings(120, 600, self.repos("gha-a-", "gha-b-")), [])
+        self.assertEqual(
+            unsafe_settings(120, 600, 30, self.repos("gha-a-", "gha-b-")), []
+        )
         for prefixes in (("gha-a-", "gha-a-"), ("gha-a", "gha-a-b-"), ("", "gha-b-")):
             with self.subTest(prefixes=prefixes):
-                self.assertTrue(unsafe_settings(120, 600, self.repos(*prefixes)))
+                self.assertTrue(unsafe_settings(120, 600, 30, self.repos(*prefixes)))
 
     def test_the_daemon_refuses_to_start_with_b_at_or_above_w(self):
         with (

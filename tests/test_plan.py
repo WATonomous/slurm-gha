@@ -7,6 +7,7 @@ from config import (
     BOOT_ALLOWANCE_S as B,
     BUSY_COVER_S as T,
     IDLE_ALLOWANCE_S as W,
+    IDLE_STOP_MARGIN_S,
     UNUSED_REGISTRATION_LIFETIME_S as A_DAY,
 )
 from node_rule import (
@@ -86,8 +87,11 @@ def ended(slurm_job_id, state, ran_s=30, size_label=MEDIUM, submitted_at=None, n
     )
 
 
-def registration(of, is_online=True, is_busy=False):
-    return RunnerRegistration(of.slurm_job_id, of.runner_name, is_online, is_busy)
+def registration(of, is_online=True, is_busy=False, listed_at=NOW):
+    """As the runners list showed it, read at listed_at (by default with squeue, at NOW)."""
+    return RunnerRegistration(
+        of.slurm_job_id, of.runner_name, is_online, is_busy, listed_at
+    )
 
 
 def as_seen(of, runner):
@@ -355,17 +359,45 @@ class LaunchEvidenceTest(unittest.TestCase):
             with self.subTest(description):
                 self.assertIsNone(self.evidence(of, None))
 
-    def test_a_runner_offline_between_b_and_w(self):
+    def test_a_runner_offline_between_b_and_w_less_the_margin(self):
+        # Squeue and the runners list read together, at NOW
         rows = [
             (B - 1, None),
             (B, Evidence.STILL_OFFLINE_AT_B),
-            (W - 1, Evidence.STILL_OFFLINE_AT_B),
+            (W - IDLE_STOP_MARGIN_S - 1, Evidence.STILL_OFFLINE_AT_B),
+            # Offline this close to W may be the runner stopping itself at its deadline
+            (W - IDLE_STOP_MARGIN_S, None),
+            (W - 1, None),
             (W, None),
         ]
         for age_s, evidence in rows:
             with self.subTest(age_s=age_s):
                 of = allocation(1, age_s=age_s)
                 self.assertEqual(self.evidence(of, registration(of, False)), evidence)
+
+    def test_a_runner_that_stops_at_its_deadline_between_the_two_reads(self):
+        # As on the cluster: squeue read 5 s before its deadline, the runners list 6 s after, by then offline
+        of = allocation(1, age_s=W - 5)
+        listed_after_the_stop = registration(of, False, listed_at=NOW + 11)
+        self.assertIsNone(self.evidence(of, listed_after_the_stop))
+        # The same with the runners list read more than the margin after squeue
+        of = allocation(1, age_s=W - 35)
+        listed_after_the_stop = registration(of, False, listed_at=NOW + 40)
+        self.assertIsNone(self.evidence(of, listed_after_the_stop))
+        records = filed(NO_LAUNCH_RECORDS, (of, listed_after_the_stop))
+        self.assertEqual(records, NO_LAUNCH_RECORDS)
+
+    def test_a_runner_never_online_is_still_a_failed_launch_whenever_listed(self):
+        # The runners list read a few seconds after squeue changes nothing well before the deadline
+        for age_s in (B, W // 2, W - IDLE_STOP_MARGIN_S - 10):
+            with self.subTest(age_s=age_s):
+                of = on("tr-slurm2", allocation(1, age_s=age_s))
+                listed_later = registration(of, False, listed_at=NOW + 5)
+                self.assertEqual(
+                    self.evidence(of, listed_later), Evidence.STILL_OFFLINE_AT_B
+                )
+                records = filed(NO_LAUNCH_RECORDS, (of, listed_later))
+                self.assertEqual(nodes_out(records, MEDIUM), {"tr-slurm2"})
 
     def test_a_runner_github_leaves_idle_while_a_job_of_its_size_waits(self):
         rows = [
@@ -564,7 +596,7 @@ class RegistrationsToDeleteTest(unittest.TestCase):
             allocation(4, "COMPLETING"),
         ]
         # Its sbatch has not happened yet, or another daemon's
-        not_in_squeue = RunnerRegistration(9, "gha-test-9", False, False)
+        not_in_squeue = RunnerRegistration(9, "gha-test-9", False, False, NOW)
         by_name = registrations(
             registration(busy, False, True),
             *(registration(each, False) for each in unfinished),
