@@ -17,6 +17,13 @@ running Slurm job; it only cancels pending ones that can never start and deletes
 whose Slurm job has ended. Such a runner can stay listed online on GitHub for about a minute (68 s measured
 after a cancel), and GitHub may offer it a job meanwhile.
 
+Jobs with `container:` are not supported. The runner mounts its own files (`/home/runner/externals`, which
+exist only inside the Apptainer image) into the job container, and the rootless Docker daemon runs on the
+node, outside that image, where the path does not exist, so `docker start` fails. Only the work folder,
+`/tmp/<runner name>/_work`, is the same path on both sides: a step may start its own containers with
+`docker run` and mount the workspace (`-v "$GITHUB_WORKSPACE:..."`). `services:` mounts none of the runner's
+own paths and has not been tried.
+
 Where each size may go is the node rule, in `node_rule.py`, one line each:
 1. A size is not sent to a node where its newest runner failed to launch; it is used there again once a runner
    of that size takes a job there.
