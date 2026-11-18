@@ -39,7 +39,8 @@ logger.addHandler(stderr_handler)
 # Load GitHub access token from .env file
 # Only secret required is the GitHub access token
 load_dotenv()
-GITHUB_ACCESS_TOKEN = os.getenv("GITHUB_ACCESS_TOKEN").strip()
+# Removed from the environment, which sbatch copies into runner jobs by default
+GITHUB_ACCESS_TOKEN = os.environ.pop("GITHUB_ACCESS_TOKEN").strip()
 os.environ["PATH"] = "/opt/slurm/bin:" + os.environ["PATH"]
 
 
@@ -49,6 +50,30 @@ allocated_jobs = {}
 
 # A small flag used for logging "Polling for queued workflows..." only when we don't allocate anything.
 POLLED_WITHOUT_ALLOCATING = False
+
+# sacct states from which a job can still run; every other state is final.
+# https://slurm.schedmd.com/archive/slurm-24.05.1/sacct.html#SECTION_JOB-STATE-CODES
+UNFINISHED_SLURM_STATES = ("PENDING", "RUNNING", "REQUEUED", "RESIZING", "SUSPENDED")
+
+# After a runner cannot be submitted or ends in any state but COMPLETED, its job gets no new
+# runner for this long; a launch that always fails would otherwise be resubmitted every poll
+SECONDS_BEFORE_REPLACING_A_FAILED_RUNNER = 60
+
+# When each job whose last runner failed may get a new one, keyed like allocated_jobs (epoch seconds)
+no_new_runner_before = {}
+
+
+def hold_job_back_after_failed_runner(job_key, how_it_failed):
+    """
+    Gives the job (repo_name, job_id) no new runner for SECONDS_BEFORE_REPLACING_A_FAILED_RUNNER.
+    """
+    no_new_runner_before[job_key] = (
+        time.time() + SECONDS_BEFORE_REPLACING_A_FAILED_RUNNER
+    )
+    logger.warning(
+        f"Runner for job {job_key[1]} {how_it_failed}; its next runner may go in "
+        f"{SECONDS_BEFORE_REPLACING_A_FAILED_RUNNER} s"
+    )
 
 
 def get_gh_api(url, token, etag=None):
@@ -215,6 +240,8 @@ def allocate_actions_runner(job_id, token, repo_api_base_url, repo_url, repo_nam
     if (repo_name, job_id) in allocated_jobs:
         logger.info(f"Runner already allocated for job {job_id} in {repo_name}")
         return False
+    if time.time() < no_new_runner_before.get((repo_name, job_id), 0):
+        return False
 
     logger.info(f"Allocating runner for job {job_id} in repo {repo_name}")
     allocated_jobs[(repo_name, job_id)] = None
@@ -314,6 +341,8 @@ def allocate_actions_runner(job_id, token, repo_api_base_url, repo_url, repo_nam
             f"--cpus-per-task={runner_resources['cpu']}",
             f"--gres=tmpdisk:{runner_resources['tmpdisk']}",
             f"--time={runner_resources['time']}",
+            # Else JobRequeue=1 turns a failed launch into a held job that never ends
+            "--no-requeue",
             ALLOCATE_RUNNER_SCRIPT_PATH,  # allocate-ephemeral-runner-from-docker.sh
             repo_url,
             registration_token,
@@ -322,7 +351,11 @@ def allocate_actions_runner(job_id, token, repo_api_base_url, repo_url, repo_nam
             str(run_id),
         ]
 
-        logger.info(f"Running command: {' '.join(command)}")
+        command_without_tokens = " ".join(
+            "<token>" if arg in (registration_token, removal_token) else arg
+            for arg in command
+        )
+        logger.info(f"Running command: {command_without_tokens}")
         try:
             result = subprocess.run(
                 command, capture_output=True, text=True, timeout=SLURM_COMMAND_TIMEOUT
@@ -360,16 +393,19 @@ def allocate_actions_runner(job_id, token, repo_api_base_url, repo_url, repo_nam
                 )
 
             # If we get here, something failed, so remove from tracking and consider retry
+            hold_job_back_after_failed_runner((repo_name, job_id), "was not submitted")
             del allocated_jobs[(repo_name, job_id)]
             return False
         except subprocess.TimeoutExpired:
             logger.error(
-                f"SLURM command timed out after {SLURM_COMMAND_TIMEOUT} seconds: {' '.join(command)}"
+                f"SLURM command timed out after {SLURM_COMMAND_TIMEOUT} seconds: {command_without_tokens}"
             )
+            hold_job_back_after_failed_runner((repo_name, job_id), "was not submitted")
             del allocated_jobs[(repo_name, job_id)]
             return False
         except subprocess.SubprocessError as e:
             logger.error(f"Subprocess error running SLURM command: {e}")
+            hold_job_back_after_failed_runner((repo_name, job_id), "was not submitted")
             del allocated_jobs[(repo_name, job_id)]
             return False
 
@@ -384,6 +420,10 @@ def check_slurm_status():
     """
     Checks the status of SLURM jobs and removes completed or failed entries from allocated_jobs.
     """
+    for key, allowed_at in list(no_new_runner_before.items()):
+        if time.time() >= allowed_at:
+            del no_new_runner_before[key]
+
     if not allocated_jobs:
         return
 
@@ -438,12 +478,7 @@ def check_slurm_status():
 
                 # Convert time strings to datetime objects
 
-                if (
-                    status.startswith("COMPLETED")
-                    or status.startswith("FAILED")
-                    or status.startswith("CANCELLED")
-                    or status.startswith("TIMEOUT")
-                ):
+                if not status.startswith(UNFINISHED_SLURM_STATES):
                     try:
                         start_time = datetime.strptime(
                             start_time_str, "%Y-%m-%dT%H:%M:%S"
@@ -462,6 +497,8 @@ def check_slurm_status():
                     logger.info(
                         f"Slurm job {job_component} {status} in {duration}. Running Job Info: {str(running_job)}"
                     )
+                    if not status.startswith("COMPLETED"):
+                        hold_job_back_after_failed_runner(job_id, f"ended {status}")
                     to_remove.append(job_id)
 
         except subprocess.TimeoutExpired:
