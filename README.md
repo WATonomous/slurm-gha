@@ -14,7 +14,8 @@ Each Slurm job runs `allocation_scripts/apptainer.sh`: rootless Docker for the j
 just-in-time (JIT) runner in an apptainer container. A runner that has taken no job by its idle deadline
 (`IDLE_ALLOWANCE_S`, 10 minutes) stops itself; a runner never runs a second job. The daemon never ends a
 running Slurm job; it only cancels pending ones that can never start and deletes the registration of a runner
-whose Slurm job has ended.
+whose Slurm job has ended. Such a runner can stay listed online on GitHub for about a minute (68 s measured
+after a cancel), and GitHub may offer it a job meanwhile.
 
 Where each size may go is the node rule, in `node_rule.py`, one line each:
 1. A size is not sent to a node where its newest runner failed to launch; it is used there again once a runner
@@ -41,6 +42,11 @@ ones. Runners already running finish their job or stop at their idle deadline.
 **Keep runners off a node:** drain it, `scontrol update NodeName=<node> State=DRAIN Reason=<why>`. The daemon
 reads no node list and needs no change. A runner pinned to a drained node stays pending and holds nothing; it is
 cancelled once GitHub drops its unused registration, about a day after it was submitted.
+
+**Cancelling runner jobs by hand:** `scancel` of a running runner job that has not taken a job, like a node
+failure that kills it, counts as a failed launch on its node: its size skips that node until a runner of it
+takes a job there, and the node is tried again a minute later while a job of the size waits. A runner that
+already took a job, or one cancelled while still pending, counts for nothing against the node.
 
 **Log lines** (each starts with the repository; all but the outage lines then name the size label):
 - `out on <node>: Slurm job N <how it failed> (its log: <path> on <node>); next pinned runner there in N s`
