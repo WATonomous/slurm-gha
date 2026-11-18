@@ -137,7 +137,8 @@ class RunnerSightings:
 NO_SIGHTINGS = RunnerSightings(first_seen_busy_at={}, seen_on_a_job=frozenset())
 PHASES_THAT_CAN_TAKE_A_JOB = frozenset({Phase.PENDING, Phase.BOOTING, Phase.IDLE})
 # The batch script exits non-zero only when its runner ended before the idle deadline with no job begun.
-# A launch failure as in #37 ends CANCELLED by slurmd, but so does a job we cancelled while pending.
+# A launch failure as in #37 ends CANCELLED by slurmd with its node kept, but so does a job we cancelled
+# while pending, which never had a node.
 LAUNCH_FAILURE_STATES = frozenset({"FAILED", "CANCELLED", "NODE_FAIL", "BOOT_FAIL"})
 
 
@@ -222,7 +223,7 @@ def launch_evidence(
     now: float,
 ) -> Evidence | None:
     """TOOK_A_JOB if busy or named on a job read this cycle. Failed to launch: ENDED_WITHOUT_A_JOB if it
-    ended FAILED, NODE_FAIL or BOOT_FAIL, or ran and ended CANCELLED; STILL_OFFLINE_AT_B if it is RUNNING,
+    ended FAILED, NODE_FAIL or BOOT_FAIL, or ended CANCELLED on a node; STILL_OFFLINE_AT_B if it is RUNNING,
     registered and offline between B and W old; LEFT_IDLE_WHILE_A_JOB_WAITED if it is online and idle past
     2B while a job of its size has waited over B that no runner covers (uncovered_jobs_waiting_past_b > 0).
     Otherwise None."""
@@ -231,10 +232,9 @@ def launch_evidence(
     ):
         return Evidence.TOOK_A_JOB
     if allocation.state in LAUNCH_FAILURE_STATES:
-        started_at, ended_at = allocation.started_at, allocation.ended_at
-        # Slurm stamps a job cancelled while pending with a start equal to its end
-        ran = started_at is not None and ended_at is not None and started_at < ended_at
-        if allocation.state != "CANCELLED" or ran:
+        # Cancelled while pending, it never had a node. A launch slurmd gave up on has one, and can end
+        # within the second it started, so its start and end do not tell the two apart
+        if allocation.state != "CANCELLED" or allocation.node is not None:
             return Evidence.ENDED_WITHOUT_A_JOB
         return None
     if (

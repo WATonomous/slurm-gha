@@ -302,9 +302,23 @@ class LaunchEvidenceTest(unittest.TestCase):
     def test_ending_in_a_launch_failure_state_after_running(self):
         for state in ("FAILED", "CANCELLED", "NODE_FAIL", "BOOT_FAIL"):
             with self.subTest(state):
-                self.assertEqual(
-                    self.evidence(ended(1, state), None), Evidence.ENDED_WITHOUT_A_JOB
-                )
+                ran = on("trpro-slurm1", ended(1, state))
+                self.assertEqual(self.evidence(ran, None), Evidence.ENDED_WITHOUT_A_JOB)
+
+    def test_a_launch_slurmd_gave_up_on_is_a_failure_on_its_node(self):
+        # Under --no-requeue slurmd kills a job it could not start: CANCELLED, its node kept, and it can
+        # end within the second it started
+        gave_up = on("trpro-slurm1", ended(1, "CANCELLED", ran_s=0))
+        self.assertEqual(gave_up.started_at, gave_up.ended_at)
+        self.assertEqual(self.evidence(gave_up, None), Evidence.ENDED_WITHOUT_A_JOB)
+        records = filed(NO_LAUNCH_RECORDS, (gave_up, None))
+        self.assertEqual(nodes_out(records, MEDIUM), {"trpro-slurm1"})
+
+    def test_a_runner_cancelled_after_taking_a_job_took_a_job(self):
+        cancelled = on("trpro-slurm1", ended(1, "CANCELLED"))
+        self.assertEqual(
+            self.evidence(cancelled, None, [cancelled.runner_name]), Evidence.TOOK_A_JOB
+        )
 
     def test_a_failure_within_its_first_second_still_counts(self):
         # Slurm times are whole seconds: a batch script that dies at once starts and ends in one
@@ -330,6 +344,7 @@ class LaunchEvidenceTest(unittest.TestCase):
             2, "gha-test-2", MEDIUM, "CANCELLED", False, NOW - 60, NOW - 10, NOW - 10
         )
         rows = [
+            # Cancelled while pending: never a node, whatever squeue prints for its start
             ("cancelled while pending", cancelled_while_pending),
             ("start stamped with its end", stamped_start_at_end),
             ("stopped itself at its idle deadline", ended(3, "COMPLETED", ran_s=W)),
