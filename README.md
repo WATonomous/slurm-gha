@@ -55,6 +55,11 @@ failure that kills it, counts as a failed launch on its node: its size skips tha
 takes a job there, and the node is tried again a minute later while a job of the size waits. A runner that
 already took a job, or one cancelled while still pending, counts for nothing against the node.
 
+**A run cancelled as its runner comes online:** that runner can lose its registration on GitHub's side. It
+exits without running anything (its log says the registration was deleted), its Slurm job ends FAILED, and it
+counts as a failed launch on its node, as above. It is counted because a runner that dies as GitHub gives it a
+job looks the same to the daemon.
+
 **Log lines** (each starts with the repository; all but the outage lines then name the size label):
 - `out on <node>: Slurm job N <how it failed> (its log: <path> on <node>); next pinned runner there in N s`
   (WARNING): runners of that size skip the node. How it failed points at where to look: *ended without
