@@ -6,13 +6,14 @@ import threading
 import time
 from datetime import datetime
 
-import requests
 from dotenv import load_dotenv
 
 from config import ALLOCATE_RUNNER_SCRIPT_PATH, REPOS_TO_MONITOR
+from github_client import GitHubClient, GitHubUnavailable
 from KubernetesLogFormatter import KubernetesLogFormatter
 from runner_size_config import get_runner_resources
-from config import NETWORK_TIMEOUT, SLURM_COMMAND_TIMEOUT, THREAD_SLEEP_TIMEOUT
+from config import MIN_SECONDS_BETWEEN_CYCLES, NETWORK_TIMEOUT, SLURM_COMMAND_TIMEOUT
+from config import THREAD_SLEEP_TIMEOUT
 from RunningJob import RunningJob
 
 logger = logging.getLogger()
@@ -76,166 +77,107 @@ def hold_job_back_after_failed_runner(job_key, how_it_failed):
     )
 
 
-def get_gh_api(url, token, etag=None):
+def poll_github_actions_and_allocate_runners(github: GitHubClient) -> None:
     """
-    Sends a GET request to the GitHub API with the given URL and access token.
-    If rate limit is exceeded, the function waits until the rate limit is reset and retries.
-    Returns: (json_data, new_etag) or (None, etag)
-    """
-    try:
-        headers = {
-            "Authorization": f"token {token}",
-            "Accept": "application/vnd.github.v3+json",
-        }
-        if etag:
-            headers["If-None-Match"] = etag
-
-        response = requests.get(url, headers=headers, timeout=NETWORK_TIMEOUT)
-
-        response.raise_for_status()
-
-        if int(response.headers.get("X-RateLimit-Remaining", "0")) % 100 == 0:
-            logger.info(
-                f"Rate Limit Remaining: {response.headers['X-RateLimit-Remaining']}"
-            )
-        if response.status_code == 304:
-            return None, etag
-        elif response.status_code == 200:
-            new_etag = response.headers.get("ETag")
-            return response.json(), new_etag
-        elif (
-            response.status_code == 403
-            and "X-RateLimit-Remaining" in response.headers
-            and response.headers["X-RateLimit-Remaining"] == "0"
-        ):
-            reset_time = int(response.headers["X-RateLimit-Reset"])
-            sleep_time = (
-                reset_time - time.time() + 1
-            )  # Adding 1 second to ensure the reset has occurred
-            logger.warning(f"Rate limit exceeded. Waiting for {sleep_time} seconds.")
-            time.sleep(sleep_time)
-            return get_gh_api(url, token, etag)  # Retry the request
-        else:
-            logger.error(f"Unexpected status code: {response.status_code}")
-            return None, etag
-    except requests.exceptions.Timeout:
-        logger.error(
-            f"GitHub API request timed out after {NETWORK_TIMEOUT} seconds: {url}"
-        )
-        return None, etag
-    except requests.exceptions.ConnectionError as e:
-        logger.error(f"Connection error while calling GitHub API: {e}")
-        return None, etag
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Exception occurred while calling GitHub API: {e}")
-    return None, etag
-
-
-def poll_github_actions_and_allocate_runners(token, sleep_time=THREAD_SLEEP_TIMEOUT):
-    """
-    Polls each repository in REPOS_TO_MONITOR for queued workflows, then tries
-    to allocate ephemeral runners.
+    Each cycle, lists the queued workflow runs of each repository in REPOS_TO_MONITOR
+    and tries to allocate an ephemeral runner for every queued job. A cycle in which
+    a list of queued runs cannot be read is abandoned.
     """
     global POLLED_WITHOUT_ALLOCATING
 
-    logger.info(f"Starting GitHub Actions polling thread with {sleep_time}s intervals")
+    logger.info(
+        f"Starting GitHub Actions polling thread, at least {MIN_SECONDS_BETWEEN_CYCLES}s between cycles"
+    )
 
     while True:
+        github.start_cycle()
         try:
             something_allocated = False
 
             for repo in REPOS_TO_MONITOR:
-                queued_url = f"{repo['api_base_url']}/actions/runs?status=queued"
-                data, _ = get_gh_api(queued_url, token)
-
-                if data:
-                    new_allocations = allocate_runners_for_jobs(
-                        workflow_data=data,
-                        token=token,
-                        repo_api_base_url=repo["api_base_url"],
-                        repo_url=repo["repo_url"],
-                        repo_name=repo["name"],
-                    )
-                    if new_allocations > 0:
-                        something_allocated = True
+                queued_runs = github.get_all_pages(
+                    f"{repo['api_base_url']}/actions/runs?status=queued",
+                    "workflow_runs",
+                )
+                new_allocations = allocate_runners_for_jobs(
+                    github=github,
+                    queued_runs=queued_runs,
+                    repo_api_base_url=repo["api_base_url"],
+                    repo_url=repo["repo_url"],
+                    repo_name=repo["name"],
+                )
+                if new_allocations > 0:
+                    something_allocated = True
 
             if not something_allocated and not POLLED_WITHOUT_ALLOCATING:
                 logger.info("Polling for queued workflows...")
                 POLLED_WITHOUT_ALLOCATING = True
+        except GitHubUnavailable as e:
+            logger.warning(f"Abandoned this cycle, could not list queued runs: {e}")
         except Exception as e:
             logger.error(f"Exception in poll_github_actions_and_allocate_runners: {e}")
 
-        time.sleep(sleep_time)
-
-
-def get_all_jobs(workflow_id, token, repo_api_base_url):
-    """
-    Get all CI jobs for a given workflow ID by paginating through the GitHub API.
-    """
-    all_jobs = []
-    page = 1
-    per_page = 100
-
-    while True:
-        url = f"{repo_api_base_url}/actions/runs/{workflow_id}/jobs"
-        url += f"?per_page={per_page}&page={page}"
-
-        job_data, _ = get_gh_api(url, token)
-        if job_data and "jobs" in job_data:
-            all_jobs.extend(job_data["jobs"])
-            if len(job_data["jobs"]) < per_page:
-                break  # No more pages
-            page += 1
-        else:
-            # Possibly no more jobs or an error
-            break
-
-    return all_jobs
+        time.sleep(github.seconds_until_next_cycle(time.time()))
 
 
 def allocate_runners_for_jobs(
-    workflow_data, token, repo_api_base_url, repo_url, repo_name
-):
+    github: GitHubClient,
+    queued_runs: list[dict],
+    repo_api_base_url: str,
+    repo_url: str,
+    repo_name: str,
+) -> int:
     """
-    For each queued job in a workflow, allocate the ephemeral SLURM runner if appropriate.
+    For each queued job in the queued workflow runs, allocate the ephemeral SLURM runner
+    if appropriate; a run or job GitHub gives no answer for is skipped.
     Returns the count of new allocations made.
     """
     new_allocations = 0
 
-    if "workflow_runs" not in workflow_data:
-        logger.error("No workflow_runs in data.")
-        return new_allocations
-
-    number_of_queued_workflows = len(workflow_data["workflow_runs"])
-
-    for i in range(number_of_queued_workflows):
-        workflow_id = workflow_data["workflow_runs"][i]["id"]
-        job_data = get_all_jobs(workflow_id, token, repo_api_base_url)
-        if not job_data:
+    for run in queued_runs:
+        # Skipping is safe only because this adds runners: a lower bound on demand is enough
+        try:
+            jobs = github.get_all_pages(
+                f"{repo_api_base_url}/actions/runs/{run['id']}/jobs", "jobs"
+            )
+        except GitHubUnavailable as e:
+            logger.warning(f"Skipped run {run['id']}, could not list its jobs: {e}")
             continue
 
-        for job in job_data:
+        for job in jobs:
             if job["status"] == "queued":
-                queued_job_id = job["id"]
-                allocated = allocate_actions_runner(
-                    job_id=queued_job_id,
-                    token=token,
-                    repo_api_base_url=repo_api_base_url,
-                    repo_url=repo_url,
-                    repo_name=repo_name,
-                )
+                try:
+                    allocated = allocate_actions_runner(
+                        github=github,
+                        job=job,
+                        repo_api_base_url=repo_api_base_url,
+                        repo_url=repo_url,
+                        repo_name=repo_name,
+                    )
+                except GitHubUnavailable as e:
+                    logger.warning(f"Skipped job {job['id']}: {e}")
+                    continue
                 if allocated:
                     new_allocations += 1
 
     return new_allocations
 
 
-def allocate_actions_runner(job_id, token, repo_api_base_url, repo_url, repo_name):
+def allocate_actions_runner(
+    github: GitHubClient,
+    job: dict,
+    repo_api_base_url: str,
+    repo_url: str,
+    repo_name: str,
+) -> bool:
     """
-    Allocates a runner for the given job ID. Returns True if successful, False otherwise.
+    Allocates a runner for a queued job, as its run's jobs list gives it. Returns True if
+    successful, False otherwise. Raises GitHubUnavailable, after forgetting the job, if
+    GitHub gives no answer.
     """
     global allocated_jobs, POLLED_WITHOUT_ALLOCATING
 
+    job_id = job["id"]
     # If we already allocated a runner for this job in this repo, skip
     if (repo_name, job_id) in allocated_jobs:
         logger.info(f"Runner already allocated for job {job_id} in {repo_name}")
@@ -243,94 +185,43 @@ def allocate_actions_runner(job_id, token, repo_api_base_url, repo_url, repo_nam
     if time.time() < no_new_runner_before.get((repo_name, job_id), 0):
         return False
 
+    labels = job.get("labels", [])
+    if not labels:
+        logger.error(f"No labels found for job_id {job_id}")
+        return False
+
+    runner_size_label = labels[0]
+    if "slurm-runner" not in runner_size_label:
+        logger.info(
+            f"Skipping job {job_id} because it is not labeled for slurm-runner."
+        )
+        return False
+
     logger.info(f"Allocating runner for job {job_id} in repo {repo_name}")
+    logger.info(f"Job {job_id} labels: {labels}")
     allocated_jobs[(repo_name, job_id)] = None
     POLLED_WITHOUT_ALLOCATING = False
 
     try:
-        # Get registration token
-        headers = {
-            "Authorization": f"token {token}",
-            "Accept": "application/vnd.github.v3+json",
-        }
-
-        reg_url = f"{repo_api_base_url}/actions/runners/registration-token"
-        remove_url = f"{repo_api_base_url}/actions/runners/remove-token"
-
-        try:
-            reg_resp = requests.post(reg_url, headers=headers, timeout=NETWORK_TIMEOUT)
-            reg_resp.raise_for_status()
-            reg_data = reg_resp.json()
-            registration_token = reg_data["token"]
-            logger.debug("Successfully obtained registration token")
-        except requests.exceptions.Timeout:
-            logger.error(
-                f"Registration token request timed out after {NETWORK_TIMEOUT} seconds"
-            )
-            del allocated_jobs[(repo_name, job_id)]
-            return False
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to get registration token: {e}")
-            del allocated_jobs[(repo_name, job_id)]
-            return False
-
-        # recommended small delay https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api?apiVersion=2022-11-28#pause-between-mutative-requests
-        time.sleep(1)
-
-        # Get removal token
-        try:
-            remove_resp = requests.post(
-                remove_url, headers=headers, timeout=NETWORK_TIMEOUT
-            )
-            remove_resp.raise_for_status()
-            remove_data = remove_resp.json()
-            removal_token = remove_data["token"]
-        except requests.exceptions.Timeout:
-            logger.error(
-                f"Removal token request timed out after {NETWORK_TIMEOUT} seconds"
-            )
-            del allocated_jobs[(repo_name, job_id)]
-            return False
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to get removal token: {e}")
-            del allocated_jobs[(repo_name, job_id)]
-            return False
-
-        # Get job details to see labels
-        job_api_url = f"{repo_api_base_url}/actions/jobs/{job_id}"
-        job_data, _ = get_gh_api(job_api_url, token)
-        if not job_data:
-            logger.error(f"Failed to retrieve job data for job_id {job_id}")
-            del allocated_jobs[(repo_name, job_id)]
-            return False
-
-        labels = job_data.get("labels", [])
-        if not labels:
-            logger.error(f"No labels found for job_id {job_id}")
-            del allocated_jobs[(repo_name, job_id)]
-            return False
-
-        logger.info(f"Job {job_id} labels: {labels}")
-
-        run_id = job_data["run_id"]
+        run_id = job["run_id"]
         allocated_jobs[(repo_name, job_id)] = RunningJob(
             repo=repo_name,
             job_id=job_id,
             slurm_job_id=None,
-            workflow_name=job_data["workflow_name"],
-            job_name=job_data["name"],
+            workflow_name=job["workflow_name"],
+            job_name=job["name"],
             labels=labels,
         )
 
-        runner_size_label = labels[0]
-
-        if "slurm-runner" not in runner_size_label:
-            logger.info("Skipping job because it is not labeled for slurm-runner.")
-            del allocated_jobs[(repo_name, job_id)]
-            return False
-
         logger.info(f"Using runner size label: {runner_size_label}")
         runner_resources = get_runner_resources(runner_size_label)
+
+        registration_token = github.post_json(
+            f"{repo_api_base_url}/actions/runners/registration-token"
+        )["token"]
+        removal_token = github.post_json(
+            f"{repo_api_base_url}/actions/runners/remove-token"
+        )["token"]
 
         # sbatch resource allocation command
         command = [
@@ -375,8 +266,8 @@ def allocate_actions_runner(job_id, token, repo_api_base_url, repo_url, repo_nam
                         repo=repo_name,
                         job_id=job_id,
                         slurm_job_id=slurm_job_id,
-                        workflow_name=job_data["workflow_name"],
-                        job_name=job_data["name"],
+                        workflow_name=job["workflow_name"],
+                        job_name=job["name"],
                         labels=labels,
                     )
                     logger.info(
@@ -409,6 +300,9 @@ def allocate_actions_runner(job_id, token, repo_api_base_url, repo_url, repo_nam
             del allocated_jobs[(repo_name, job_id)]
             return False
 
+    except GitHubUnavailable:
+        allocated_jobs.pop((repo_name, job_id), None)
+        raise
     except Exception as e:
         logger.error(f"Exception in allocate_actions_runner for job_id {job_id}: {e}")
         if (repo_name, job_id) in allocated_jobs:
@@ -542,7 +436,7 @@ if __name__ == "__main__":
     # Thread to poll GitHub for new queued workflows
     github_thread = threading.Thread(
         target=poll_github_actions_and_allocate_runners,
-        args=(GITHUB_ACCESS_TOKEN, 2),
+        args=(GitHubClient(GITHUB_ACCESS_TOKEN),),
         name="GitHub-Poller",
     )
 
