@@ -18,6 +18,7 @@ from config import (
 )
 from github_client import (
     GitHubClient,
+    GitHubNotFound,
     GitHubUnavailable,
     RateLimitWindow,
     classify_response,
@@ -54,7 +55,7 @@ class ClassifyResponseTest(unittest.TestCase):
             429: "stop",
             301: "failed",
             400: "failed",
-            404: "failed",
+            404: "not_found",
             422: "failed",
             500: "failed",
             502: "failed",
@@ -597,6 +598,37 @@ class GitHubClientTest(unittest.TestCase):
             self.github.post_json(self.url("/token"))
         self.assertEqual(self.github.no_requests_before - self.clock.now, 120)
         self.assertEqual(len(self.fake.requests_to("/token")), 2)
+
+    def test_a_404_raises_not_found_and_stops_nothing(self):
+        self.fake.script(
+            "/runs/7", Reply(404, body={"message": "Not Found"}), Reply(200, body={})
+        )
+        with self.assertRaises(GitHubNotFound) as raised:
+            self.github.get_json(self.url("/runs/7"))
+        self.assertIsInstance(raised.exception, GitHubUnavailable)
+        self.assertIn("HTTP 404", str(raised.exception))
+        self.assertEqual(self.github.no_requests_before, 0)
+        self.assertEqual(self.github.get_json(self.url("/runs/7")), {})
+
+    def test_get_page_names_the_next_page_only_when_github_does(self):
+        page_2 = self.url("/runs?page=2")
+        # A short page with a next link: GitHub may return fewer than per_page before the end
+        short_with_next = {"workflow_runs": [{"id": 1}]}
+        self.fake.script(
+            "/runs?page=1",
+            answer_304_to('"p1"', short_with_next, {"Link": f'<{page_2}>; rel="next"'}),
+        )
+        self.fake.script("/runs?page=2", Reply(200, body={"workflow_runs": []}))
+        for _ in range(2):  # the second answer is a 304, followed from the stored link
+            self.assertEqual(
+                self.github.get_page(self.url("/runs?page=1")),
+                (short_with_next, page_2),
+            )
+            self.github.start_cycle()
+        self.assertEqual(self.github.get_page(page_2), ({"workflow_runs": []}, None))
+        self.assertEqual(
+            self.fake.requests_to("/runs?page=1")[1][2]["If-None-Match"], '"p1"'
+        )
 
     def test_a_server_error_fails_only_that_request(self):
         self.fake.script(

@@ -31,6 +31,10 @@ class GitHubUnavailable(Exception):
     """No complete answer: what the caller wanted is unknown, never empty."""
 
 
+class GitHubNotFound(GitHubUnavailable):
+    """GitHub answered 404: the resource is gone, or this token may not see it."""
+
+
 @dataclass(frozen=True)
 class RateLimitWindow:
     """One primary rate-limit window, by its lowest reading: GitHub's replicas disagree and the lowest is safe."""
@@ -83,7 +87,7 @@ class GitHubClient:
 
     def get_json(self, url: str) -> dict:
         """One conditional GET of exactly one page; a 304 returns the stored body. A fresh object every call."""
-        body, _ = self._get_page(url)
+        body, _ = self.get_page(url)
         return body
 
     def get_all_pages(self, url: str, items_key: str) -> list[dict]:
@@ -94,7 +98,7 @@ class GitHubClient:
         page_url = f"{url}{separator}per_page={PAGE_SIZE}"
         items = []
         while page_url is not None:
-            body, page_url = self._get_page(page_url)
+            body, page_url = self.get_page(page_url)
             page_items = body.get(items_key)
             if not isinstance(page_items, list):
                 raise GitHubUnavailable(
@@ -124,8 +128,9 @@ class GitHubClient:
             now,
         )
 
-    def _get_page(self, url: str) -> tuple[dict, str | None]:
-        """One conditional GET: the body and the next page's URL, from GitHub or, on a 304, from the stored page."""
+    def get_page(self, url: str) -> tuple[dict, str | None]:
+        """One conditional GET: the body and the next page's URL (None when GitHub names none), from GitHub or,
+        on a 304, from the stored page. A page shorter than per_page is not the last one unless this says so."""
         stored = self._pages_this_cycle.get(url) or self._pages_last_cycle.get(url)
         headers = {"If-None-Match": stored.etag} if stored is not None else {}
         response = self._send("GET", url, headers=headers)
@@ -201,6 +206,10 @@ class GitHubClient:
                 f"{method} {url}: HTTP {response.status_code}, {reason} ({message});"
                 f" no requests for {stop_s:.0f} s"
             )
+        if outcome == "not_found":
+            raise GitHubNotFound(
+                f"{method} {url}: HTTP 404 {_github_error_message(response)}"
+            )
         if outcome == "failed":
             raise GitHubUnavailable(
                 f"{method} {url}: HTTP {response.status_code} {_github_error_message(response)}"
@@ -209,11 +218,14 @@ class GitHubClient:
 
 
 def classify_response(status_code: int) -> str:
-    """Pure: "ok" (2xx), "not_modified" (304), "stop" (401, 403, 429: GitHub asks us to wait) or "failed" (the rest)."""
+    """Pure: "ok" (2xx), "not_modified" (304), "stop" (401, 403, 429: GitHub asks us to wait), "not_found" (404)
+    or "failed" (the rest)."""
     if 200 <= status_code < 300:
         return "ok"
     if status_code == 304:
         return "not_modified"
+    if status_code == 404:
+        return "not_found"
     # 401 too: repeated bad credentials make GitHub refuse the account's valid tokens as well
     if status_code in (401, 403, 429):
         return "stop"

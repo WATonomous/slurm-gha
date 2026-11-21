@@ -9,10 +9,19 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 from config import ALLOCATE_RUNNER_SCRIPT_PATH, REPOS_TO_MONITOR
+from demand import (
+    WaitingJob,
+    demand_from_jobs,
+    read_latest_jobs,
+    stop_watching_finished_runs,
+    watch_new_runs,
+    watch_runs_from_history_page,
+)
 from github_client import GitHubClient, GitHubUnavailable
 from KubernetesLogFormatter import KubernetesLogFormatter
 from runner_size_config import get_runner_resources
-from config import MIN_SECONDS_BETWEEN_CYCLES, NETWORK_TIMEOUT, SLURM_COMMAND_TIMEOUT
+from config import HISTORY_PAGE_INTERVAL_S, MIN_SECONDS_BETWEEN_CYCLES
+from config import NETWORK_TIMEOUT, SLURM_COMMAND_TIMEOUT
 from config import THREAD_SLEEP_TIMEOUT
 from RunningJob import RunningJob
 
@@ -79,105 +88,107 @@ def hold_job_back_after_failed_runner(job_key, how_it_failed):
 
 def poll_github_actions_and_allocate_runners(github: GitHubClient) -> None:
     """
-    Each cycle, lists the queued workflow runs of each repository in REPOS_TO_MONITOR
-    and tries to allocate an ephemeral runner for every queued job. A cycle in which
-    a list of queued runs cannot be read is abandoned.
+    Each cycle, finds the jobs waiting for a runner in each repository in REPOS_TO_MONITOR
+    by reading the jobs of every run it watches, and tries to allocate an ephemeral runner
+    for each as soon as its run is read. What GitHub cannot answer is left out of that
+    cycle; the watched runs stay.
     """
     global POLLED_WITHOUT_ALLOCATING
 
     logger.info(
         f"Starting GitHub Actions polling thread, at least {MIN_SECONDS_BETWEEN_CYCLES}s between cycles"
     )
+    # Demand's only state across cycles; after a restart GitHub's run lists refill it
+    watched_run_ids_by_repo = {repo["name"]: set() for repo in REPOS_TO_MONITOR}
+    history_page_by_repo = {repo["name"]: 1 for repo in REPOS_TO_MONITOR}
+    next_history_page_at = 0.0  # time.monotonic(); 0 reads page 1 in the first cycle
 
     while True:
         github.start_cycle()
         try:
             something_allocated = False
+            read_history_page = time.monotonic() >= next_history_page_at
+            if read_history_page:
+                next_history_page_at = time.monotonic() + HISTORY_PAGE_INTERVAL_S
 
             for repo in REPOS_TO_MONITOR:
-                queued_runs = github.get_all_pages(
-                    f"{repo['api_base_url']}/actions/runs?status=queued",
-                    "workflow_runs",
+                repo_api_base_url = repo["api_base_url"]
+                watched_run_ids = watch_new_runs(
+                    github, repo_api_base_url, watched_run_ids_by_repo[repo["name"]]
                 )
-                new_allocations = allocate_runners_for_jobs(
-                    github=github,
-                    queued_runs=queued_runs,
-                    repo_api_base_url=repo["api_base_url"],
-                    repo_url=repo["repo_url"],
-                    repo_name=repo["name"],
+                if read_history_page:
+                    watched_run_ids, history_page_by_repo[repo["name"]] = (
+                        watch_runs_from_history_page(
+                            github,
+                            repo_api_base_url,
+                            watched_run_ids,
+                            history_page_by_repo[repo["name"]],
+                            time.time(),
+                        )
+                    )
+                watched_run_ids_by_repo[repo["name"]] = watched_run_ids
+
+                jobs_by_run = {}
+                # Newest first: runs idle for days, such as those that never got jobs, come last
+                for run_id in sorted(watched_run_ids, reverse=True):
+                    jobs_of_run = read_latest_jobs(github, repo_api_base_url, {run_id})
+                    jobs_by_run.update(jobs_of_run)
+                    if allocate_runners_for_waiting_jobs(
+                        github, repo, demand_from_jobs(jobs_of_run).waiting_jobs
+                    ):
+                        something_allocated = True
+
+                watched_run_ids_by_repo[repo["name"]] = stop_watching_finished_runs(
+                    github, repo_api_base_url, watched_run_ids, jobs_by_run
                 )
-                if new_allocations > 0:
-                    something_allocated = True
 
             if not something_allocated and not POLLED_WITHOUT_ALLOCATING:
                 logger.info("Polling for queued workflows...")
                 POLLED_WITHOUT_ALLOCATING = True
-        except GitHubUnavailable as e:
-            logger.warning(f"Abandoned this cycle, could not list queued runs: {e}")
         except Exception as e:
             logger.error(f"Exception in poll_github_actions_and_allocate_runners: {e}")
 
         time.sleep(github.seconds_until_next_cycle(time.time()))
 
 
-def allocate_runners_for_jobs(
-    github: GitHubClient,
-    queued_runs: list[dict],
-    repo_api_base_url: str,
-    repo_url: str,
-    repo_name: str,
-) -> int:
+def allocate_runners_for_waiting_jobs(
+    github: GitHubClient, repo: dict, waiting_jobs: list[WaitingJob]
+) -> bool:
     """
-    For each queued job in the queued workflow runs, allocate the ephemeral SLURM runner
-    if appropriate; a run or job GitHub gives no answer for is skipped.
-    Returns the count of new allocations made.
+    allocate_actions_runner for each waiting job of one repository; a job GitHub gives no
+    answer for is skipped. True if any runner was allocated.
     """
-    new_allocations = 0
-
-    for run in queued_runs:
+    something_allocated = False
+    for job in waiting_jobs:
         # Skipping is safe only because this adds runners: a lower bound on demand is enough
         try:
-            jobs = github.get_all_pages(
-                f"{repo_api_base_url}/actions/runs/{run['id']}/jobs", "jobs"
-            )
+            if allocate_actions_runner(
+                github=github,
+                job=job,
+                repo_api_base_url=repo["api_base_url"],
+                repo_url=repo["repo_url"],
+                repo_name=repo["name"],
+            ):
+                something_allocated = True
         except GitHubUnavailable as e:
-            logger.warning(f"Skipped run {run['id']}, could not list its jobs: {e}")
-            continue
-
-        for job in jobs:
-            if job["status"] == "queued":
-                try:
-                    allocated = allocate_actions_runner(
-                        github=github,
-                        job=job,
-                        repo_api_base_url=repo_api_base_url,
-                        repo_url=repo_url,
-                        repo_name=repo_name,
-                    )
-                except GitHubUnavailable as e:
-                    logger.warning(f"Skipped job {job['id']}: {e}")
-                    continue
-                if allocated:
-                    new_allocations += 1
-
-    return new_allocations
+            logger.warning(f"Skipped job {job.job_id}: {e}")
+    return something_allocated
 
 
 def allocate_actions_runner(
     github: GitHubClient,
-    job: dict,
+    job: WaitingJob,
     repo_api_base_url: str,
     repo_url: str,
     repo_name: str,
 ) -> bool:
     """
-    Allocates a runner for a queued job, as its run's jobs list gives it. Returns True if
-    successful, False otherwise. Raises GitHubUnavailable, after forgetting the job, if
-    GitHub gives no answer.
+    Allocates a runner for a job waiting for one. Returns True if successful, False
+    otherwise. Raises GitHubUnavailable, after forgetting the job, if GitHub gives no answer.
     """
     global allocated_jobs, POLLED_WITHOUT_ALLOCATING
 
-    job_id = job["id"]
+    job_id = job.job_id
     # If we already allocated a runner for this job in this repo, skip
     if (repo_name, job_id) in allocated_jobs:
         logger.info(f"Runner already allocated for job {job_id} in {repo_name}")
@@ -185,17 +196,8 @@ def allocate_actions_runner(
     if time.time() < no_new_runner_before.get((repo_name, job_id), 0):
         return False
 
-    labels = job.get("labels", [])
-    if not labels:
-        logger.error(f"No labels found for job_id {job_id}")
-        return False
-
-    runner_size_label = labels[0]
-    if "slurm-runner" not in runner_size_label:
-        logger.info(
-            f"Skipping job {job_id} because it is not labeled for slurm-runner."
-        )
-        return False
+    labels = list(job.labels)
+    runner_size_label = job.size_label
 
     logger.info(f"Allocating runner for job {job_id} in repo {repo_name}")
     logger.info(f"Job {job_id} labels: {labels}")
@@ -203,13 +205,13 @@ def allocate_actions_runner(
     POLLED_WITHOUT_ALLOCATING = False
 
     try:
-        run_id = job["run_id"]
+        run_id = job.run_id
         allocated_jobs[(repo_name, job_id)] = RunningJob(
             repo=repo_name,
             job_id=job_id,
             slurm_job_id=None,
-            workflow_name=job["workflow_name"],
-            job_name=job["name"],
+            workflow_name=job.workflow_name,
+            job_name=job.job_name,
             labels=labels,
         )
 
@@ -266,8 +268,8 @@ def allocate_actions_runner(
                         repo=repo_name,
                         job_id=job_id,
                         slurm_job_id=slurm_job_id,
-                        workflow_name=job["workflow_name"],
-                        job_name=job["name"],
+                        workflow_name=job.workflow_name,
+                        job_name=job.job_name,
                         labels=labels,
                     )
                     logger.info(
