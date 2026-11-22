@@ -47,6 +47,7 @@ from node_rule import (
     next_unpinned_runner_at,
     plan_submissions,
     record_refused_submission,
+    record_unusable_runner_answer,
 )
 from plan import (
     NO_DEMAND,
@@ -63,6 +64,7 @@ from supply import (
     SlurmTimedOut,
     SlurmUnavailable,
     SbatchLeftNoJob,
+    GitHubGaveNoUsableRunner,
     SubmissionRefused,
     cancel_pending_allocation,
     delete_registration,
@@ -382,6 +384,8 @@ def submit_runners(
     sbatch_left_no_job of them before this call, left no job and named no node Slurm does not know. What
     the cycle records is stamped clock() when it happens.
     - Refused (the FAILED record): record_refused_submission; the size submits nothing more this cycle.
+    - GitHub's answer gave no runner we can use: record_unusable_runner_answer (rule 5); the size submits
+      nothing more this cycle.
     - sbatch left no job and named nodes Slurm does not know: those nodes are forgotten for every size, and
       the entries naming them are skipped. Otherwise (nothing named, all named nodes known, or Slurm could
       not be asked) nothing is recorded: the first such failure in a cycle skips its own entry, since the
@@ -401,6 +405,16 @@ def submit_runners(
             submit_runner(
                 github, repo.api_base_url, repo.runner_name_prefix, submission
             )
+        except GitHubGaveNoUsableRunner as unusable:
+            answered_at = clock()
+            records = record_unusable_runner_answer(records, size_label, answered_at)
+            refused_size_labels.add(size_label)
+            wait_s = next_unpinned_runner_at(records, size_label) - answered_at
+            logger.warning(
+                f"{repo.name}: {size_label}: GitHub's answer gave no runner we can use for"
+                f" {unusable.runner_name} ({unusable}); next runner in {wait_s:.0f} s"
+            )
+            continue
         except SubmissionRefused as refused:
             refused_at = clock()
             records = record_refused_submission(

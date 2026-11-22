@@ -24,6 +24,7 @@ from node_rule import (
     ordinal,
     plan_submissions,
     record_refused_submission,
+    record_unusable_runner_answer,
     retry_wait_s,
     size_usable_somewhere,
     submission_order,
@@ -675,6 +676,70 @@ class RuleFiveNodelessFailuresTest(unittest.TestCase):
         later = NOW + REFUSED_NAMES_KEPT_S
         self.assertEqual(
             filed(records, now=later).by_size[MEDIUM].refused_runner_names, {}
+        )
+
+
+class UnusableRunnerAnswerTest(unittest.TestCase):
+    """GitHub's answer to generate-jitconfig gave no runner we can use: a failure that belongs to no node
+    (rule 5)."""
+
+    def test_the_size_waits_doubling_until_a_newer_runner_takes_a_job(self):
+        records = record_unusable_runner_answer(
+            usable_on("thor-slurm1", MEDIUM), MEDIUM, NOW
+        )
+        self.assertFalse(size_usable_somewhere(records, MEDIUM))
+        self.assertEqual(next_unpinned_runner_at(records, MEDIUM), NOW + 60)
+        records = record_unusable_runner_answer(records, MEDIUM, NOW + 60)
+        self.assertEqual(next_unpinned_runner_at(records, MEDIUM), NOW + 180)
+        newer = on("thor-slurm1", allocation(1, submitted_at=NOW + 180))
+        took = filed(records, (newer, registration(newer, is_busy=True)), now=NOW + 200)
+        self.assertTrue(size_usable_somewhere(took, MEDIUM))
+        self.assertEqual(next_unpinned_runner_at(took, MEDIUM), 0)
+
+    def test_it_backs_off_whatever_slurms_clock_says(self):
+        # Successes are ordered by Slurm's submit time, the answer by the daemon's clock
+        for skew_s in (100, -100):
+            with self.subTest(slurm_ahead_by_s=skew_s):
+                took = on("thor-slurm1", allocation(1, submitted_at=NOW - 30 + skew_s))
+                records = filed(
+                    NO_LAUNCH_RECORDS, (took, registration(took, is_busy=True))
+                )
+                self.assertTrue(size_usable_somewhere(records, MEDIUM))
+                records = record_unusable_runner_answer(records, MEDIUM, NOW)
+                self.assertFalse(size_usable_somewhere(records, MEDIUM))
+                self.assertEqual(next_unpinned_runner_at(records, MEDIUM), NOW + 60)
+                records = record_unusable_runner_answer(records, MEDIUM, NOW + 60)
+                self.assertEqual(next_unpinned_runner_at(records, MEDIUM), NOW + 180)
+
+    def test_with_slurm_behind_only_a_runner_stamped_after_the_answer_clears_it(self):
+        # The cost of Slurm's clock running 100 s behind: a runner submitted 70 s after the answer is
+        # stamped 30 s before it, and its job does not end the back-off
+        records = record_unusable_runner_answer(
+            usable_on("thor-slurm1", MEDIUM), MEDIUM, NOW
+        )
+        early = on("thor-slurm1", allocation(1, submitted_at=NOW - 30))
+        records = filed(
+            records, (early, registration(early, is_busy=True)), now=NOW + 90
+        )
+        self.assertFalse(size_usable_somewhere(records, MEDIUM))
+        later = on("thor-slurm1", allocation(2, submitted_at=NOW + 1))
+        records = filed(
+            records, (later, registration(later, is_busy=True)), now=NOW + 200
+        )
+        self.assertTrue(size_usable_somewhere(records, MEDIUM))
+
+    def test_it_is_logged_where_it_happens_and_named_as_the_cause(self):
+        before = usable_on("thor-slurm1", MEDIUM)
+        after = record_unusable_runner_answer(before, MEDIUM, NOW)
+        self.assertEqual(
+            launch_record_log_lines(before, after, NOW),
+            [
+                (
+                    logging.WARNING,
+                    f"{MEDIUM}: one runner at a time: GitHub's answer gave no runner we can"
+                    " use (see above)",
+                )
+            ],
         )
 
 

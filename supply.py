@@ -87,6 +87,15 @@ class SbatchLeftNoJob(Exception):
         self.runner_name = runner_name
 
 
+class GitHubGaveNoUsableRunner(Exception):
+    """An answer, not an unknown: GitHub registered a runner but its answer carried nothing to start it
+    with; the registration has been deleted when its id was readable. str() says what was missing."""
+
+    def __init__(self, runner_name: str, why: str):
+        super().__init__(why)
+        self.runner_name = runner_name
+
+
 class AfterFailedSbatch(Enum):
     """What squeue shows by a runner's name after its sbatch exited non-zero."""
 
@@ -268,11 +277,12 @@ def submit_runner(
 ) -> None:
     """POST generate-jitconfig for a new runner of the submission's size, then sbatch with the config in the
     environment. Raises GitHubUnavailable or SlurmUnavailable, and ValueError for a label that is not a
-    size, which demand never reports. When sbatch exits non-zero, squeue decides: a live job is a submitted
-    runner after all; otherwise the registration is deleted (a failed delete is only logged) and
-    SubmissionRefused raised for a FAILED record with no node, SbatchLeftNoJob for nothing. If squeue
-    cannot be read, or sbatch timed out (SlurmTimedOut) and its request may still be queued in slurmctld,
-    the registration is left and SlurmUnavailable raised."""
+    size, which demand never reports. GitHubGaveNoUsableRunner when the answer has no config to start
+    the runner with: its registration is deleted and nothing is submitted. When sbatch exits non-zero,
+    squeue decides: a live job is a submitted runner after all; otherwise the registration is deleted (a
+    failed delete is only logged) and SubmissionRefused raised for a FAILED record with no node,
+    SbatchLeftNoJob for nothing. If squeue cannot be read, or sbatch timed out (SlurmTimedOut) and its
+    request may still be queued in slurmctld, the registration is left and SlurmUnavailable raised."""
     size_label = submission.size_label
     resources = get_runner_resources(size_label)
     if resources is None:
@@ -291,9 +301,16 @@ def submit_runner(
     )
     jit_config = jit_response.get("encoded_jit_config")
     if not isinstance(jit_config, str) or not jit_config:
-        raise GitHubUnavailable(
-            f"generate-jitconfig for {runner_name}: no encoded_jit_config in the answer"
-        )
+        why = "GitHub's answer carried no encoded_jit_config to start the runner with"
+        runner = jit_response.get("runner")
+        runner_id = runner.get("id") if isinstance(runner, dict) else None
+        if isinstance(runner_id, int):
+            delete_registration(
+                github, repo_api_base_url, runner_id, runner_name, why=why
+            )
+        else:
+            why += "; no runner id to delete its registration by"
+        raise GitHubGaveNoUsableRunner(runner_name, why)
     try:
         sbatch_output = run_slurm_command(
             sbatch_command(runner_name, submission, resources),

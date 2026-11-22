@@ -101,6 +101,9 @@ class SizeRecord:
     # Every refused runner's name -> when; kept REFUSED_NAMES_KEPT_S, so the FAILED record its refusal may
     # leave in squeue is never counted as a launch failure
     refused_runner_names: dict[str, float] = field(default_factory=dict)
+    # When GitHub's answer to generate-jitconfig last gave no runner we can use (a failure with no node,
+    # logged where it happens); it names the cause in the log while it is the one outstanding
+    unusable_answer_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -414,6 +417,34 @@ def record_size_took_a_job(
     )
 
 
+def record_unusable_runner_answer(
+    records: LaunchRecords, size_label: str, answered_at: float
+) -> LaunchRecords:
+    """Pure: GitHub's answer to generate-jitconfig for a runner of the size gave none we can use. A failure
+    that belongs to no node (rule 5), of a runner counted as submitted when answered: the size gets one
+    runner at a time, the next after a wait that doubles per such answer, until a runner submitted after it
+    takes a job. Outstanding whatever the newest success's submit time, as a refusal is: that is Slurm's
+    clock and answered_at the daemon's, so a slurmctld clock ahead would otherwise make a fresh answer look
+    older than a success and change nothing."""
+    record = records.by_size.get(size_label) or SizeRecord()
+    retries = 0
+    if record.nodeless_failure_seen_at is not None:
+        retries = record.nodeless_retries
+        if answered_at > record.nodeless_failure_seen_at:
+            retries += 1
+    record = replace(
+        record,
+        outstanding_since=answered_at,
+        nodeless_failure_seen_at=answered_at,
+        nodeless_retries=retries,
+        newest_failure_submitted_at=max(
+            record.newest_failure_submitted_at or 0.0, answered_at
+        ),
+        unusable_answer_at=answered_at,
+    )
+    return replace(records, by_size={**records.by_size, size_label: record})
+
+
 def next_unpinned_runner_at(records: LaunchRecords, size_label: str) -> float:
     """Pure: when a size usable nowhere may send its one runner, given what is outstanding; 0 when nothing
     is. The later of rule 5's wait after a failure with no node, and, after a refused exclusion, the
@@ -626,8 +657,8 @@ def launch_record_log_lines(
         old = before.by_size.get(size_label, SizeRecord())
         refused = new.refused_runner_names.keys() - old.refused_runner_names.keys()
         if new.nodeless_failure_seen_at not in (None, old.nodeless_failure_seen_at):
-            # A refusal is logged where it happens, with sbatch's message
-            if not refused:
+            # A refusal, or an answer that gave no runner, is logged where it happens, with what it said
+            if not refused and new.nodeless_failure_seen_at != new.unusable_answer_at:
                 wait_s = next_unpinned_runner_at(after, size_label) - now
                 lines.append(
                     (
@@ -674,6 +705,8 @@ def why_usable_nowhere(records: LaunchRecords, size_label: str) -> str:
         return "no node is known to work for it"
     if size_record.outstanding_since in size_record.refused_runner_names.values():
         return "Slurm refused a submission (see above)"
+    if size_record.outstanding_since == size_record.unusable_answer_at:
+        return "GitHub's answer gave no runner we can use (see above)"
     return "a runner failed with no node"
 
 

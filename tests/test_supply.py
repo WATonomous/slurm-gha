@@ -6,6 +6,7 @@ import logging
 import re
 import subprocess
 import unittest
+from contextlib import nullcontext
 from unittest import mock
 
 import github_client
@@ -33,6 +34,7 @@ from supply import (
     SlurmTimedOut,
     SbatchLeftNoJob,
     SlurmUnavailable,
+    GitHubGaveNoUsableRunner,
     SubmissionRefused,
     cancel_pending_allocation,
     delete_registration,
@@ -1053,16 +1055,44 @@ class GitHubSideTest(unittest.TestCase):
             any(f"Submitted {request['name']}" in line for line in logs.output)
         )
 
-    def test_no_sbatch_without_a_jit_config(self):
-        for reply in (
+    def test_no_sbatch_when_github_does_not_answer(self):
+        self.fake.script(
+            f"{REPO}/actions/runners/generate-jitconfig",
             Reply(500, body={"message": "Server Error"}),
-            Reply(201, body={"runner": {"id": 9}}),
-        ):
-            with self.subTest(status=reply.status):
-                self.fake.script(f"{REPO}/actions/runners/generate-jitconfig", reply)
-                with self.assertRaises(GitHubUnavailable):
-                    submit_runner(self.github, self.repo, PREFIX, ANYWHERE)
-                self.assertEqual(self.slurm.calls, [])
+        )
+        with self.assertRaises(GitHubUnavailable):
+            submit_runner(self.github, self.repo, PREFIX, ANYWHERE)
+        self.assertEqual((self.slurm.calls, self.deletes()), ([], []))
+
+    def test_a_runner_registered_without_a_config_is_deleted_not_submitted(self):
+        # Else each cycle would register another runner and leave it, until GitHub stops the client
+        self.fake.script(f"{REPO}/actions/runners/9", Reply(204, body=None))
+        rows = [
+            ({"id": 9}, [f"{REPO}/actions/runners/9"]),
+            ({"id": "9"}, []),
+            (None, []),
+        ]
+        for runner, deletes in rows:
+            for config in (None, "", 7):
+                with self.subTest(runner=runner, config=config):
+                    self.fake.received.clear()
+                    self.jit_config_reply(
+                        body={"runner": runner, "encoded_jit_config": config}
+                    )
+                    with (
+                        self.assertLogs("supply", logging.INFO)
+                        if deletes
+                        else nullcontext()
+                    ):
+                        with self.assertRaises(GitHubGaveNoUsableRunner) as raised:
+                            submit_runner(self.github, self.repo, PREFIX, ANYWHERE)
+                    self.assertIn("no encoded_jit_config", str(raised.exception))
+                    self.assertEqual(
+                        raised.exception.runner_name[: len(PREFIX)], PREFIX
+                    )
+                    self.assertEqual(self.deletes(), deletes)
+                    self.assertEqual(self.slurm.calls, [])
+        self.assertIn("no runner id", str(raised.exception))
 
     def deletes(self):
         return [path for method, path, _ in self.fake.received if method == "DELETE"]

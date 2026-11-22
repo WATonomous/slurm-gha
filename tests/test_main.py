@@ -90,13 +90,17 @@ class CycleAgainstFakes(unittest.TestCase):
             RUNNERS, lambda headers: Reply(200, body={"runners": self.runners})
         )
         self.jit_config_statuses = []  # statuses of the next generate-jitconfig answers; 201 after
+        self.jit_config_answer_lacks = set()  # fields left out of a 201 answer
         self.fake.script(GENERATE_JIT_CONFIG, self.answer_generate_jit_config)
 
     def answer_generate_jit_config(self, request_headers):
         status = self.jit_config_statuses.pop(0) if self.jit_config_statuses else 201
         if status != 201:
             return Reply(status, body={"message": "Server Error"})
-        return Reply(201, body={"runner": {"id": 9}, "encoded_jit_config": JIT_CONFIG})
+        answer = {"runner": {"id": 9}, "encoded_jit_config": JIT_CONFIG}
+        for field in self.jit_config_answer_lacks:
+            del answer[field]
+        return Reply(201, body=answer)
 
     def jobs(self, *jobs_of_run_1):
         self.fake.script(jobs_path(1), Reply(200, body=jobs_answer(*jobs_of_run_1)))
@@ -146,6 +150,63 @@ class RunCycleTest(CycleAgainstFakes):
         # Supply before demand: a runner that took a job after the jobs were read would look free
         paths = [path for _, path, _ in self.fake.received]
         self.assertLess(paths.index(RUNNERS), paths.index(jobs_path(1)))
+
+    def test_an_answer_without_a_config_costs_one_registration_per_wait(self):
+        # Production before: a POST for each waiting job every cycle, each leaving its registration
+        self.jit_config_answer_lacks = {"encoded_jit_config"}
+        self.fake.script(f"{REPO}/actions/runners/9", Reply(204, body=None))
+        self.jobs(*(job(i, "queued", [MEDIUM]) for i in range(3)))
+        memory = memory_with(usable_on("thor-slurm1", MEDIUM))
+        for now, posts in ((NOW, 1), (NOW + 30, 1), (NOW + 61, 2)):
+            with self.assertLogs(level=logging.INFO) as logs:
+                memory = self.cycle(memory, now)
+                logging.getLogger("sentinel").info("end of cycle")
+            self.assertEqual(len(self.fake.requests_to(GENERATE_JIT_CONFIG)), posts)
+            deletes = [
+                path for method, path, _ in self.fake.received if method == "DELETE"
+            ]
+            self.assertEqual(len(deletes), posts)
+            lines = "\n".join(logs.output)
+            self.assertNotIn("a runner failed with no node", lines)
+            if now == NOW:
+                self.assertIn("no encoded_jit_config", lines)
+                self.assertIn("next runner in 60 s", lines)
+                self.assertIn(
+                    "one runner at a time: GitHub's answer gave no runner we can use",
+                    lines,
+                )
+            if now == NOW + 61:
+                self.assertIn("next runner in 120 s", lines)
+        self.assertEqual(self.slurm.commands("sbatch"), [])
+        # Once GitHub's answer has a config again, the size's one runner goes
+        self.jit_config_answer_lacks = set()
+        memory = self.cycle(memory, NOW + 182)
+        self.assertEqual(self.submitted_size_labels(), [MEDIUM])
+        self.assertEqual(nodes_out(memory.launch_records, MEDIUM), set())
+
+    def test_an_answer_without_a_config_backs_off_with_slurms_clock_ahead(self):
+        # slurmctld's clock 100 s ahead of the daemon's: a runner that took a job is stamped in its future
+        name = f"{PREFIX}busy"
+        self.slurm.add_job(
+            name,
+            "RUNNING",
+            submitted_at=NOW + 100,
+            started_at=NOW + 101,
+            node="thor-slurm1",
+        )
+        self.runners.append({**runner(name, busy=True), "id": 1})
+        self.jit_config_answer_lacks = {"encoded_jit_config"}
+        self.fake.script(f"{REPO}/actions/runners/9", Reply(204, body=None))
+        self.jobs(
+            job(1, "queued", [MEDIUM]),
+            job(2, "in_progress", [MEDIUM], runner_name=name),
+        )
+        with self.assertLogs(level=logging.WARNING) as logs:
+            memory = self.cycle(memory_with(NO_LAUNCH_RECORDS))
+        self.assertIn("no encoded_jit_config", "\n".join(logs.output))
+        self.assertIn("next runner in 60 s", "\n".join(logs.output))
+        self.cycle(memory, NOW + 30)
+        self.assertEqual(len(self.fake.requests_to(GENERATE_JIT_CONFIG)), 1)
 
     def test_the_history_is_read_one_page_per_interval(self):
         self.jobs()
