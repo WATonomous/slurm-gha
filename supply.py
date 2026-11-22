@@ -34,9 +34,11 @@ from runner_size_config import (
 
 logger = logging.getLogger(__name__)
 
-# id, name, comment (size label), state, priority, submit, start, end, node, requested node, excluded
-# nodes; none of ours contains "|"
-SQUEUE_FORMAT = "%i|%j|%k|%T|%Q|%V|%S|%e|%N|%n|%x"
+# id, name, state, priority, submit, start, end, node, requested node, excluded nodes, and last the comment
+# (the size label): the job's owner or an administrator can change a comment with scontrol, so whatever it
+# holds cannot shift the other fields
+SQUEUE_FORMAT = "%i|%j|%T|%Q|%V|%S|%e|%N|%n|%x|%k"
+SQUEUE_FIELDS = SQUEUE_FORMAT.count("|") + 1
 # squeue prints times in this strftime format; epoch seconds need no time zone
 SLURM_TIME_FORMAT = "%s"
 # One hostlist item: a node name, or a prefix and one bracket of numbers and ranges ("trpro-slurm[1-2,4]")
@@ -137,13 +139,13 @@ def parse_squeue_line(line: str, runner_name_prefix: str) -> Allocation | None:
     """Pure: one SQUEUE_FORMAT line; None for a job that is not ours, such as the old daemon's.
     SlurmUnavailable for one of ours that cannot be read, except its excluded nodes: None when %x does not
     parse."""
-    fields = line.split("|")
+    fields = line.split("|", SQUEUE_FIELDS - 1)
     if len(fields) < 2 or not fields[1].startswith(runner_name_prefix):
         return None
-    if len(fields) != 11:
+    if len(fields) != SQUEUE_FIELDS:
         raise SlurmUnavailable(f"squeue: cannot read {line!r}")
-    slurm_job_id, runner_name, size_label, state, priority = fields[:5]
-    submitted, started, ended, node, pinned_node, excluded = fields[5:]
+    slurm_job_id, runner_name, state, priority, submitted, started, ended = fields[:7]
+    node, pinned_node, excluded, size_label = fields[7:]
     submitted_at = epoch_seconds_or_none(submitted)
     if not slurm_job_id.isdigit() or not priority.isdigit() or submitted_at is None:
         raise SlurmUnavailable(f"squeue: cannot read {line!r}")

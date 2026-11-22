@@ -536,7 +536,7 @@ class NodeRuleScenarioTest(CycleAgainstFakes):
             for i in range(6)
         ]
         self.queue(6)
-        self.assertIn("|thor-slurm1,trpro-slurm[1-2]\n", self.slurm.squeue_output())
+        self.assertIn("|thor-slurm1,trpro-slurm[1-2]|", self.slurm.squeue_output())
         # The fault is gone. As each node's wait passes, the pending runners are released onto it
         memory, sent = self.cycles(memory_with(records), 8)
         self.assertTrue(
