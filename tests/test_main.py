@@ -144,7 +144,12 @@ class RunCycleTest(CycleAgainstFakes):
         self.assertEqual(
             memory,
             RepositoryMemory(
-                {1}, 1, NOW + HISTORY_PAGE_INTERVAL_S, NO_LAUNCH_RECORDS, NO_SIGHTINGS
+                {1},
+                1,
+                NOW + HISTORY_PAGE_INTERVAL_S,
+                NO_LAUNCH_RECORDS,
+                NO_SIGHTINGS,
+                jobs_queued=6,
             ),
         )
         # Supply before demand: a runner that took a job after the jobs were read would look free

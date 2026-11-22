@@ -23,6 +23,7 @@ from config import (
     SLURM_COMMAND_TIMEOUT,
     SLURM_OUTPUT_PATH,
 )
+from cycle_summary import SPENT
 from github_client import GitHubClient, GitHubUnavailable
 from node_rule import Submission
 from plan import FINISHED_STATES, Allocation, RunnerRegistration
@@ -326,6 +327,7 @@ def submit_runner(
         if after is None:
             raise
         if after is AfterFailedSbatch.LIVE_JOB:
+            SPENT.runners_submitted += 1
             logger.info(f"Submitted {runner_name} for {size_label} although {error}")
             return
         # Otherwise the registration waits a day for a runner that will never start
@@ -347,6 +349,7 @@ def submit_runner(
         placement = f", pinned to {submission.pinned_node}, retry {submission.retry}"
     elif submission.excluded_nodes:
         placement = f", excluding {','.join(sorted(submission.excluded_nodes))}"
+    SPENT.runners_submitted += 1
     logger.info(
         f"Submitted {runner_name} for {size_label}{placement}: {sbatch_output.strip()}"
     )
@@ -480,6 +483,7 @@ def run_slurm_command(
     """A Slurm client command's stdout; SlurmUnavailable if it fails, times out or is missing. The
     environment is the daemon's plus extra_environment, which never appears in a message."""
     environment = {**os.environ, **(extra_environment or {})}
+    started_at = time.monotonic()
     try:
         result = subprocess.run(
             command,
@@ -494,6 +498,8 @@ def run_slurm_command(
         ) from None
     except OSError as error:
         raise SlurmUnavailable(f"{' '.join(command)}: {error}") from None
+    finally:
+        SPENT.slurm_s += time.monotonic() - started_at
     if result.returncode != 0:
         raise SlurmUnavailable(
             f"{' '.join(command)}: exit status {result.returncode}: {result.stderr.strip()}",
