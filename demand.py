@@ -7,35 +7,14 @@ from the job's own status, in the jobs of every watched run, every cycle.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from datetime import datetime
 
 from config import NEWEST_RUNS_PAGE_SIZE, RERUN_WINDOW_S
 from github_client import PAGE_SIZE, GitHubClient, GitHubNotFound, GitHubUnavailable
+from plan import Demand, WaitingJob
+from runner_size_config import size_label_of_job
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class WaitingJob:
-    """A job GitHub reported queued this cycle, for a size label we serve."""
-
-    job_id: int
-    run_id: int
-    size_label: str
-    # All of the job's labels; its runner registers with exactly these
-    labels: tuple[str, ...]
-    workflow_name: str
-    job_name: str
-
-
-@dataclass(frozen=True)
-class Demand:
-    """A lower bound: a run whose read failed this cycle is missing, never stale."""
-
-    waiting_jobs: list[WaitingJob]
-    # runner_name of every job read this cycle, any status
-    runner_names_on_jobs: set[str]
 
 
 def watch_new_runs(
@@ -100,10 +79,7 @@ def next_history_page(
     to be re-run. Never judged by length: GitHub may return a short page with more after it."""
     if not runs_on_page or not has_next_page:
         return 1
-    oldest_created_at = datetime.fromisoformat(
-        runs_on_page[-1]["created_at"].replace("Z", "+00:00")
-    )
-    if oldest_created_at.timestamp() < now - RERUN_WINDOW_S:
+    if epoch_seconds(runs_on_page[-1]["created_at"]) < now - RERUN_WINDOW_S:
         return 1
     return page + 1
 
@@ -176,7 +152,7 @@ def demand_from_jobs(jobs_by_run: dict[int, list[dict]]) -> Demand:
     """Pure: jobs whose status is "queued" with a size label we serve, and every job's runner_name."""
     waiting_jobs = []
     runner_names_on_jobs = set()
-    for run_id, jobs in sorted(jobs_by_run.items()):
+    for _, jobs in sorted(jobs_by_run.items()):
         for job in jobs:
             if job.get("runner_name"):
                 runner_names_on_jobs.add(job["runner_name"])
@@ -185,21 +161,16 @@ def demand_from_jobs(jobs_by_run: dict[int, list[dict]]) -> Demand:
                 waiting_jobs.append(
                     WaitingJob(
                         job_id=job["id"],
-                        run_id=run_id,
                         size_label=size_label,
-                        labels=tuple(job["labels"]),
-                        workflow_name=job["workflow_name"],
-                        job_name=job["name"],
+                        created_at=epoch_seconds(job["created_at"]),
                     )
                 )
     return Demand(waiting_jobs, runner_names_on_jobs)
 
 
-def size_label_of_job(job_labels: list[str]) -> str | None:
-    """Pure: the first label if it names a slurm-runner size, as the daemon has always read it; None otherwise."""
-    if job_labels and "slurm-runner" in job_labels[0]:
-        return job_labels[0]
-    return None
+def epoch_seconds(github_time: str) -> float:
+    """Pure: a GitHub timestamp such as "2026-11-13T00:37:59Z" in seconds since the epoch."""
+    return datetime.fromisoformat(github_time.replace("Z", "+00:00")).timestamp()
 
 
 def workflow_runs_in(body: dict, url: str) -> list[dict]:

@@ -7,8 +7,8 @@ RUN apt-get update && apt-get install -y python3 python3-pip
 # Set the working directory in the container
 WORKDIR /home/watcloud-slurm-ci/
 
-# Copy the Python script and any necessary files
-COPY main.py config.py demand.py github_client.py runner_size_config.py RunningJob.py KubernetesLogFormatter.py allocation_scripts/apptainer.sh start.sh /home/watcloud-slurm-ci/
+# Every module, so that a new one cannot be left out and crash the pod at import
+COPY *.py allocation_scripts/apptainer.sh start.sh /home/watcloud-slurm-ci/
 
 # Install Python requirements
 COPY requirements.txt /home/watcloud-slurm-ci/

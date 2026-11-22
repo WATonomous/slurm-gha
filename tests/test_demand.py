@@ -10,9 +10,9 @@ from demand import (
     WaitingJob,
     demand_from_jobs,
     next_history_page,
+    epoch_seconds,
     read_latest_jobs,
     run_ids_to_watch,
-    size_label_of_job,
     stop_watching_finished_runs,
     watch_new_runs,
     watch_runs_from_history_page,
@@ -64,7 +64,12 @@ def runs_of(capture, *answers):
 
 
 def job(
-    job_id, status, labels=("slurm-runner-small",), runner_name=None, run_attempt=1
+    job_id,
+    status,
+    labels=("slurm-runner-small",),
+    runner_name=None,
+    run_attempt=1,
+    created_at=NOW - 60,
 ):
     return {
         "id": job_id,
@@ -74,6 +79,7 @@ def job(
         "workflow_name": "Provision",
         "name": f"job-{job_id}",
         "run_attempt": run_attempt,
+        "created_at": iso(created_at),
     }
 
 
@@ -150,11 +156,8 @@ class RecordedAnswersTest(unittest.TestCase):
             [
                 WaitingJob(
                     job_id=131560293044,
-                    run_id=43326533215,
                     size_label="slurm-runner-small",
-                    labels=("slurm-runner-small",),
-                    workflow_name="Check pull request task list completion",
-                    job_name="task-list-checker",
+                    created_at=epoch_seconds("2026-11-12T23:10:19Z"),
                 )
             ],
         )
@@ -191,28 +194,30 @@ class PureFunctionsTest(unittest.TestCase):
         waiting = demand_from_jobs({1: jobs}).waiting_jobs
         self.assertEqual([waiting_job.job_id for waiting_job in waiting], [0])
 
-    def test_a_job_waits_for_us_only_if_its_first_label_names_a_slurm_runner(self):
+    def test_a_job_waits_for_us_only_if_runs_on_is_exactly_one_size_label(self):
         rows = [
             ([], None),
             (["ubuntu-latest"], None),
             (["self-hosted", "slurm-runner-medium"], None),
+            (["slurm-runner-medium", "gpu"], None),
             (["slurm-runner-medium"], "slurm-runner-medium"),
+            (["Slurm-Runner-Medium"], "slurm-runner-medium"),
             (["slurm-runner-4cpu-2mempercpu"], "slurm-runner-4cpu-2mempercpu"),
         ]
         for labels, size_label in rows:
             with self.subTest(labels=labels):
-                self.assertEqual(size_label_of_job(labels), size_label)
                 waiting = demand_from_jobs({1: [job(7, "queued", labels)]}).waiting_jobs
                 self.assertEqual(
                     [j.size_label for j in waiting], [size_label] if size_label else []
                 )
 
-    def test_a_waiting_job_keeps_all_its_labels(self):
-        labels = ("slurm-runner-medium", "gpu")
-        waiting = demand_from_jobs({9: [job(7, "queued", labels)]}).waiting_jobs
+    def test_a_waiting_job_says_when_github_created_it(self):
+        waiting = demand_from_jobs(
+            {9: [job(7, "queued", ["slurm-runner-medium"], created_at=NOW - 90)]}
+        ).waiting_jobs
         self.assertEqual(
             waiting,
-            [WaitingJob(7, 9, "slurm-runner-medium", labels, "Provision", "job-7")],
+            [WaitingJob(7, "slurm-runner-medium", NOW - 90)],
         )
 
     def test_runner_names_skip_jobs_without_a_runner(self):

@@ -58,7 +58,8 @@ class GitHubClient:
     def __init__(self, token: str) -> None:
         self.rate_limit_window: RateLimitWindow | None = None
         self.no_requests_before = 0.0  # epoch seconds, from GitHub's last stop signal
-        self._last_unsignalled_stop_s = 0.0  # what the doubling grows from
+        # The last stop GitHub gave no wait for; the doubling grows from it
+        self._last_backoff_s = 0.0
         self._stop_seen_this_cycle = False
         # Read responses GitHub counted against the limit this cycle; a 304 is not counted
         self._charged_this_cycle = 0
@@ -79,7 +80,7 @@ class GitHubClient:
         """Begin a polling cycle: forget pages not requested in the last one, restart the request count,
         and let the stop backoff start over once a whole cycle passed without a stop."""
         if not self._stop_seen_this_cycle:
-            self._last_unsignalled_stop_s = 0.0
+            self._last_backoff_s = 0.0
         self._stop_seen_this_cycle = False
         self._charged_this_cycle = 0
         self._pages_last_cycle = self._pages_this_cycle
@@ -108,16 +109,16 @@ class GitHubClient:
         return items
 
     def post_json(self, url: str, body: dict | None = None) -> dict:
-        """One write, started MIN_SECONDS_BETWEEN_WRITES after the last one started (the client's only sleep);
-        never retried, body never logged."""
-        self._raise_if_stopped("POST", url)
-        wait_s = (
-            self._last_write_started_at + MIN_SECONDS_BETWEEN_WRITES - time.monotonic()
-        )
-        if wait_s > 0:
-            time.sleep(wait_s)
+        """One write, spaced from the last (_wait_to_write); never retried, body never logged."""
+        self._wait_to_write("POST", url)
         response = self._send("POST", url, json_body=body)
         return _json_object_from(response.content, f"POST {url}")
+
+    def delete(self, url: str) -> int:
+        """One write, spaced from the last (_wait_to_write); never retried. The status for 204, 404 (already
+        gone) and 422 (GitHub refuses); GitHubUnavailable for any other answer."""
+        self._wait_to_write("DELETE", url)
+        return self._send("DELETE", url, answered_statuses=(404, 422)).status_code
 
     def seconds_until_next_cycle(self, now: float) -> float:
         """next_cycle_delay_s with this cycle's charged requests, this client's window and its stop signal."""
@@ -161,14 +162,26 @@ class GitHubClient:
                 f"{method} {url}: not sent, GitHub asked for {wait_s:.0f} s more without requests"
             )
 
+    def _wait_to_write(self, method: str, url: str) -> None:
+        """Refused while a stop lasts; else sleeps until MIN_SECONDS_BETWEEN_WRITES after the last write
+        started (the client's only sleep)."""
+        self._raise_if_stopped(method, url)
+        wait_s = (
+            self._last_write_started_at + MIN_SECONDS_BETWEEN_WRITES - time.monotonic()
+        )
+        if wait_s > 0:
+            time.sleep(wait_s)
+
     def _send(
         self,
         method: str,
         url: str,
         headers: dict | None = None,
         json_body: dict | None = None,
+        answered_statuses: tuple[int, ...] = (),
     ) -> requests.Response:
-        """The one place a request leaves: refused while a stop lasts; returns a 2xx or 304 response, raises on the rest."""
+        """The one place a request leaves: refused while a stop lasts; returns a 2xx or 304 response, or one
+        with a status in answered_statuses, and raises on the rest."""
         self._raise_if_stopped(method, url)
         if method != "GET":
             self._last_write_started_at = time.monotonic()
@@ -180,7 +193,7 @@ class GitHubClient:
             raise GitHubUnavailable(f"{method} {url}: {error}") from error
 
         now = time.time()
-        # Only reads pace: token POSTs answer as "core" but are counted on a separate counter
+        # Only reads pace: writes report "core" but count separately (measured: token and JIT-config POSTs)
         if method == "GET":
             self.rate_limit_window = update_rate_limit_window(
                 self.rate_limit_window, response.headers, now
@@ -191,19 +204,18 @@ class GitHubClient:
                 if remaining.isdigit() and int(remaining) % 100 == 0:
                     logger.info(f"Rate Limit Remaining: {remaining}")
 
+        if response.status_code in answered_statuses:
+            return response
         outcome = classify_response(response.status_code)
         if outcome == "stop":
             message = _github_error_message(response)
-            stop_s = stop_duration_s(
-                response.headers, now, self._last_unsignalled_stop_s
-            )
-            if signalled_wait_s(response.headers, now) is None:
-                self._last_unsignalled_stop_s = stop_s
+            stop_s = stop_duration_s(response.headers, now, self._last_backoff_s)
+            if wait_github_asks_for_s(response.headers, now) is None:
+                self._last_backoff_s = stop_s
             self._stop_seen_this_cycle = True
             self.no_requests_before = now + stop_s
-            reason = stop_reason(response.status_code, response.headers, message)
             raise GitHubUnavailable(
-                f"{method} {url}: HTTP {response.status_code}, {reason} ({message});"
+                f"{method} {url}: HTTP {response.status_code} ({message});"
                 f" no requests for {stop_s:.0f} s"
             )
         if outcome == "not_found":
@@ -232,34 +244,18 @@ def classify_response(status_code: int) -> str:
     return "failed"
 
 
-def stop_reason(
-    status_code: int, headers: Mapping[str, str], github_message: str
-) -> str:
-    """Pure: "rate limited" when the answer says so, else what a person has to fix."""
-    if (
-        status_code == 429
-        or headers.get("x-ratelimit-remaining") == "0"
-        or "retry-after" in headers
-        or "rate limit" in github_message.lower()
-    ):
-        return "rate limited"
-    if status_code == 401:
-        return "credentials rejected, needs a human"
-    return "forbidden, needs a human"
-
-
 def stop_duration_s(
-    headers: Mapping[str, str], now: float, previous_unsignalled_stop_s: float
+    headers: Mapping[str, str], now: float, previous_backoff_s: float
 ) -> float:
-    """Pure: as long as GitHub's headers ask; without such a signal 60 s, doubling from previous_unsignalled_stop_s."""
-    signalled_s = signalled_wait_s(headers, now)
-    if signalled_s is not None:
-        return signalled_s
-    doubled = max(2 * previous_unsignalled_stop_s, FIRST_WAIT_WITHOUT_RETRY_AFTER_S)
+    """Pure: as long as GitHub's headers ask; without such a signal 60 s, doubling from previous_backoff_s."""
+    asked_s = wait_github_asks_for_s(headers, now)
+    if asked_s is not None:
+        return asked_s
+    doubled = max(2 * previous_backoff_s, FIRST_WAIT_WITHOUT_RETRY_AFTER_S)
     return min(doubled, LONGEST_WAIT_WITHOUT_RETRY_AFTER_S)
 
 
-def signalled_wait_s(headers: Mapping[str, str], now: float) -> float | None:
+def wait_github_asks_for_s(headers: Mapping[str, str], now: float) -> float | None:
     """Pure: the wait GitHub's headers ask for, until x-ratelimit-reset if remaining is 0 and
     at least retry-after; None if they ask for none."""
     waits = []

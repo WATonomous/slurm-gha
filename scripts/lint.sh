@@ -1,4 +1,6 @@
 #!/bin/bash
+# The venv's activate script is made by uv at run time
+# shellcheck disable=SC1091
 
 # Lint script for local development
 # Usage: ./scripts/lint.sh [--fix]
