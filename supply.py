@@ -23,6 +23,7 @@ from config import (
     SLURM_COMMAND_TIMEOUT,
     SLURM_OUTPUT_PATH,
 )
+from cycle_summary import SPENT
 from github_client import GitHubClient, GitHubUnavailable
 from node_rule import Submission
 from plan import FINISHED_STATES, Allocation, RunnerRegistration
@@ -34,9 +35,11 @@ from runner_size_config import (
 
 logger = logging.getLogger(__name__)
 
-# id, name, comment (size label), state, priority, submit, start, end, node, requested node, excluded
-# nodes; none of ours contains "|"
-SQUEUE_FORMAT = "%i|%j|%k|%T|%Q|%V|%S|%e|%N|%n|%x"
+# id, name, state, priority, submit, start, end, node, requested node, excluded nodes, and last the comment
+# (the size label): the job's owner or an administrator can change a comment with scontrol, so whatever it
+# holds cannot shift the other fields
+SQUEUE_FORMAT = "%i|%j|%T|%Q|%V|%S|%e|%N|%n|%x|%k"
+SQUEUE_FIELDS = SQUEUE_FORMAT.count("|") + 1
 # squeue prints times in this strftime format; epoch seconds need no time zone
 SLURM_TIME_FORMAT = "%s"
 # One hostlist item: a node name, or a prefix and one bracket of numbers and ranges ("trpro-slurm[1-2,4]")
@@ -87,6 +90,15 @@ class SbatchLeftNoJob(Exception):
         self.runner_name = runner_name
 
 
+class GitHubGaveNoUsableRunner(Exception):
+    """An answer, not an unknown: GitHub registered a runner but its answer carried nothing to start it
+    with; the registration has been deleted when its id was readable. str() says what was missing."""
+
+    def __init__(self, runner_name: str, why: str):
+        super().__init__(why)
+        self.runner_name = runner_name
+
+
 class AfterFailedSbatch(Enum):
     """What squeue shows by a runner's name after its sbatch exited non-zero."""
 
@@ -128,13 +140,13 @@ def parse_squeue_line(line: str, runner_name_prefix: str) -> Allocation | None:
     """Pure: one SQUEUE_FORMAT line; None for a job that is not ours, such as the old daemon's.
     SlurmUnavailable for one of ours that cannot be read, except its excluded nodes: None when %x does not
     parse."""
-    fields = line.split("|")
+    fields = line.split("|", SQUEUE_FIELDS - 1)
     if len(fields) < 2 or not fields[1].startswith(runner_name_prefix):
         return None
-    if len(fields) != 11:
+    if len(fields) != SQUEUE_FIELDS:
         raise SlurmUnavailable(f"squeue: cannot read {line!r}")
-    slurm_job_id, runner_name, size_label, state, priority = fields[:5]
-    submitted, started, ended, node, pinned_node, excluded = fields[5:]
+    slurm_job_id, runner_name, state, priority, submitted, started, ended = fields[:7]
+    node, pinned_node, excluded, size_label = fields[7:]
     submitted_at = epoch_seconds_or_none(submitted)
     if not slurm_job_id.isdigit() or not priority.isdigit() or submitted_at is None:
         raise SlurmUnavailable(f"squeue: cannot read {line!r}")
@@ -268,11 +280,12 @@ def submit_runner(
 ) -> None:
     """POST generate-jitconfig for a new runner of the submission's size, then sbatch with the config in the
     environment. Raises GitHubUnavailable or SlurmUnavailable, and ValueError for a label that is not a
-    size, which demand never reports. When sbatch exits non-zero, squeue decides: a live job is a submitted
-    runner after all; otherwise the registration is deleted (a failed delete is only logged) and
-    SubmissionRefused raised for a FAILED record with no node, SbatchLeftNoJob for nothing. If squeue
-    cannot be read, or sbatch timed out (SlurmTimedOut) and its request may still be queued in slurmctld,
-    the registration is left and SlurmUnavailable raised."""
+    size, which demand never reports. GitHubGaveNoUsableRunner when the answer has no config to start
+    the runner with: its registration is deleted and nothing is submitted. When sbatch exits non-zero,
+    squeue decides: a live job is a submitted runner after all; otherwise the registration is deleted (a
+    failed delete is only logged) and SubmissionRefused raised for a FAILED record with no node,
+    SbatchLeftNoJob for nothing. If squeue cannot be read, or sbatch timed out (SlurmTimedOut) and its
+    request may still be queued in slurmctld, the registration is left and SlurmUnavailable raised."""
     size_label = submission.size_label
     resources = get_runner_resources(size_label)
     if resources is None:
@@ -291,9 +304,16 @@ def submit_runner(
     )
     jit_config = jit_response.get("encoded_jit_config")
     if not isinstance(jit_config, str) or not jit_config:
-        raise GitHubUnavailable(
-            f"generate-jitconfig for {runner_name}: no encoded_jit_config in the answer"
-        )
+        why = "GitHub's answer carried no encoded_jit_config to start the runner with"
+        runner = jit_response.get("runner")
+        runner_id = runner.get("id") if isinstance(runner, dict) else None
+        if isinstance(runner_id, int):
+            delete_registration(
+                github, repo_api_base_url, runner_id, runner_name, why=why
+            )
+        else:
+            why += "; no runner id to delete its registration by"
+        raise GitHubGaveNoUsableRunner(runner_name, why)
     try:
         sbatch_output = run_slurm_command(
             sbatch_command(runner_name, submission, resources),
@@ -307,6 +327,7 @@ def submit_runner(
         if after is None:
             raise
         if after is AfterFailedSbatch.LIVE_JOB:
+            SPENT.runners_submitted += 1
             logger.info(f"Submitted {runner_name} for {size_label} although {error}")
             return
         # Otherwise the registration waits a day for a runner that will never start
@@ -328,6 +349,7 @@ def submit_runner(
         placement = f", pinned to {submission.pinned_node}, retry {submission.retry}"
     elif submission.excluded_nodes:
         placement = f", excluding {','.join(sorted(submission.excluded_nodes))}"
+    SPENT.runners_submitted += 1
     logger.info(
         f"Submitted {runner_name} for {size_label}{placement}: {sbatch_output.strip()}"
     )
@@ -461,6 +483,7 @@ def run_slurm_command(
     """A Slurm client command's stdout; SlurmUnavailable if it fails, times out or is missing. The
     environment is the daemon's plus extra_environment, which never appears in a message."""
     environment = {**os.environ, **(extra_environment or {})}
+    started_at = time.monotonic()
     try:
         result = subprocess.run(
             command,
@@ -475,6 +498,8 @@ def run_slurm_command(
         ) from None
     except OSError as error:
         raise SlurmUnavailable(f"{' '.join(command)}: {error}") from None
+    finally:
+        SPENT.slurm_s += time.monotonic() - started_at
     if result.returncode != 0:
         raise SlurmUnavailable(
             f"{' '.join(command)}: exit status {result.returncode}: {result.stderr.strip()}",

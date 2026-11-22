@@ -6,6 +6,7 @@ import logging
 import re
 import subprocess
 import unittest
+from contextlib import nullcontext
 from unittest import mock
 
 import github_client
@@ -33,6 +34,7 @@ from supply import (
     SlurmTimedOut,
     SbatchLeftNoJob,
     SlurmUnavailable,
+    GitHubGaveNoUsableRunner,
     SubmissionRefused,
     cancel_pending_allocation,
     delete_registration,
@@ -328,10 +330,11 @@ class FakeSlurm:
 
     def squeue_output(self):
         return "".join(
-            f"{slurm_job_id}|{job['name']}|{job['comment']}|{job['state']}|{job['priority']}"
+            f"{slurm_job_id}|{job['name']}|{job['state']}|{job['priority']}"
             f"|{job['submitted_at']}|{job['started_at']}|{job['ended_at']}"
             f"|{job['node']}|{job['pinned_node']}"
-            f"|{job['excluded_as_printed'] or compressed_hostlist(job['excluded'])}\n"
+            f"|{job['excluded_as_printed'] or compressed_hostlist(job['excluded'])}"
+            f"|{job['comment']}\n"
             for slurm_job_id, job in sorted(self.jobs.items())
         )
 
@@ -474,39 +477,43 @@ class ParseSqueueLineTest(unittest.TestCase):
                 excluded_nodes,
             )
 
-        line = f"812345|{PREFIX}a|{MEDIUM}"
+        def squeued(fields):
+            return f"812345|{PREFIX}a|{fields}|{MEDIUM}"
+
         rows = [
             # Pending: no node yet
             (
-                f"{line}|PENDING|4294|{NOW}|N/A|N/A|||",
+                squeued(f"PENDING|4294|{NOW}|N/A|N/A|||"),
                 ours("PENDING", False, None, None),
             ),
             # A pending job's start time is only an estimate
             (
-                f"{line}|PENDING|4294|{NOW}|{NOW + 60}|{NOW + 2580}|||",
+                squeued(f"PENDING|4294|{NOW}|{NOW + 60}|{NOW + 2580}|||"),
                 ours("PENDING", False, None, None),
             ),
-            (f"{line}|PENDING|0|{NOW}|N/A|N/A|||", ours("PENDING", True, None, None)),
+            (squeued(f"PENDING|0|{NOW}|N/A|N/A|||"), ours("PENDING", True, None, None)),
             # Pinned with --nodelist, still pending
             (
-                f"{line}|PENDING|4294|{NOW}|N/A|N/A||trpro-slurm1|",
+                squeued(f"PENDING|4294|{NOW}|N/A|N/A||trpro-slurm1|"),
                 ours("PENDING", False, None, None, pinned_node="trpro-slurm1"),
             ),
             # Its end time is only the limit while it runs
             (
-                f"{line}|RUNNING|4294|{NOW}|{NOW + 5}|{NOW + 2525}|delta-slurm1||",
+                squeued(f"RUNNING|4294|{NOW}|{NOW + 5}|{NOW + 2525}|delta-slurm1||"),
                 ours("RUNNING", False, NOW + 5, None, node="delta-slurm1"),
             ),
             # Ended, within MinJobAge: squeue still names its node and its pin
             (
-                f"{line}|FAILED|0|{NOW}|{NOW + 5}|{NOW + 20}|trpro-slurm1|trpro-slurm1|",
+                squeued(
+                    f"FAILED|0|{NOW}|{NOW + 5}|{NOW + 20}|trpro-slurm1|trpro-slurm1|"
+                ),
                 ours(
                     "FAILED", False, NOW + 5, NOW + 20, "trpro-slurm1", "trpro-slurm1"
                 ),
             ),
             # Excluded nodes, sorted and compressed into ranges as squeue prints them on the cluster
             (
-                f"{line}|PENDING|4294|{NOW}|N/A|N/A|||tr-slurm2,trpro-slurm[1-2]",
+                squeued(f"PENDING|4294|{NOW}|N/A|N/A|||tr-slurm2,trpro-slurm[1-2]"),
                 ours(
                     "PENDING",
                     False,
@@ -517,18 +524,31 @@ class ParseSqueueLineTest(unittest.TestCase):
             ),
             # Excluded nodes it cannot parse: left alone, never guessed
             (
-                f"{line}|PENDING|4294|{NOW}|N/A|N/A|||trpro-slurm[1-",
+                squeued(f"PENDING|4294|{NOW}|N/A|N/A|||trpro-slurm[1-"),
                 ours("PENDING", False, None, None, excluded_nodes=None),
             ),
             # Cancelled while pending: never placed
             (
-                f"{line}|CANCELLED|0|{NOW}|Unknown|{NOW + 20}|||",
+                squeued(f"CANCELLED|0|{NOW}|Unknown|{NOW + 20}|||"),
                 ours("CANCELLED", False, None, NOW + 20),
             ),
         ]
         for squeue_line, allocation in rows:
             with self.subTest(squeue_line):
                 self.assertEqual(parse_squeue_line(squeue_line, PREFIX), allocation)
+
+    def test_a_comment_holding_a_pipe_shifts_no_other_field(self):
+        # The job's owner can change its comment with scontrol; it is the last field
+        allocation = parse_squeue_line(
+            f"812345|{PREFIX}a|RUNNING|4294|{NOW}|{NOW + 5}|{NOW + 2525}|delta-slurm1|||"
+            f"{MEDIUM}|x",
+            PREFIX,
+        )
+        self.assertEqual(
+            (allocation.state, allocation.started_at, allocation.node),
+            ("RUNNING", NOW + 5, "delta-slurm1"),
+        )
+        self.assertEqual(allocation.size_label, f"{MEDIUM}|x")
 
     def test_jobs_that_are_not_ours_are_skipped(self):
         for line in (
@@ -543,12 +563,12 @@ class ParseSqueueLineTest(unittest.TestCase):
     def test_one_of_ours_that_cannot_be_read_makes_squeue_unknown(self):
         for line in (
             # Without the node fields, as an older SQUEUE_FORMAT printed it
-            f"812345|{PREFIX}a|{MEDIUM}|PENDING|4294|{NOW}|N/A|N/A",
+            f"812345|{PREFIX}a|PENDING|4294|{NOW}|N/A|N/A|{MEDIUM}",
             # Without the excluded nodes
-            f"812345|{PREFIX}a|{MEDIUM}|PENDING|4294|{NOW}|N/A|N/A||",
-            f"812345|{PREFIX}a|{MEDIUM}|PENDING|high|{NOW}|N/A|N/A|||",
-            f"812345_1|{PREFIX}a|{MEDIUM}|PENDING|4294|{NOW}|N/A|N/A|||",
-            f"812345|{PREFIX}a|{MEDIUM}|PENDING|4294|2026-11-13T00:38:09|N/A|N/A|||",
+            f"812345|{PREFIX}a|PENDING|4294|{NOW}|N/A|N/A|||{MEDIUM}",
+            f"812345|{PREFIX}a|PENDING|high|{NOW}|N/A|N/A||||{MEDIUM}",
+            f"812345_1|{PREFIX}a|PENDING|4294|{NOW}|N/A|N/A||||{MEDIUM}",
+            f"812345|{PREFIX}a|PENDING|4294|2026-11-13T00:38:09|N/A|N/A||||{MEDIUM}",
         ):
             with self.subTest(line):
                 with self.assertRaises(SlurmUnavailable):
@@ -660,7 +680,7 @@ class PhaseFromSqueueAndRunnersTest(unittest.TestCase):
         def line(state, priority=4294, started=-1, submitted=-100):
             started_at = "N/A" if started is None else NOW + started
             submitted_at = NOW + submitted
-            return f"1|{PREFIX}a|{MEDIUM}|{state}|{priority}|{submitted_at}|{started_at}|N/A|||"
+            return f"1|{PREFIX}a|{state}|{priority}|{submitted_at}|{started_at}|N/A||||{MEDIUM}"
 
         now = NOW
         rows = [
@@ -774,7 +794,7 @@ class SlurmCommandsTest(unittest.TestCase):
                 "--me",
                 "--states=all",
                 "--noheader",
-                "--format=%i|%j|%k|%T|%Q|%V|%S|%e|%N|%n|%x",
+                "--format=%i|%j|%T|%Q|%V|%S|%e|%N|%n|%x|%k",
             ],
         )
         self.assertEqual(added_environment, {"SLURM_TIME_FORMAT": "%s"})
@@ -1053,16 +1073,44 @@ class GitHubSideTest(unittest.TestCase):
             any(f"Submitted {request['name']}" in line for line in logs.output)
         )
 
-    def test_no_sbatch_without_a_jit_config(self):
-        for reply in (
+    def test_no_sbatch_when_github_does_not_answer(self):
+        self.fake.script(
+            f"{REPO}/actions/runners/generate-jitconfig",
             Reply(500, body={"message": "Server Error"}),
-            Reply(201, body={"runner": {"id": 9}}),
-        ):
-            with self.subTest(status=reply.status):
-                self.fake.script(f"{REPO}/actions/runners/generate-jitconfig", reply)
-                with self.assertRaises(GitHubUnavailable):
-                    submit_runner(self.github, self.repo, PREFIX, ANYWHERE)
-                self.assertEqual(self.slurm.calls, [])
+        )
+        with self.assertRaises(GitHubUnavailable):
+            submit_runner(self.github, self.repo, PREFIX, ANYWHERE)
+        self.assertEqual((self.slurm.calls, self.deletes()), ([], []))
+
+    def test_a_runner_registered_without_a_config_is_deleted_not_submitted(self):
+        # Else each cycle would register another runner and leave it, until GitHub stops the client
+        self.fake.script(f"{REPO}/actions/runners/9", Reply(204, body=None))
+        rows = [
+            ({"id": 9}, [f"{REPO}/actions/runners/9"]),
+            ({"id": "9"}, []),
+            (None, []),
+        ]
+        for runner, deletes in rows:
+            for config in (None, "", 7):
+                with self.subTest(runner=runner, config=config):
+                    self.fake.received.clear()
+                    self.jit_config_reply(
+                        body={"runner": runner, "encoded_jit_config": config}
+                    )
+                    with (
+                        self.assertLogs("supply", logging.INFO)
+                        if deletes
+                        else nullcontext()
+                    ):
+                        with self.assertRaises(GitHubGaveNoUsableRunner) as raised:
+                            submit_runner(self.github, self.repo, PREFIX, ANYWHERE)
+                    self.assertIn("no encoded_jit_config", str(raised.exception))
+                    self.assertEqual(
+                        raised.exception.runner_name[: len(PREFIX)], PREFIX
+                    )
+                    self.assertEqual(self.deletes(), deletes)
+                    self.assertEqual(self.slurm.calls, [])
+        self.assertIn("no runner id", str(raised.exception))
 
     def deletes(self):
         return [path for method, path, _ in self.fake.received if method == "DELETE"]

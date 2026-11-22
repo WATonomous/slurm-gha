@@ -21,6 +21,7 @@ from config import (
     MIN_SECONDS_BETWEEN_WRITES,
     NETWORK_TIMEOUT,
 )
+from cycle_summary import SPENT
 
 logger = logging.getLogger(__name__)
 
@@ -170,7 +171,9 @@ class GitHubClient:
             self._last_write_started_at + MIN_SECONDS_BETWEEN_WRITES - time.monotonic()
         )
         if wait_s > 0:
+            slept_from = time.monotonic()
             time.sleep(wait_s)
+            SPENT.write_spacing_s += time.monotonic() - slept_from
 
     def _send(
         self,
@@ -183,14 +186,17 @@ class GitHubClient:
         """The one place a request leaves: refused while a stop lasts; returns a 2xx or 304 response, or one
         with a status in answered_statuses, and raises on the rest."""
         self._raise_if_stopped(method, url)
+        sent_at = time.monotonic()
         if method != "GET":
-            self._last_write_started_at = time.monotonic()
+            self._last_write_started_at = sent_at
         try:
             response = self._session.request(
                 method, url, headers=headers, json=json_body, timeout=NETWORK_TIMEOUT
             )
         except requests.RequestException as error:
             raise GitHubUnavailable(f"{method} {url}: {error}") from error
+        finally:
+            count_request(method, time.monotonic() - sent_at)
 
         now = time.time()
         # Only reads pace: writes report "core" but count separately (measured: token and JIT-config POSTs)
@@ -200,6 +206,7 @@ class GitHubClient:
             )
             if response.status_code != 304:
                 self._charged_this_cycle += 1
+                SPENT.charged_reads += 1
                 remaining = response.headers.get("x-ratelimit-remaining", "")
                 if remaining.isdigit() and int(remaining) % 100 == 0:
                     logger.info(f"Rate Limit Remaining: {remaining}")
@@ -227,6 +234,16 @@ class GitHubClient:
                 f"{method} {url}: HTTP {response.status_code} {_github_error_message(response)}"
             )
         return response
+
+
+def count_request(method: str, took_s: float) -> None:
+    """Add one sent request and how long it took to SPENT, as a read or a write."""
+    if method == "GET":
+        SPENT.reads += 1
+        SPENT.github_read_s += took_s
+    else:
+        SPENT.writes += 1
+        SPENT.github_write_s += took_s
 
 
 def classify_response(status_code: int) -> str:

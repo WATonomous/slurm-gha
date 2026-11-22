@@ -81,6 +81,21 @@ job looks the same to the daemon.
   and `cycles recovered after N s and M failed cycles; the last: ...` (INFO). Nothing is submitted or
   cancelled while a read fails.
 
+One line covers every repository: `Last 61 s: 3 cycles, longest 26.0 s; GitHub reads 12.2 s, GitHub writes 3.5 s +
+9.0 s spacing, Slurm 5.0 s, pause 14.0 s, other 2.2 s; 38 reads (19 charged), 18 writes; 18 runners submitted;
+2 jobs queued at the end; rate limit 4512 left at this hour's lowest reading, resets in 41 min` (INFO), about once
+a minute, only when a cycle that completed in that minute ended with a job queued, or a runner was submitted. An
+outage alone does not log it; the `cycles stopped` lines speak for that. The times add up to the minute:
+*spacing* is the wait that keeps writes 1 s apart, *pause* the sleep between cycles (including any wait GitHub
+asked for), *other* the rest (planning, logging). *Charged* reads are those GitHub counts against the rate limit
+(every read but a 304); writes count separately. *Runners submitted* are those sbatch confirmed; one whose sbatch
+timed out is counted as in flight by the cycle but not here. *Queued* jobs are those the repositories whose cycle
+completed read as queued: they include jobs whose runner is still starting or has just taken them. A cycle in
+which no repository's cycle completed is counted as failed (`3 cycles (1 failed)`), and when the last one failed
+the line says `jobs queued at the end unknown: the last cycle did not complete`. *This hour's lowest reading* is
+the lowest `x-ratelimit-remaining` seen since the rate limit last reset, not in the last minute. The same split
+for each cycle is logged at DEBUG (`Cycle took 26.0 s: ...`), which the daemon's handlers do not print.
+
 ## Configuration
 
 `config.py` holds every setting, each with the reason for its value. `REPOS_TO_MONITOR` lists the

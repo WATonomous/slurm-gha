@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 
 from config import (
     BOOT_ALLOWANCE_S,
+    CYCLE_SUMMARY_INTERVAL_S,
     HISTORY_PAGE_INTERVAL_S,
     IDLE_ALLOWANCE_S,
     IDLE_STOP_MARGIN_S,
@@ -26,6 +27,15 @@ from config import (
     OUTAGE_REMINDER_INTERVAL_S,
     REPOS_TO_MONITOR,
     Repository,
+)
+from cycle_summary import (
+    SPENT,
+    Spent,
+    SummaryWindow,
+    cycle_line,
+    cycle_times,
+    summary_line,
+    window_with_cycle,
 )
 from demand import (
     demand_from_jobs,
@@ -47,6 +57,7 @@ from node_rule import (
     next_unpinned_runner_at,
     plan_submissions,
     record_refused_submission,
+    record_unusable_runner_answer,
 )
 from plan import (
     NO_DEMAND,
@@ -63,6 +74,7 @@ from supply import (
     SlurmTimedOut,
     SlurmUnavailable,
     SbatchLeftNoJob,
+    GitHubGaveNoUsableRunner,
     SubmissionRefused,
     cancel_pending_allocation,
     delete_registration,
@@ -89,6 +101,8 @@ class RepositoryMemory:
     launch_records: LaunchRecords
     # Losing it lets a busy runner cover a waiting job for up to BUSY_COVER_S longer
     runner_sightings: RunnerSightings
+    # Queued jobs of a size we serve, as the last completed cycle read them; only for the cycle summary
+    jobs_queued: int = 0
 
 
 def empty_memory() -> RepositoryMemory:
@@ -168,8 +182,12 @@ def main() -> None:
     logger.info(
         f"Starting: {', '.join(memory_by_repo)}; W {IDLE_ALLOWANCE_S} s, B {BOOT_ALLOWANCE_S} s"
     )
+    window = SummaryWindow(started_at=time.monotonic())
     while True:
+        cycle_started_at = time.monotonic()
+        spent_before = SPENT.snapshot()
         github.start_cycle()
+        queued_in_completed_cycles = []
         for repo in REPOS_TO_MONITOR:
             error = None
             try:
@@ -186,10 +204,62 @@ def main() -> None:
                 outage_by_repo[repo.name], error, time.time()
             )
             outage_by_repo[repo.name] = outage
+            if error is None:
+                queued_in_completed_cycles.append(memory_by_repo[repo.name].jobs_queued)
             if line is not None:
                 level = logging.INFO if outage is None else logging.WARNING
                 logger.log(level, f"{repo.name}: {line}")
-        time.sleep(github.seconds_until_next_cycle(time.time()))
+        pause_s = github.seconds_until_next_cycle(time.time())
+        paused_from = time.monotonic()
+        time.sleep(pause_s)
+        cycle_ended_at = time.monotonic()
+        window = log_cycle(
+            window,
+            spent=SPENT.minus(spent_before),
+            duration_s=cycle_ended_at - cycle_started_at,
+            pause_s=cycle_ended_at - paused_from,
+            jobs_queued=sum(queued_in_completed_cycles)
+            if queued_in_completed_cycles
+            else None,
+            ended_at=cycle_ended_at,
+            github=github,
+        )
+
+
+def log_cycle(
+    window: SummaryWindow,
+    spent: Spent,
+    duration_s: float,
+    pause_s: float,
+    jobs_queued: int | None,
+    ended_at: float,
+    github: GitHubClient,
+) -> SummaryWindow:
+    """Log the cycle that just ended at DEBUG and, once the window is CYCLE_SUMMARY_INTERVAL_S old, the
+    window at INFO if a job waited or a runner was submitted in it; the window to carry on with. Never
+    raises: an error here is logged and starts a new window, so measuring can never stop the cycles."""
+    try:
+        cycle = cycle_times(spent, duration_s, pause_s, jobs_queued)
+        logger.debug(cycle_line(cycle))
+        window = window_with_cycle(window, cycle)
+        if ended_at - window.started_at < CYCLE_SUMMARY_INTERVAL_S:
+            return window
+        rate_limit = github.rate_limit_window
+        line = summary_line(
+            window,
+            ended_at,
+            lowest_remaining=None
+            if rate_limit is None
+            else rate_limit.lowest_remaining,
+            resets_in_s=None
+            if rate_limit is None
+            else rate_limit.resets_at - time.time(),
+        )
+        if line is not None:
+            logger.info(line)
+    except Exception:
+        logger.exception("Could not log the cycle summary; the cycles go on")
+    return SummaryWindow(started_at=ended_at)
 
 
 def run_cycle(
@@ -302,18 +372,20 @@ def run_cycle(
         logger.log(level, f"{repo.name}: {line}")
 
     # 8. Remember what this cycle saw
+    demand = demand_from_jobs(jobs_by_run)
     sightings = update_sightings(
-        sightings,
-        allocations,
-        registrations_by_name,
-        demand_from_jobs(jobs_by_run),
-        cycle_started_at,
+        sightings, allocations, registrations_by_name, demand, cycle_started_at
     )
     watched_run_ids = stop_watching_finished_runs(
         github, repo.api_base_url, watched_run_ids, jobs_by_run
     )
     return RepositoryMemory(
-        watched_run_ids, next_history_page, next_history_page_at, records, sightings
+        watched_run_ids,
+        next_history_page,
+        next_history_page_at,
+        records,
+        sightings,
+        jobs_queued=len(demand.waiting_jobs),
     )
 
 
@@ -382,6 +454,8 @@ def submit_runners(
     sbatch_left_no_job of them before this call, left no job and named no node Slurm does not know. What
     the cycle records is stamped clock() when it happens.
     - Refused (the FAILED record): record_refused_submission; the size submits nothing more this cycle.
+    - GitHub's answer gave no runner we can use: record_unusable_runner_answer (rule 5); the size submits
+      nothing more this cycle.
     - sbatch left no job and named nodes Slurm does not know: those nodes are forgotten for every size, and
       the entries naming them are skipped. Otherwise (nothing named, all named nodes known, or Slurm could
       not be asked) nothing is recorded: the first such failure in a cycle skips its own entry, since the
@@ -401,6 +475,16 @@ def submit_runners(
             submit_runner(
                 github, repo.api_base_url, repo.runner_name_prefix, submission
             )
+        except GitHubGaveNoUsableRunner as unusable:
+            answered_at = clock()
+            records = record_unusable_runner_answer(records, size_label, answered_at)
+            refused_size_labels.add(size_label)
+            wait_s = next_unpinned_runner_at(records, size_label) - answered_at
+            logger.warning(
+                f"{repo.name}: {size_label}: GitHub's answer gave no runner we can use for"
+                f" {unusable.runner_name} ({unusable}); next runner in {wait_s:.0f} s"
+            )
+            continue
         except SubmissionRefused as refused:
             refused_at = clock()
             records = record_refused_submission(

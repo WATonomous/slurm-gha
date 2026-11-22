@@ -23,6 +23,8 @@ LONGEST_WAIT_WITHOUT_RETRY_AFTER_S = 15 * 60
 NEWEST_RUNS_PAGE_SIZE = 30
 # One run-history page (2-6 s, one counted request) a minute; trades how long a missed run stays unseen against cost
 HISTORY_PAGE_INTERVAL_S = 60
+# How often the cycle summary is logged at INFO while a job waits or runners are submitted; only the log's length
+CYCLE_SUMMARY_INTERVAL_S = 60
 # While a repository's cycles are stopped, how often the log repeats how long and why; the cause can change
 # within GitHub (a rate limit turning into bad credentials) without the cycles recovering
 OUTAGE_REMINDER_INTERVAL_S = 10 * 60
