@@ -348,10 +348,10 @@ class GitHubClientTest(unittest.TestCase):
         runs = {"workflow_runs": [{"id": 1}]}
         paced = rate_limit_headers(100, NOW + 2400)  # one charged request -> 24 s
         self.fake.script("/runs", answer_304_to('W/"v1"', runs, paced))
-        self.assertEqual(self.github.get_json(self.url("/runs")), runs)
+        self.assertEqual(self.github._get_object(self.url("/runs")), runs)
         self.assertEqual(self.github.seconds_until_next_cycle(NOW), 24)
         self.github.start_cycle()
-        self.assertEqual(self.github.get_json(self.url("/runs")), runs)
+        self.assertEqual(self.github._get_object(self.url("/runs")), runs)
         self.assertEqual(
             self.github.seconds_until_next_cycle(NOW), MIN_SECONDS_BETWEEN_CYCLES
         )
@@ -363,7 +363,7 @@ class GitHubClientTest(unittest.TestCase):
         jobs = {"jobs": [{"id": 1, "labels": ["slurm-runner-small"]}]}
         self.fake.script("/jobs?per_page=100", answer_304_to('"v1"', jobs))
         for _ in range(2):
-            items = self.github.get_all_pages(self.url("/jobs"), "jobs")
+            items = self.github._get_all_items(self.url("/jobs"), "jobs")
             self.assertEqual(items, jobs["jobs"])
             items[0]["labels"].append("changed by the caller")
             items.clear()
@@ -372,10 +372,10 @@ class GitHubClientTest(unittest.TestCase):
 
     def test_a_page_not_requested_for_a_whole_cycle_is_forgotten(self):
         self.fake.script("/job", answer_304_to('"v1"', {"id": 7}))
-        self.github.get_json(self.url("/job"))
+        self.github._get_object(self.url("/job"))
         self.github.start_cycle()
         self.github.start_cycle()
-        self.github.get_json(self.url("/job"))
+        self.github._get_object(self.url("/job"))
         self.assertNotIn("If-None-Match", self.fake.requests_to("/job")[1][2])
 
     def test_a_200_without_an_etag_drops_the_stored_page(self):
@@ -385,7 +385,7 @@ class GitHubClientTest(unittest.TestCase):
             Reply(200, {}, {"n": 2}),
             Reply(200, {}, {"n": 3}),
         )
-        answers = [self.github.get_json(self.url("/job")) for _ in range(3)]
+        answers = [self.github._get_object(self.url("/job")) for _ in range(3)]
         self.assertEqual(answers, [{"n": 1}, {"n": 2}, {"n": 3}])
         sent = self.fake.requests_to("/job")
         self.assertEqual(sent[1][2]["If-None-Match"], '"v1"')
@@ -394,8 +394,8 @@ class GitHubClientTest(unittest.TestCase):
     def test_every_request_carries_the_same_fixed_headers(self):
         self.fake.script("/a", Reply(200, body={}))
         self.fake.script("/b", Reply(201, body={"token": "x"}))
-        self.github.get_json(self.url("/a"))
-        self.github.post_json(self.url("/b"))
+        self.github._get_object(self.url("/a"))
+        self.github._post_object(self.url("/b"))
         names = ("Authorization", "Accept", "X-GitHub-Api-Version", "User-Agent")
         first, second = (
             {name: headers.get(name) for name in names}
@@ -421,14 +421,14 @@ class GitHubClientTest(unittest.TestCase):
             "/runs?status=queued&per_page=100&page=2",
             Reply(200, body={"workflow_runs": [{"id": 3}]}),
         )
-        runs = self.github.get_all_pages(
+        runs = self.github._get_all_items(
             self.url("/runs?status=queued"), "workflow_runs"
         )
         self.assertEqual([run["id"] for run in runs], [1, 2, 3])
 
     def test_a_url_that_already_sets_per_page_is_refused(self):
         with self.assertRaises(ValueError):
-            self.github.get_all_pages(self.url("/runs?per_page=30"), "workflow_runs")
+            self.github._get_all_items(self.url("/runs?per_page=30"), "workflow_runs")
         self.assertEqual(self.fake.received, [])
 
     def test_pages_answered_304_are_followed_from_the_stored_links(self):
@@ -440,9 +440,9 @@ class GitHubClientTest(unittest.TestCase):
         self.fake.script(
             "/jobs?per_page=100&page=2", answer_304_to('"p2"', {"jobs": [{"id": 2}]})
         )
-        first = self.github.get_all_pages(self.url("/jobs"), "jobs")
+        first = self.github._get_all_items(self.url("/jobs"), "jobs")
         self.github.start_cycle()
-        self.assertEqual(self.github.get_all_pages(self.url("/jobs"), "jobs"), first)
+        self.assertEqual(self.github._get_all_items(self.url("/jobs"), "jobs"), first)
         self.assertEqual(len(self.fake.requests_to("/jobs?per_page=100&page=2")), 2)
 
     def test_a_failure_on_a_later_page_raises(self):
@@ -453,7 +453,7 @@ class GitHubClientTest(unittest.TestCase):
             "/jobs?per_page=100&page=2", Reply(502, body={"message": "Server Error"})
         )
         with self.assertRaises(GitHubUnavailable):
-            self.github.get_all_pages(self.url("/jobs"), "jobs")
+            self.github._get_all_items(self.url("/jobs"), "jobs")
 
     def test_an_answer_without_the_list_or_without_json_raises(self):
         self.fake.script(
@@ -463,9 +463,9 @@ class GitHubClientTest(unittest.TestCase):
             "/html", Reply(200, {"Content-Type": "text/html"}, b"<html>unicorn</html>")
         )
         with self.assertRaises(GitHubUnavailable):
-            self.github.get_all_pages(self.url("/jobs"), "jobs")
+            self.github._get_all_items(self.url("/jobs"), "jobs")
         with self.assertRaises(GitHubUnavailable):
-            self.github.get_json(self.url("/html"))
+            self.github._get_object(self.url("/html"))
 
     def test_a_rate_limit_403_stops_requests_until_the_reset(self):
         resets_at = int(NOW) + 2
@@ -479,27 +479,27 @@ class GitHubClientTest(unittest.TestCase):
             Reply(200, body={"workflow_runs": [{"id": 1}]}),
         )
         with self.assertRaises(GitHubUnavailable) as raised:
-            self.github.get_all_pages(self.url("/runs"), "workflow_runs")
+            self.github._get_all_items(self.url("/runs"), "workflow_runs")
         self.assertIn("API rate limit exceeded", str(raised.exception))
         with self.assertRaises(GitHubUnavailable):
-            self.github.get_all_pages(self.url("/runs"), "workflow_runs")
+            self.github._get_all_items(self.url("/runs"), "workflow_runs")
         self.assertEqual(len(self.fake.received), 1)
         self.assertEqual(self.github.no_requests_before, resets_at + 1)
         self.assertEqual(self.github.seconds_until_next_cycle(NOW), resets_at + 1 - NOW)
 
         self.wait_out_the_stop()
-        runs = self.github.get_all_pages(self.url("/runs"), "workflow_runs")
+        runs = self.github._get_all_items(self.url("/runs"), "workflow_runs")
         self.assertEqual(runs, [{"id": 1}])
         self.assertEqual(len(self.fake.received), 2)
 
     def test_a_secondary_limit_obeys_retry_after(self):
         self.fake.script("/runs", Reply(403, {"Retry-After": "120"}, SECONDARY_LIMIT))
         with self.assertRaises(GitHubUnavailable) as raised:
-            self.github.get_json(self.url("/runs"))
+            self.github._get_object(self.url("/runs"))
         self.assertIn("secondary rate limit", str(raised.exception))
         self.assertEqual(self.github.no_requests_before, NOW + 120)
         with self.assertRaises(GitHubUnavailable):
-            self.github.get_json(self.url("/runs"))
+            self.github._get_object(self.url("/runs"))
         self.assertEqual(len(self.fake.received), 1)
 
     def test_a_429_obeys_retry_after(self):
@@ -507,29 +507,29 @@ class GitHubClientTest(unittest.TestCase):
             "/runs", Reply(429, {"Retry-After": "30"}, {"message": "Too many requests"})
         )
         with self.assertRaises(GitHubUnavailable) as raised:
-            self.github.get_json(self.url("/runs"))
+            self.github._get_object(self.url("/runs"))
         self.assertIn("HTTP 429 (Too many requests)", str(raised.exception))
         self.assertEqual(self.github.no_requests_before, NOW + 30)
 
     def test_a_401_stops_requests_and_says_why(self):
         self.fake.script("/runs", Reply(401, body={"message": "Bad credentials"}))
         with self.assertRaises(GitHubUnavailable) as raised:
-            self.github.get_json(self.url("/runs"))
+            self.github._get_object(self.url("/runs"))
         self.assertIn("HTTP 401 (Bad credentials)", str(raised.exception))
         self.assertIn("/runs", str(raised.exception))
         self.assertEqual(
             self.github.no_requests_before, NOW + FIRST_WAIT_WITHOUT_RETRY_AFTER_S
         )
         with self.assertRaises(GitHubUnavailable):
-            self.github.get_json(self.url("/runs"))
+            self.github._get_object(self.url("/runs"))
         self.assertEqual(len(self.fake.received), 1)
 
     def test_a_post_during_a_stop_raises_without_sending(self):
         self.fake.script("/runs", Reply(403, {"Retry-After": "60"}, SECONDARY_LIMIT))
         with self.assertRaises(GitHubUnavailable):
-            self.github.get_json(self.url("/runs"))
+            self.github._get_object(self.url("/runs"))
         with self.assertRaises(GitHubUnavailable):
-            self.github.post_json(self.url("/generate-jitconfig"))
+            self.github._post_object(self.url("/generate-jitconfig"))
         self.assertEqual(self.fake.requests_to("/generate-jitconfig"), [])
 
     def test_repeated_secondary_limits_double_across_cycles_despite_successes(self):
@@ -538,19 +538,19 @@ class GitHubClientTest(unittest.TestCase):
         stops = []
         for _ in range(3):
             self.github.start_cycle()
-            self.github.get_json(self.url("/runs"))
+            self.github._get_object(self.url("/runs"))
             with self.assertRaises(GitHubUnavailable):
-                self.github.post_json(self.url("/generate-jitconfig"))
+                self.github._post_object(self.url("/generate-jitconfig"))
             stops.append(self.github.no_requests_before - self.clock.now)
             self.wait_out_the_stop()
         self.assertEqual(stops, [60, 120, 240])
 
         # A whole cycle without a stop lets the backoff start over
         self.github.start_cycle()
-        self.github.get_json(self.url("/runs"))
+        self.github._get_object(self.url("/runs"))
         self.github.start_cycle()
         with self.assertRaises(GitHubUnavailable):
-            self.github.post_json(self.url("/generate-jitconfig"))
+            self.github._post_object(self.url("/generate-jitconfig"))
         self.assertEqual(self.github.no_requests_before - self.clock.now, 60)
 
     def test_a_long_primary_stop_does_not_inflate_the_next_backoff(self):
@@ -564,12 +564,12 @@ class GitHubClientTest(unittest.TestCase):
             Reply(403, body={"message": "Must have admin rights to Repository."}),
         )
         with self.assertRaises(GitHubUnavailable):
-            self.github.get_json(self.url("/runs"))
+            self.github._get_object(self.url("/runs"))
         self.assertEqual(self.github.no_requests_before - NOW, 1801)
         self.wait_out_the_stop()
         self.github.start_cycle()
         with self.assertRaises(GitHubUnavailable):
-            self.github.get_json(self.url("/runs"))
+            self.github._get_object(self.url("/runs"))
         self.assertEqual(
             self.github.no_requests_before - self.clock.now,
             FIRST_WAIT_WITHOUT_RETRY_AFTER_S,
@@ -578,14 +578,14 @@ class GitHubClientTest(unittest.TestCase):
     def test_a_cycle_whose_requests_were_refused_keeps_the_backoff(self):
         self.fake.script("/generate-jitconfig", Reply(403, body=SECONDARY_LIMIT))
         with self.assertRaises(GitHubUnavailable):
-            self.github.post_json(self.url("/generate-jitconfig"))
+            self.github._post_object(self.url("/generate-jitconfig"))
         self.github.start_cycle()
         with self.assertRaises(GitHubUnavailable):  # refused: the stop is still active
-            self.github.post_json(self.url("/generate-jitconfig"))
+            self.github._post_object(self.url("/generate-jitconfig"))
         self.github.start_cycle()
         self.wait_out_the_stop()
         with self.assertRaises(GitHubUnavailable):
-            self.github.post_json(self.url("/generate-jitconfig"))
+            self.github._post_object(self.url("/generate-jitconfig"))
         self.assertEqual(self.github.no_requests_before - self.clock.now, 120)
         self.assertEqual(len(self.fake.requests_to("/generate-jitconfig")), 2)
 
@@ -594,11 +594,11 @@ class GitHubClientTest(unittest.TestCase):
             "/runs/7", Reply(404, body={"message": "Not Found"}), Reply(200, body={})
         )
         with self.assertRaises(GitHubNotFound) as raised:
-            self.github.get_json(self.url("/runs/7"))
+            self.github._get_object(self.url("/runs/7"))
         self.assertIsInstance(raised.exception, GitHubUnavailable)
         self.assertIn("HTTP 404", str(raised.exception))
         self.assertEqual(self.github.no_requests_before, 0)
-        self.assertEqual(self.github.get_json(self.url("/runs/7")), {})
+        self.assertEqual(self.github._get_object(self.url("/runs/7")), {})
 
     def test_get_page_names_the_next_page_only_when_github_does(self):
         page_2 = self.url("/runs?page=2")
@@ -611,11 +611,11 @@ class GitHubClientTest(unittest.TestCase):
         self.fake.script("/runs?page=2", Reply(200, body={"workflow_runs": []}))
         for _ in range(2):  # the second answer is a 304, followed from the stored link
             self.assertEqual(
-                self.github.get_page(self.url("/runs?page=1")),
+                self.github._get_page(self.url("/runs?page=1")),
                 (short_with_next, page_2),
             )
             self.github.start_cycle()
-        self.assertEqual(self.github.get_page(page_2), ({"workflow_runs": []}, None))
+        self.assertEqual(self.github._get_page(page_2), ({"workflow_runs": []}, None))
         self.assertEqual(
             self.fake.requests_to("/runs?page=1")[1][2]["If-None-Match"], '"p1"'
         )
@@ -627,14 +627,14 @@ class GitHubClientTest(unittest.TestCase):
             Reply(200, body={"ok": 1}),
         )
         with self.assertRaises(GitHubUnavailable):
-            self.github.get_json(self.url("/runs"))
-        self.assertEqual(self.github.get_json(self.url("/runs")), {"ok": 1})
+            self.github._get_object(self.url("/runs"))
+        self.assertEqual(self.github._get_object(self.url("/runs")), {"ok": 1})
 
     def test_a_timeout_raises_and_leaves_the_next_cycle_free_to_try(self):
         self.fake.script("/slow", Reply(200, body={}, delay_s=0.5))
         with mock.patch.object(github_client, "NETWORK_TIMEOUT", 0.05):
             with self.assertRaises(GitHubUnavailable):
-                self.github.get_json(self.url("/slow"))
+                self.github._get_object(self.url("/slow"))
         self.assertEqual(self.github.no_requests_before, 0)
 
     def test_an_unreachable_github_raises(self):
@@ -642,41 +642,41 @@ class GitHubClientTest(unittest.TestCase):
             unused.bind(("127.0.0.1", 0))
             port = unused.getsockname()[1]
         with self.assertRaises(GitHubUnavailable):
-            self.github.get_json(f"http://127.0.0.1:{port}/runs")
+            self.github._get_object(f"http://127.0.0.1:{port}/runs")
 
     def test_a_delete_returns_the_status_github_answered_or_raises(self):
         for status in (204, 404, 422):
             with self.subTest(status=status):
                 self.fake.script(f"/runners/{status}", Reply(status, body=None))
                 self.assertEqual(
-                    self.github.delete(self.url(f"/runners/{status}")), status
+                    self.github._delete(self.url(f"/runners/{status}")), status
                 )
         self.fake.script("/runners/500", Reply(500, body={"message": "Server Error"}))
         with self.assertRaises(GitHubUnavailable):
-            self.github.delete(self.url("/runners/500"))
+            self.github._delete(self.url("/runners/500"))
         self.assertEqual(self.github.no_requests_before, 0)
 
     def test_a_delete_is_a_write_spaced_from_the_last_and_obeys_stops(self):
         self.fake.script("/write", Reply(201, body={}))
         self.fake.script("/runners/1", Reply(204, body=None))
-        self.github.post_json(self.url("/write"))
-        self.github.delete(self.url("/runners/1"))
+        self.github._post_object(self.url("/write"))
+        self.github._delete(self.url("/runners/1"))
         self.assertEqual(self.clock.slept, [MIN_SECONDS_BETWEEN_WRITES])
         self.fake.script("/runners/2", Reply(403, body=SECONDARY_LIMIT))
         with self.assertRaises(GitHubUnavailable):
-            self.github.delete(self.url("/runners/2"))
+            self.github._delete(self.url("/runners/2"))
         self.assertEqual(self.github.no_requests_before - self.clock.now, 60)
         with self.assertRaises(GitHubUnavailable):
-            self.github.delete(self.url("/runners/1"))
+            self.github._delete(self.url("/runners/1"))
         self.assertEqual(len(self.fake.requests_to("/runners/1")), 1)
 
     def test_writes_are_spaced_one_second_apart(self):
         self.fake.script(
             "/generate-jitconfig", answer_like_a_jit_config_post(4000, NOW + 600)
         )
-        answer = self.github.post_json(self.url("/generate-jitconfig"))
+        answer = self.github._post_object(self.url("/generate-jitconfig"))
         self.assertEqual(answer["encoded_jit_config"], "jit-config-value")
-        self.github.post_json(self.url("/generate-jitconfig"))
+        self.github._post_object(self.url("/generate-jitconfig"))
         self.assertEqual(self.clock.slept, [MIN_SECONDS_BETWEEN_WRITES])
 
     def test_a_wave_of_jit_config_posts_neither_paces_nor_changes_the_window(self):
@@ -684,9 +684,9 @@ class GitHubClientTest(unittest.TestCase):
         self.fake.script(
             "/generate-jitconfig", answer_like_a_jit_config_post(400, NOW + 3000)
         )
-        self.github.get_json(self.url("/runs"))
+        self.github._get_object(self.url("/runs"))
         for _ in range(47):
-            self.github.post_json(self.url("/generate-jitconfig"))
+            self.github._post_object(self.url("/generate-jitconfig"))
         self.assertEqual(
             self.github.rate_limit_window, RateLimitWindow(NOW + 3000, 4000)
         )
@@ -701,30 +701,30 @@ class GitHubClientTest(unittest.TestCase):
             return Reply(201, body={"token": "x"})
 
         self.fake.script("/generate-jitconfig", answer_after_300_ms)
-        self.github.post_json(self.url("/generate-jitconfig"))
-        self.github.post_json(self.url("/generate-jitconfig"))
+        self.github._post_object(self.url("/generate-jitconfig"))
+        self.github._post_object(self.url("/generate-jitconfig"))
         self.assertEqual(len(self.clock.slept), 1)
         self.assertAlmostEqual(self.clock.slept[0], MIN_SECONDS_BETWEEN_WRITES - 0.3)
 
     def test_a_refused_write_neither_sleeps_nor_counts_as_a_write(self):
         self.fake.script("/generate-jitconfig", Reply(201, body={"token": "x"}))
         self.fake.script("/runs", Reply(403, {"Retry-After": "60"}, SECONDARY_LIMIT))
-        self.github.post_json(self.url("/generate-jitconfig"))
+        self.github._post_object(self.url("/generate-jitconfig"))
         with self.assertRaises(GitHubUnavailable):
-            self.github.get_json(self.url("/runs"))
+            self.github._get_object(self.url("/runs"))
         for refused_at in (NOW + 0.5, NOW + 59.5):
             self.clock.now = refused_at
             with self.assertRaises(GitHubUnavailable):
-                self.github.post_json(self.url("/generate-jitconfig"))
+                self.github._post_object(self.url("/generate-jitconfig"))
         self.clock.now = NOW + 60
-        self.github.post_json(self.url("/generate-jitconfig"))
+        self.github._post_object(self.url("/generate-jitconfig"))
         self.assertEqual(self.clock.slept, [])
         self.assertEqual(len(self.fake.requests_to("/generate-jitconfig")), 2)
 
     def test_pacing_uses_this_cycles_charged_requests(self):
         self.fake.script("/a", Reply(200, rate_limit_headers(100, NOW + 2400), {}))
-        self.github.get_json(self.url("/a"))
-        self.github.get_json(self.url("/a"))
+        self.github._get_object(self.url("/a"))
+        self.github._get_object(self.url("/a"))
         self.assertEqual(self.github.seconds_until_next_cycle(NOW), 48)
         self.github.start_cycle()
         self.assertEqual(
@@ -750,11 +750,11 @@ class GitHubClientTest(unittest.TestCase):
         )
         messages = []
         with self.assertLogs(level="DEBUG") as logs:
-            self.github.post_json(self.url("/generate-jitconfig"))
+            self.github._post_object(self.url("/generate-jitconfig"))
             for path in ("/forbidden", "/unauthorized"):
                 self.wait_out_the_stop()
                 with self.assertRaises(GitHubUnavailable) as raised:
-                    self.github.get_json(self.url(path))
+                    self.github._get_object(self.url(path))
                 messages.append(str(raised.exception))
         self.assertIn("Must have admin rights to Repository.", messages[0])
         self.assertTrue(

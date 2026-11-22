@@ -10,7 +10,7 @@ import logging
 from datetime import datetime
 
 from config import NEWEST_RUNS_PAGE_SIZE, RERUN_WINDOW_S
-from github_client import PAGE_SIZE, GitHubClient, GitHubNotFound, GitHubUnavailable
+from github_client import GitHubClient, GitHubNotFound, GitHubUnavailable
 from plan import Demand, WaitingJob
 from runner_size_config import size_label_of_job
 
@@ -23,21 +23,15 @@ def watch_new_runs(
     """watched_run_ids plus not-completed runs on the newest page and every run listed queued/in_progress;
     never removes; a failed list adds nothing."""
     newest_runs = []
-    newest_page_url = f"{repo_api_base_url}/actions/runs?per_page={NEWEST_RUNS_PAGE_SIZE}&exclude_pull_requests=true"
     try:
-        newest_runs = workflow_runs_in(
-            github.get_json(newest_page_url), newest_page_url
-        )
+        newest_runs = github.get_latest_runs(repo_api_base_url, NEWEST_RUNS_PAGE_SIZE)
     except GitHubUnavailable as e:
         logger.warning(f"Could not read the newest runs: {e}")
 
     listed_runs = []
     for status in ("queued", "in_progress"):
         try:
-            listed_runs += github.get_all_pages(
-                f"{repo_api_base_url}/actions/runs?status={status}&exclude_pull_requests=true",
-                "workflow_runs",
-            )
+            listed_runs += github.list_runs(repo_api_base_url, status)
         except GitHubUnavailable as e:
             logger.warning(f"Could not list the {status} runs: {e}")
 
@@ -57,18 +51,17 @@ def watch_runs_from_history_page(
     """watched_run_ids plus the not-completed runs on one page of all runs, newest first, and the page to
     read next; finds a re-run or, after a restart, a run that neither the newest page nor the status
     lists show. A failed read adds nothing and keeps the page."""
-    page_url = f"{repo_api_base_url}/actions/runs?per_page={PAGE_SIZE}&page={page}&exclude_pull_requests=true"
     try:
-        body, next_page_url = github.get_page(page_url)
-        runs = workflow_runs_in(body, page_url)
+        history_page = github.get_run_history_page(repo_api_base_url, page)
     except GitHubUnavailable as e:
         logger.warning(f"Could not read page {page} of the run history: {e}")
         return watched_run_ids, page
 
+    runs = history_page.runs
     new_run_ids = run_ids_to_watch(runs, []) - watched_run_ids
     for run_id in sorted(new_run_ids):
         logger.info(f"Watching run {run_id}, found on page {page} of the run history")
-    next_page = next_history_page(page, runs, next_page_url is not None, now)
+    next_page = next_history_page(page, runs, history_page.has_next_page, now)
     return watched_run_ids | new_run_ids, next_page
 
 
@@ -92,8 +85,8 @@ def read_latest_jobs(
     jobs_by_run = {}
     for run_id in sorted(run_ids):
         try:
-            jobs_by_run[run_id] = github.get_all_pages(
-                f"{repo_api_base_url}/actions/runs/{run_id}/jobs?filter=latest", "jobs"
+            jobs_by_run[run_id] = github.list_jobs_of_latest_attempt(
+                repo_api_base_url, run_id
             )
         except GitHubNotFound:
             jobs_by_run[run_id] = []
@@ -117,9 +110,7 @@ def stop_watching_finished_runs(
         if jobs is None or any(job["status"] != "completed" for job in jobs):
             continue
         try:
-            run = github.get_json(
-                f"{repo_api_base_url}/actions/runs/{run_id}?exclude_pull_requests=true"
-            )
+            run = github.get_run(repo_api_base_url, run_id)
         except GitHubNotFound as e:
             # Its jobs answered 404 or nothing too: one stray 404 cannot drop a run between waves
             if not jobs:
@@ -171,11 +162,3 @@ def demand_from_jobs(jobs_by_run: dict[int, list[dict]]) -> Demand:
 def epoch_seconds(github_time: str) -> float:
     """Pure: a GitHub timestamp such as "2026-11-13T00:37:59Z" in seconds since the epoch."""
     return datetime.fromisoformat(github_time.replace("Z", "+00:00")).timestamp()
-
-
-def workflow_runs_in(body: dict, url: str) -> list[dict]:
-    """The workflow_runs list of a run-list answer; GitHubUnavailable if the answer has none."""
-    runs = body.get("workflow_runs")
-    if not isinstance(runs, list):
-        raise GitHubUnavailable(f"GET {url}: no 'workflow_runs' list in the answer")
-    return runs
