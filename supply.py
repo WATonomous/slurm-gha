@@ -209,7 +209,7 @@ def read_our_registrations(
     """Our runner registrations, by name, from every page of the runners list, each stamped with clock()
     after the last page: no later than that, it was as shown. Raises GitHubUnavailable, also for one of
     ours without a runner id."""
-    runners = github.get_all_pages(f"{repo_api_base_url}/actions/runners", "runners")
+    runners = github.list_runners(repo_api_base_url)
     listed_at = clock()
     registrations = {}
     for runner in runners:
@@ -278,7 +278,7 @@ def submit_runner(
     runner_name_prefix: str,
     submission: Submission,
 ) -> None:
-    """POST generate-jitconfig for a new runner of the submission's size, then sbatch with the config in the
+    """Create a just-in-time runner config for a new runner of the submission's size, then sbatch with the config in the
     environment. Raises GitHubUnavailable or SlurmUnavailable, and ValueError for a label that is not a
     size, which demand never reports. GitHubGaveNoUsableRunner when the answer has no config to start
     the runner with: its registration is deleted and nothing is submitted. When sbatch exits non-zero,
@@ -291,25 +291,20 @@ def submit_runner(
     if resources is None:
         raise ValueError(f"{size_label!r} is not a size label")
     runner_name = new_runner_name(runner_name_prefix)
-    jit_response = github.post_json(
-        f"{repo_api_base_url}/actions/runners/generate-jitconfig",
-        {
-            "name": runner_name,
-            "runner_group_id": RUNNER_GROUP_ID,
-            "labels": [size_label],
-            # On the job's tmpdisk, and the same path inside the runner's container (--bind /tmp) and for
-            # the rootless Docker daemon outside it, which resolves the workspace mounts of job containers
-            "work_folder": f"/tmp/{runner_name}/_work",
-        },
+    jit_runner = github.create_jit_runner(
+        repo_api_base_url,
+        runner_name,
+        RUNNER_GROUP_ID,
+        labels=[size_label],
+        # On the job's tmpdisk, and the same path inside the runner's container (--bind /tmp) and for
+        # the rootless Docker daemon outside it, which resolves the workspace mounts of job containers
+        work_folder=f"/tmp/{runner_name}/_work",
     )
-    jit_config = jit_response.get("encoded_jit_config")
-    if not isinstance(jit_config, str) or not jit_config:
+    if jit_runner.encoded_config is None:
         why = "GitHub's answer carried no encoded_jit_config to start the runner with"
-        runner = jit_response.get("runner")
-        runner_id = runner.get("id") if isinstance(runner, dict) else None
-        if isinstance(runner_id, int):
+        if jit_runner.runner_id is not None:
             delete_registration(
-                github, repo_api_base_url, runner_id, runner_name, why=why
+                github, repo_api_base_url, jit_runner.runner_id, runner_name, why=why
             )
         else:
             why += "; no runner id to delete its registration by"
@@ -317,7 +312,7 @@ def submit_runner(
     try:
         sbatch_output = run_slurm_command(
             sbatch_command(runner_name, submission, resources),
-            {JIT_CONFIG_VARIABLE: jit_config},
+            {JIT_CONFIG_VARIABLE: jit_runner.encoded_config},
         )
     except SlurmTimedOut:
         # The request may still be queued in slurmctld, after the squeue that would check for it
@@ -331,12 +326,11 @@ def submit_runner(
             logger.info(f"Submitted {runner_name} for {size_label} although {error}")
             return
         # Otherwise the registration waits a day for a runner that will never start
-        runner_id = (jit_response.get("runner") or {}).get("id")
-        if isinstance(runner_id, int):
+        if jit_runner.runner_id is not None:
             delete_registration(
                 github,
                 repo_api_base_url,
-                runner_id,
+                jit_runner.runner_id,
                 runner_name,
                 why="sbatch created no job",
             )
@@ -459,7 +453,7 @@ def delete_registration(
     (404), or declined (422: it believes a job is on that runner, and that job then waits as it would
     without the delete). False after any other failure, logged; the next cycle tries again."""
     try:
-        status = github.delete(f"{repo_api_base_url}/actions/runners/{runner_id}")
+        status = github.delete_runner(repo_api_base_url, runner_id)
     except GitHubUnavailable as error:
         logger.warning(
             f"Could not delete the registration of {runner_name} ({why}): {error}"
