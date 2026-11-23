@@ -16,9 +16,10 @@ from demand import (
     stop_watching_finished_runs,
     watch_new_runs,
     watch_runs_from_history_page,
+    workflow_runs_in,
 )
 from config import NEWEST_RUNS_PAGE_SIZE, RERUN_WINDOW_S
-from github_client import GitHubClient
+from github_client import GitHubClient, GitHubUnavailable
 from test_github_client import FakeGitHub, Reply, answer_304_to
 
 # Saved by gha-queue-wait whenever a run with a waiting job was missing from runs?status=queued:
@@ -181,6 +182,14 @@ class PureFunctionsTest(unittest.TestCase):
         self.assertEqual(run_ids_to_watch(newest, listed), {1, 2, 3, 4, 5, 6})
         self.assertEqual(run_ids_to_watch([], []), set())
 
+    def test_a_run_list_with_a_null_entry_is_not_read_as_a_run_list(self):
+        with self.assertRaises(GitHubUnavailable):
+            workflow_runs_in(runs_answer(run(1, "queued"), None), "the-url")
+        self.assertEqual(
+            workflow_runs_in(runs_answer(run(1, "queued")), "the-url"),
+            [run(1, "queued")],
+        )
+
     def test_only_queued_jobs_wait(self):
         statuses = [
             "queued",
@@ -291,6 +300,25 @@ class ReadingTest(unittest.TestCase):
         self.assertEqual(sorted(jobs_by_run), [1, 3])
         self.assertEqual(jobs_by_run[1][0]["id"], 11)
         self.assertIn("Left run 2 out of this cycle", logs.output[0])
+
+    def test_a_run_whose_job_list_holds_a_null_is_left_out_and_stays_watched(self):
+        self.fake.script(jobs_path(1), Reply(200, body=jobs_answer(job(11, "queued"))))
+        self.fake.script(
+            jobs_path(2), Reply(200, body=jobs_answer(job(21, "queued"), None))
+        )
+        with self.assertLogs("demand", level="WARNING") as logs:
+            waiting, still_watched = self.cycle({1, 2})
+        self.assertEqual(waiting, [11])
+        self.assertEqual(still_watched, {1, 2})
+        self.assertIn("Left run 2 out of this cycle", logs.output[0])
+
+    def test_a_run_list_that_holds_a_null_adds_nothing(self):
+        self.fake.script(
+            NEWEST_RUNS, Reply(200, body=runs_answer(run(1, "queued"), None))
+        )
+        self.fake.script(QUEUED_RUNS, Reply(200, body=runs_answer(run(3, "queued"))))
+        with self.assertLogs("demand", level="WARNING"):
+            self.assertEqual(watch_new_runs(self.github, self.repo, {9}), {3, 9})
 
     def test_a_run_whose_jobs_cannot_be_read_stays_watched_without_asking(self):
         self.assertEqual(
