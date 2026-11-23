@@ -1,6 +1,6 @@
 """
-Every request to GitHub goes through GitHubClient. A call returns what GitHub answered (every page
-for a list_* method) or raises GitHubUnavailable, never an empty stand-in.
+Every request to GitHub goes through GitHubClient. A call returns what GitHub answered (one page
+from get_json, every page from get_all_pages) or raises GitHubUnavailable, never an empty stand-in.
 """
 
 from __future__ import annotations
@@ -26,8 +26,6 @@ from cycle_summary import SPENT
 logger = logging.getLogger(__name__)
 
 PAGE_SIZE = 100  # the most items GitHub returns per page of a list
-# Still lists runs triggered by pull requests; only empties each run's pull_requests field, which is never read
-OMIT_PULL_REQUESTS_FIELD = "exclude_pull_requests=true"
 
 
 class GitHubUnavailable(Exception):
@@ -44,22 +42,6 @@ class RateLimitWindow:
 
     resets_at: float
     lowest_remaining: int
-
-
-@dataclass(frozen=True)
-class RunHistoryPage:
-    """One page of the run list. A page shorter than PAGE_SIZE is not the last one unless has_next_page is False."""
-
-    runs: list[dict]
-    has_next_page: bool
-
-
-@dataclass(frozen=True)
-class JitRunner:
-    """A just-in-time runner GitHub has registered; each field is None if the answer carried no usable one."""
-
-    encoded_config: str | None
-    runner_id: int | None
 
 
 @dataclass(frozen=True)
@@ -105,79 +87,39 @@ class GitHubClient:
         self._pages_last_cycle = self._pages_this_cycle
         self._pages_this_cycle = {}
 
-    def get_latest_runs(self, repo_api_base_url: str, count: int) -> list[dict]:
-        """The repository's most recently created runs, newest first, at most count of them."""
-        url = f"{repo_api_base_url}/actions/runs?per_page={count}&{OMIT_PULL_REQUESTS_FIELD}"
-        body, _ = self._get_page(url)
-        return _items_in(body, "workflow_runs", url)
+    def get_json(self, url: str) -> dict:
+        """One conditional GET of exactly one page; a 304 returns the stored body. A fresh object every call."""
+        body, _ = self.get_page(url)
+        return body
 
-    def list_runs(self, repo_api_base_url: str, status: str) -> list[dict]:
-        """Every run GitHub lists with this status, from all pages."""
-        return self._get_all_items(
-            f"{repo_api_base_url}/actions/runs?status={status}&{OMIT_PULL_REQUESTS_FIELD}",
-            "workflow_runs",
-        )
+    def get_all_pages(self, url: str, items_key: str) -> list[dict]:
+        """get_json on every page (Link rel="next"); the items under items_key, concatenated."""
+        if "per_page=" in url:
+            raise ValueError(f"{url}: get_all_pages sets per_page itself")
+        separator = "&" if "?" in url else "?"
+        page_url = f"{url}{separator}per_page={PAGE_SIZE}"
+        items = []
+        while page_url is not None:
+            body, page_url = self.get_page(page_url)
+            page_items = body.get(items_key)
+            if not isinstance(page_items, list):
+                raise GitHubUnavailable(
+                    f"GET {url}: no {items_key!r} list in the answer"
+                )
+            items.extend(page_items)
+        return items
 
-    def get_run_history_page(self, repo_api_base_url: str, page: int) -> RunHistoryPage:
-        """One page of PAGE_SIZE runs from the repository's whole run list, newest first."""
-        url = f"{repo_api_base_url}/actions/runs?per_page={PAGE_SIZE}&page={page}&{OMIT_PULL_REQUESTS_FIELD}"
-        body, next_page_url = self._get_page(url)
-        return RunHistoryPage(
-            runs=_items_in(body, "workflow_runs", url),
-            has_next_page=next_page_url is not None,
-        )
+    def post_json(self, url: str, body: dict | None = None) -> dict:
+        """One write, spaced from the last (_wait_to_write); never retried, body never logged."""
+        self._wait_to_write("POST", url)
+        response = self._send("POST", url, json_body=body)
+        return _json_object_from(response.content, f"POST {url}")
 
-    def get_run(self, repo_api_base_url: str, run_id: int) -> dict:
-        """One run, as GitHub describes it now."""
-        return self._get_object(
-            f"{repo_api_base_url}/actions/runs/{run_id}?{OMIT_PULL_REQUESTS_FIELD}"
-        )
-
-    def list_jobs_of_latest_attempt(
-        self, repo_api_base_url: str, run_id: int
-    ) -> list[dict]:
-        """Every job of the run's most recent attempt (not those of earlier re-run attempts), from all pages."""
-        return self._get_all_items(
-            f"{repo_api_base_url}/actions/runs/{run_id}/jobs?filter=latest", "jobs"
-        )
-
-    def list_runners(self, repo_api_base_url: str) -> list[dict]:
-        """Every self-hosted runner registered to the repository, from all pages."""
-        return self._get_all_items(f"{repo_api_base_url}/actions/runners", "runners")
-
-    def create_jit_runner(
-        self,
-        repo_api_base_url: str,
-        runner_name: str,
-        runner_group_id: int,
-        labels: list[str],
-        work_folder: str,
-    ) -> JitRunner:
-        """Register a just-in-time runner: its encoded config, which run.sh takes to start it, and its id.
-        Raises GitHubUnavailable only when there is no answer; an answer lacking either gives None for it."""
-        answer = self._post_object(
-            f"{repo_api_base_url}/actions/runners/generate-jitconfig",
-            {
-                "name": runner_name,
-                "runner_group_id": runner_group_id,
-                "labels": labels,
-                "work_folder": work_folder,
-            },
-        )
-        jit_config = answer.get("encoded_jit_config")
-        runner = answer.get("runner")
-        runner_id = runner.get("id") if isinstance(runner, dict) else None
-        return JitRunner(
-            encoded_config=jit_config
-            if isinstance(jit_config, str) and jit_config
-            else None,
-            runner_id=runner_id if isinstance(runner_id, int) else None,
-        )
-
-    def delete_runner(self, repo_api_base_url: str, runner_id: int) -> int:
-        """Delete a runner registration. The status for 204 (deleted), 404 (already gone) and 422 (GitHub
-        refuses: it believes a job is on that runner); GitHubUnavailable for any other answer."""
-        return self._delete(f"{repo_api_base_url}/actions/runners/{runner_id}")
+    def delete(self, url: str) -> int:
+        """One write, spaced from the last (_wait_to_write); never retried. The status for 204, 404 (already
+        gone) and 422 (GitHub refuses); GitHubUnavailable for any other answer."""
+        self._wait_to_write("DELETE", url)
+        return self._send("DELETE", url, answered_statuses=(404, 422)).status_code
 
     def seconds_until_next_cycle(self, now: float) -> float:
         """next_cycle_delay_s with this cycle's charged requests, this client's window and its stop signal."""
@@ -188,36 +130,7 @@ class GitHubClient:
             now,
         )
 
-    def _post_object(self, url: str, body: dict | None = None) -> dict:
-        """One write, spaced from the last (_wait_to_write); never retried, body never logged."""
-        self._wait_to_write("POST", url)
-        response = self._send("POST", url, json_body=body)
-        return _json_object_from(response.content, f"POST {url}")
-
-    def _delete(self, url: str) -> int:
-        """One write, spaced from the last (_wait_to_write); never retried. The status for 204, 404 and 422;
-        GitHubUnavailable for any other answer."""
-        self._wait_to_write("DELETE", url)
-        return self._send("DELETE", url, answered_statuses=(404, 422)).status_code
-
-    def _get_object(self, url: str) -> dict:
-        """One conditional GET of exactly one page; a 304 returns the stored body. A fresh object every call."""
-        body, _ = self._get_page(url)
-        return body
-
-    def _get_all_items(self, url: str, items_key: str) -> list[dict]:
-        """_get_page on every page (Link rel="next"); the items under items_key, concatenated."""
-        if "per_page=" in url:
-            raise ValueError(f"{url}: _get_all_items sets per_page itself")
-        separator = "&" if "?" in url else "?"
-        page_url = f"{url}{separator}per_page={PAGE_SIZE}"
-        items = []
-        while page_url is not None:
-            body, page_url = self._get_page(page_url)
-            items.extend(_items_in(body, items_key, url))
-        return items
-
-    def _get_page(self, url: str) -> tuple[dict, str | None]:
+    def get_page(self, url: str) -> tuple[dict, str | None]:
         """One conditional GET: the body and the next page's URL (None when GitHub names none), from GitHub or,
         on a 304, from the stored page. A page shorter than per_page is not the last one unless this says so."""
         stored = self._pages_this_cycle.get(url) or self._pages_last_cycle.get(url)
@@ -421,14 +334,6 @@ def _int_header(headers: Mapping[str, str], name: str) -> int | None:
         return int(headers[name])
     except (KeyError, ValueError):
         return None
-
-
-def _items_in(body: dict, items_key: str, url: str) -> list[dict]:
-    """The list under items_key in a list answer; GitHubUnavailable if the answer has none."""
-    items = body.get(items_key)
-    if not isinstance(items, list):
-        raise GitHubUnavailable(f"GET {url}: no {items_key!r} list in the answer")
-    return items
 
 
 def _json_object_from(content: bytes, request: str) -> dict:

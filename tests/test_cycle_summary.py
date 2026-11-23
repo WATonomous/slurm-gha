@@ -258,16 +258,16 @@ class ClientCountsTest(unittest.TestCase):
     def test_a_304_is_a_read_but_not_charged(self):
         self.fake.script("/runs", answer_304_to('"e1"', {"workflow_runs": []}))
         before = SPENT.snapshot()
-        self.github._get_object(self.fake.base_url + "/runs")
-        self.github._get_object(self.fake.base_url + "/runs")
+        self.github.get_json(self.fake.base_url + "/runs")
+        self.github.get_json(self.fake.base_url + "/runs")
         spent = SPENT.minus(before)
         self.assertEqual((spent.reads, spent.charged_reads, spent.writes), (2, 1, 0))
 
     def test_writes_and_their_spacing_are_counted_apart_from_reads(self):
         self.fake.script("/token", Reply(201, body={"token": "x"}))
         before = SPENT.snapshot()
-        self.github._post_object(self.fake.base_url + "/token")
-        self.github._post_object(self.fake.base_url + "/token")
+        self.github.post_json(self.fake.base_url + "/token")
+        self.github.post_json(self.fake.base_url + "/token")
         spent = SPENT.minus(before)
         self.assertEqual((spent.reads, spent.writes), (0, 2))
         # The fake clock moves only while the client sleeps: the second write waited the full spacing
