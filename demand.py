@@ -10,7 +10,13 @@ import logging
 from datetime import datetime
 
 from config import NEWEST_RUNS_PAGE_SIZE, RERUN_WINDOW_S
-from github_client import PAGE_SIZE, GitHubClient, GitHubNotFound, GitHubUnavailable
+from github_client import (
+    PAGE_SIZE,
+    GitHubClient,
+    GitHubNotFound,
+    GitHubUnavailable,
+    extract_list_of_objects,
+)
 from plan import Demand, WaitingJob
 from runner_size_config import size_label_of_job
 
@@ -174,8 +180,5 @@ def epoch_seconds(github_time: str) -> float:
 
 
 def workflow_runs_in(body: dict, url: str) -> list[dict]:
-    """The workflow_runs list of a run-list answer; GitHubUnavailable if the answer has none."""
-    runs = body.get("workflow_runs")
-    if not isinstance(runs, list):
-        raise GitHubUnavailable(f"GET {url}: no 'workflow_runs' list in the answer")
-    return runs
+    """The runs listed in a run-list answer; GitHubUnavailable if it has no runs list or lists a non-object."""
+    return extract_list_of_objects(body, "workflow_runs", f"GET {url}")

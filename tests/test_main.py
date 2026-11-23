@@ -285,6 +285,18 @@ class RunCycleTest(CycleAgainstFakes):
         self.assertEqual(self.slurm.commands("sbatch"), [])
         self.assertEqual(self.fake.requests_to(GENERATE_JIT_CONFIG), [])
 
+    def test_a_runners_list_that_holds_a_null_changes_nothing(self):
+        # Would be cancelled
+        self.add_runner("PENDING", status=None, started_ago_s=A_DAY)
+        self.jobs(job(1, "queued", [MEDIUM]))
+        self.fake.script(RUNNERS, Reply(200, body={"runners": [None]}))
+        with self.assertRaises(GitHubUnavailable):
+            self.cycle(empty_memory())
+
+        self.assertEqual(self.slurm.commands("scancel"), [])
+        self.assertEqual(self.slurm.commands("sbatch"), [])
+        self.assertEqual(self.fake.requests_to(GENERATE_JIT_CONFIG), [])
+
     def test_submissions_alternate_between_labels_and_a_failed_one_is_skipped(self):
         memory = memory_with(usable_on("delta-slurm1", MEDIUM, SMALL))
         self.jobs(
@@ -767,6 +779,16 @@ class SubmitAsRunsAreReadTest(CycleAgainstFakes):
         self.assertLess(paths.index(jobs_path(2)), first_jit_config)
         self.assertLess(first_jit_config, paths.index(jobs_path(1)))
         self.assertEqual(self.submitted_size_labels(), [MEDIUM] * 5)
+
+    def test_a_job_list_with_a_null_entry_leaves_that_run_out_and_the_cycle_goes_on(
+        self,
+    ):
+        self.jobs_of(2, job(20, "queued", [MEDIUM]), None)
+        self.jobs_of(1, *(job(10 + i, "queued", [MEDIUM]) for i in range(2)))
+        with self.assertLogs("demand", level=logging.WARNING) as logs:
+            self.cycle(memory_with(usable_on("delta-slurm1", MEDIUM)))
+        self.assertIn("Left run 2 out of this cycle", logs.output[0])
+        self.assertEqual(self.submitted_size_labels(), [MEDIUM] * 2)
 
     def test_launch_evidence_is_weighed_even_with_no_run_to_read(self):
         self.fake.script(NEWEST_RUNS, Reply(200, body=runs_answer()))

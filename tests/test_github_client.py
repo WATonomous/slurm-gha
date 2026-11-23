@@ -467,6 +467,30 @@ class GitHubClientTest(unittest.TestCase):
         with self.assertRaises(GitHubUnavailable):
             self.github.get_json(self.url("/html"))
 
+    def test_a_list_with_an_entry_that_is_not_an_object_raises(self):
+        self.fake.script(
+            "/jobs?per_page=100", Reply(200, body={"jobs": [{"id": 1}, None]})
+        )
+        with self.assertRaises(GitHubUnavailable) as raised:
+            self.github.get_all_pages(self.url("/jobs"), "jobs")
+        self.assertIn("is not an object", str(raised.exception))
+
+    def test_a_stored_list_with_a_null_entry_fails_until_github_sends_another(self):
+        with_a_null = answer_304_to('"v1"', {"jobs": [{"id": 1}, None]})
+        self.fake.script("/jobs?per_page=100", with_a_null)
+        for _ in range(2):  # a 200, then a 304 that replays the stored page
+            with self.assertRaises(GitHubUnavailable):
+                self.github.get_all_pages(self.url("/jobs"), "jobs")
+            self.github.start_cycle()
+        sent = self.fake.requests_to("/jobs?per_page=100")
+        self.assertEqual(sent[1][2]["If-None-Match"], '"v1"')
+
+        whole = {"jobs": [{"id": 1}, {"id": 2}]}
+        self.fake.script("/jobs?per_page=100", answer_304_to('"v2"', whole))
+        self.assertEqual(
+            self.github.get_all_pages(self.url("/jobs"), "jobs"), whole["jobs"]
+        )
+
     def test_a_rate_limit_403_stops_requests_until_the_reset(self):
         resets_at = int(NOW) + 2
         self.fake.script(

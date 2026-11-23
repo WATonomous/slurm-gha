@@ -93,7 +93,7 @@ class GitHubClient:
         return body
 
     def get_all_pages(self, url: str, items_key: str) -> list[dict]:
-        """get_json on every page (Link rel="next"); the items under items_key, concatenated."""
+        """get_json on every page (Link rel="next"); the objects listed under items_key, concatenated."""
         if "per_page=" in url:
             raise ValueError(f"{url}: get_all_pages sets per_page itself")
         separator = "&" if "?" in url else "?"
@@ -101,12 +101,7 @@ class GitHubClient:
         items = []
         while page_url is not None:
             body, page_url = self.get_page(page_url)
-            page_items = body.get(items_key)
-            if not isinstance(page_items, list):
-                raise GitHubUnavailable(
-                    f"GET {url}: no {items_key!r} list in the answer"
-                )
-            items.extend(page_items)
+            items.extend(extract_list_of_objects(body, items_key, f"GET {url}"))
         return items
 
     def post_json(self, url: str, body: dict | None = None) -> dict:
@@ -345,6 +340,19 @@ def _json_object_from(content: bytes, request: str) -> dict:
     if not isinstance(body, dict):
         raise GitHubUnavailable(f"{request}: the answer is not a JSON object")
     return body
+
+
+def extract_list_of_objects(body: dict, items_key: str, request: str) -> list[dict]:
+    """Pure: body[items_key] if it is a list of JSON objects; GitHubUnavailable otherwise. GitHub has listed a
+    null among the jobs of a run it had just created."""
+    items = body.get(items_key)
+    if not isinstance(items, list):
+        raise GitHubUnavailable(f"{request}: no {items_key!r} list in the answer")
+    if not all(isinstance(item, dict) for item in items):
+        raise GitHubUnavailable(
+            f"{request}: an entry of the {items_key!r} list is not an object"
+        )
+    return items
 
 
 def _github_error_message(response: requests.Response) -> str:
